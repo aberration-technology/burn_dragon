@@ -3940,21 +3940,25 @@ where
     };
 
     let base_absolute_step = absolute_step;
-    let probe_items =
-        dataset.sample_ruliad_validation_probe_items(epoch, base_absolute_step, requested_items);
+    let panel = crate::dataset::resolve_ruliad_validation_panel(
+        dataset,
+        training,
+        epoch,
+        base_absolute_step,
+    )?;
+    if let Some(fingerprint) = panel.fingerprint_sha256.as_deref() {
+        info!(
+            "ruliad validation panel: sha256={fingerprint} base_items={} policy_items={}",
+            panel.base_items.len(),
+            panel.policy_items.len()
+        );
+    }
+    let probe_items = panel.base_items;
     if probe_items.is_empty() {
         return Ok(None);
     }
 
-    let training_serialization_items = if training.sequence_state_probe.enabled {
-        dataset.sample_ruliad_training_serialization_probe_items(
-            epoch,
-            base_absolute_step,
-            requested_items,
-        )
-    } else {
-        Vec::new()
-    };
+    let training_serialization_items = panel.training_serialization_items;
     let reuse_base_for_training_serialization =
         !training_serialization_items.is_empty() && training_serialization_items == probe_items;
     if !training_serialization_items.is_empty() && !reuse_base_for_training_serialization {
@@ -3980,16 +3984,6 @@ where
 
     let closed_loop_policy_probe_due = ruliad_closed_loop_policy_probe_due(training, epoch);
     let policy_probe_result = if closed_loop_policy_probe_due {
-        let stratified_probe_items =
-            (training.ruliad_policy_probe.stratified_difficulty_levels > 0).then(|| {
-                dataset.sample_ruliad_validation_probe_items_stratified(
-                    epoch,
-                    base_absolute_step,
-                    training.ruliad_policy_probe.items,
-                    burn_dragon_universality::RuliadTaskKind::SelectProofAction.label(),
-                    training.ruliad_policy_probe.stratified_difficulty_levels,
-                )
-            });
         Some(run_ruliad_policy_rollout_probe(
             run_name,
             dataset,
@@ -3998,7 +3992,7 @@ where
             base_absolute_step,
             device,
             training,
-            stratified_probe_items.as_deref().unwrap_or(&probe_items),
+            &panel.policy_items,
             bus,
         )?)
     } else {
@@ -4160,39 +4154,47 @@ where
     let Some(dataset) = dataset else {
         return Ok(None);
     };
-    let probe_items =
-        dataset.sample_ruliad_validation_probe_items(epoch, absolute_step, requested_items);
+    let panel =
+        crate::dataset::resolve_ruliad_validation_panel(dataset, training, epoch, absolute_step)?;
+    if let Some(fingerprint) = panel.fingerprint_sha256.as_deref() {
+        info!(
+            "ruliad validation panel: sha256={fingerprint} base_items={} policy_items={}",
+            panel.base_items.len(),
+            panel.policy_items.len()
+        );
+    }
+    let probe_items = panel.base_items;
     if probe_items.is_empty() {
         return Ok(None);
     }
 
-    if training.sequence_state_probe.enabled {
-        let serialization_items = dataset.sample_ruliad_training_serialization_probe_items(
+    let serialization_items = panel.training_serialization_items;
+    let reuse_training_serialization = training.sequence_state_probe.enabled
+        && !serialization_items.is_empty()
+        && serialization_items == probe_items;
+    if training.sequence_state_probe.enabled
+        && !serialization_items.is_empty()
+        && serialization_items != probe_items
+    {
+        let _ = evaluate_ruliad_correctness_validation_for_items_core(
+            Some(run_name),
+            Some(run_dir),
+            dataset,
+            model,
             epoch,
             absolute_step,
-            requested_items,
-        );
-        if !serialization_items.is_empty() && serialization_items != probe_items {
-            let _ = evaluate_ruliad_correctness_validation_for_items_core(
-                Some(run_name),
-                Some(run_dir),
-                dataset,
-                model,
-                epoch,
-                absolute_step,
-                device,
-                training,
-                &serialization_items,
-                training_batch_size,
-                "ruliad_training_serialization_probe",
-                Some("ruliad_correctness_training_serialization"),
-                Some("Ruliad Training Serialization"),
-                None,
-                Some(bus),
-                RuliadProbeDecodeMode::FreeRun,
-                Some(router),
-            )?;
-        }
+            device,
+            training,
+            &serialization_items,
+            training_batch_size,
+            "ruliad_training_serialization_probe",
+            Some("ruliad_correctness_training_serialization"),
+            Some("Ruliad Training Serialization"),
+            None,
+            Some(bus),
+            RuliadProbeDecodeMode::FreeRun,
+            Some(router),
+        )?;
     }
 
     let base = evaluate_ruliad_correctness_validation_for_items_core(
@@ -4214,13 +4216,7 @@ where
         RuliadProbeDecodeMode::FreeRun,
         Some(router),
     )?;
-    if training.sequence_state_probe.enabled
-        && dataset.sample_ruliad_training_serialization_probe_items(
-            epoch,
-            absolute_step,
-            requested_items,
-        ) == probe_items
-    {
+    if reuse_training_serialization {
         emit_reused_ruliad_correctness_validation(
             run_name,
             epoch,
@@ -8918,10 +8914,22 @@ fn emit_predictive_coding_telemetry<B>(
         gradient_tensors: 0,
         direct_forward_updates: 0,
         feedback_parameter_updates: 0,
+        adjoint_teacher_updates: 0,
+        adjoint_local_updates: 0,
+        adjoint_calibration_samples: 0,
+        adjoint_calibration_loss: None,
+        adjoint_cosine_alignment: None,
+        adjoint_prediction_teacher_norm_ratio: None,
+        adjoint_update_rms: None,
         parameter_updates: usize::from(matches!(
             env.training.predictive_coding.parameter_update,
             PredictiveCodingParameterUpdate::Optimizer
         )),
+        terminal_factor_kind: "next_token_replay".to_string(),
+        structured_terminal_steps: 0,
+        structured_terminal_skipped_steps: 0,
+        structured_terminal_groups: 0,
+        structured_terminal_rows: 0,
         energy_before: snapshot.energy_before_mean(),
         energy_after: snapshot.energy_after_mean(),
         energy_delta,

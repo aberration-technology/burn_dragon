@@ -127,7 +127,9 @@ pub struct PredictiveContextRoutingTelemetryState {
 #[derive(Clone, Component)]
 struct LocalPredictiveCodingTelemetryConfig {
     profile: crate::train::local_predictive_coding::LocalPredictiveCodingProfile,
+    training_algorithm: TrainingAlgorithm,
     solver: LocalPredictiveCodingSolver,
+    terminal_criterion: crate::config::LocalPredictiveCodingTerminalCriterion,
     learning_schedule: burn_pc::PcLearningSchedule,
     execution_contract: burn_pc::PcExecutionContract,
 }
@@ -149,7 +151,8 @@ fn local_predictive_coding_event_contract(
             LocalPredictiveCodingSolver::ErrorEquilibrium
             | LocalPredictiveCodingSolver::FixedPrediction
             | LocalPredictiveCodingSolver::LayerLocalPrediction
-            | LocalPredictiveCodingSolver::DirectKolenPollack => {
+            | LocalPredictiveCodingSolver::DirectKolenPollack
+            | LocalPredictiveCodingSolver::AmortizedAdjoint => {
                 unreachable!("validated incremental PC solver")
             }
         };
@@ -174,6 +177,10 @@ fn local_predictive_coding_event_contract(
         LocalPredictiveCodingSolver::DirectKolenPollack => (
             "local_direct_kolen_pollack_v1",
             "tied_direct_feedback_activities",
+        ),
+        LocalPredictiveCodingSolver::AmortizedAdjoint => (
+            "local_amortized_adjoint_v1",
+            "calibrated_layer_output_adjoints",
         ),
     }
 }
@@ -235,12 +242,20 @@ pub fn build_training_event_handles_with_local_predictive_coding(
             RuliadSourceSelectionConfig::new(dataset, training.events.source_selection_every_steps)
         });
     let local_predictive_coding = local_predictive_coding_profile
-        .filter(|_| matches!(training.algorithm, TrainingAlgorithm::PredictiveCoding))
+        .filter(|_| {
+            matches!(training.algorithm, TrainingAlgorithm::PredictiveCoding)
+                || matches!(
+                    training.local_predictive_coding.terminal_criterion,
+                    crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSet
+                )
+        })
         .map(|profile| {
             profile.reset();
             LocalPredictiveCodingTelemetryConfig {
                 profile,
+                training_algorithm: training.algorithm,
                 solver: training.local_predictive_coding.solver,
+                terminal_criterion: training.local_predictive_coding.terminal_criterion,
                 learning_schedule: training.local_predictive_coding.learning_schedule,
                 execution_contract: training.local_predictive_coding.execution_contract(),
             }
@@ -428,8 +443,18 @@ fn record_local_predictive_coding_from_loss(
         if snapshot.steps == 0 {
             continue;
         }
-        let (learning_contract, observation_contract) =
-            local_predictive_coding_event_contract(config.solver, config.learning_schedule);
+        let global_backprop_control = matches!(
+            config.training_algorithm,
+            TrainingAlgorithm::Backpropagation
+        );
+        let (learning_contract, observation_contract) = if global_backprop_control {
+            (
+                "global_backpropagation_control_v1",
+                "verifier_terminal_global_autodiff",
+            )
+        } else {
+            local_predictive_coding_event_contract(config.solver, config.learning_schedule)
+        };
         output.write(PredictiveCodingSample {
             run_id: sample.run_id.clone(),
             epoch: Some(sample.epoch),
@@ -437,17 +462,25 @@ fn record_local_predictive_coding_from_loss(
             optimizer_step: sample.absolute_step,
             learning_contract: learning_contract.to_string(),
             execution_contract_version: config.execution_contract.version,
-            activity_derivative_contract: config
-                .execution_contract
-                .activity_derivatives
-                .as_str()
-                .to_string(),
-            parameter_derivative_contract: config
-                .execution_contract
-                .parameter_derivatives
-                .as_str()
-                .to_string(),
-            global_autodiff_graph: false,
+            activity_derivative_contract: if global_backprop_control {
+                "global_autodiff".to_string()
+            } else {
+                config
+                    .execution_contract
+                    .activity_derivatives
+                    .as_str()
+                    .to_string()
+            },
+            parameter_derivative_contract: if global_backprop_control {
+                "global_autodiff".to_string()
+            } else {
+                config
+                    .execution_contract
+                    .parameter_derivatives
+                    .as_str()
+                    .to_string()
+            },
+            global_autodiff_graph: global_backprop_control,
             observation_contract: observation_contract.to_string(),
             deployment_aligned: false,
             chunks_seen: snapshot.steps as usize,
@@ -460,7 +493,27 @@ fn record_local_predictive_coding_from_loss(
             gradient_tensors: snapshot.gradient_tensors as usize,
             direct_forward_updates: snapshot.direct_forward_updates as usize,
             feedback_parameter_updates: snapshot.feedback_parameter_updates as usize,
+            adjoint_teacher_updates: snapshot.adjoint_teacher_updates as usize,
+            adjoint_local_updates: snapshot.adjoint_local_updates as usize,
+            adjoint_calibration_samples: snapshot.adjoint_calibration_samples as usize,
+            adjoint_calibration_loss: snapshot.last_adjoint_calibration_loss,
+            adjoint_cosine_alignment: snapshot.last_adjoint_cosine_alignment,
+            adjoint_prediction_teacher_norm_ratio: snapshot
+                .last_adjoint_prediction_teacher_norm_ratio,
+            adjoint_update_rms: snapshot.last_adjoint_update_rms,
             parameter_updates: snapshot.parameter_updates as usize,
+            terminal_factor_kind: match config.terminal_criterion {
+                crate::config::LocalPredictiveCodingTerminalCriterion::NextToken => {
+                    "next_token".to_string()
+                }
+                crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSet => {
+                    "alternating_next_token_ruliad_verifier_set".to_string()
+                }
+            },
+            structured_terminal_steps: snapshot.structured_terminal_steps as usize,
+            structured_terminal_skipped_steps: snapshot.structured_terminal_skipped_steps as usize,
+            structured_terminal_groups: snapshot.structured_terminal_groups as usize,
+            structured_terminal_rows: snapshot.structured_terminal_rows as usize,
             energy_before: snapshot.last_energy_before,
             energy_after: snapshot.last_energy_after,
             energy_delta: snapshot

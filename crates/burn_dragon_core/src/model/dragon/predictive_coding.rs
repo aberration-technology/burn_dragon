@@ -91,6 +91,15 @@ pub struct DragonPredictiveCodingHeadActivityVjp<B: Backend> {
     pub normalization: Tensor<B, 1>,
 }
 
+/// Analytic VJP from an arbitrary terminal logits objective through Dragon's
+/// flat language head. This is the criterion-neutral boundary used by local
+/// predictive coding; no autodiff graph is constructed.
+#[derive(Debug, Clone)]
+pub struct DragonPredictiveCodingLogitsVjp<B: Backend> {
+    pub grad_hidden: Tensor<B, 3>,
+    pub grad_lm_head: Tensor<B, 2>,
+}
+
 impl<B: Backend> DragonModel<B>
 where
     B::Device: 'static,
@@ -1004,24 +1013,73 @@ where
         Ok(self.lm_head.as_ref().expect("validated flat LM head").val())
     }
 
+    /// Compute flat language-head logits for a criterion implemented outside
+    /// the model adapter.
+    pub fn predictive_coding_logits(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
+        let head = self
+            .predictive_coding_head_weight()
+            .expect("unsupported Dragon predictive-coding head");
+        let [batch, time, dim] = hidden.shape().dims::<3>();
+        assert_eq!(dim, head.shape().dims::<2>()[0]);
+        let vocab = head.shape().dims::<2>()[1];
+        hidden
+            .reshape([batch * time, dim])
+            .matmul(head)
+            .reshape([batch, time, vocab])
+    }
+
+    /// VJP from a criterion-supplied logits derivative to terminal activity.
+    /// This intentionally omits the language-head outer product during
+    /// iterative activity inference.
+    pub fn predictive_coding_logits_activity_vjp(&self, grad_logits: Tensor<B, 3>) -> Tensor<B, 3> {
+        let head = self
+            .predictive_coding_head_weight()
+            .expect("unsupported Dragon predictive-coding head");
+        let [batch, time, vocab] = grad_logits.shape().dims::<3>();
+        let [dim, head_vocab] = head.shape().dims::<2>();
+        assert_eq!(vocab, head_vocab);
+        grad_logits
+            .reshape([batch * time, vocab])
+            .matmul(head.transpose())
+            .reshape([batch, time, dim])
+    }
+
+    /// Complete language-head VJP for a criterion-supplied logits derivative.
+    pub fn predictive_coding_logits_vjp(
+        &self,
+        hidden: Tensor<B, 3>,
+        grad_logits: Tensor<B, 3>,
+    ) -> DragonPredictiveCodingLogitsVjp<B> {
+        let head = self
+            .predictive_coding_head_weight()
+            .expect("unsupported Dragon predictive-coding head");
+        let [batch, time, dim] = hidden.shape().dims::<3>();
+        let [grad_batch, grad_time, vocab] = grad_logits.shape().dims::<3>();
+        assert_eq!([grad_batch, grad_time], [batch, time]);
+        assert_eq!(head.shape().dims::<2>(), [dim, vocab]);
+        let hidden_flat = hidden.reshape([batch * time, dim]);
+        let grad_logits_flat = grad_logits.reshape([batch * time, vocab]);
+        let grad_hidden = grad_logits_flat
+            .clone()
+            .matmul(head.transpose())
+            .reshape([batch, time, dim]);
+        let grad_lm_head = hidden_flat.transpose().matmul(grad_logits_flat);
+        DragonPredictiveCodingLogitsVjp {
+            grad_hidden,
+            grad_lm_head,
+        }
+    }
+
     pub fn predictive_coding_head_vjp(
         &self,
         hidden: Tensor<B, 3>,
         targets: Tensor<B, 2, Int>,
         loss_mask: Option<Tensor<B, 2, Int>>,
     ) -> DragonPredictiveCodingHeadVjp<B> {
-        let head = self
-            .predictive_coding_head_weight()
-            .expect("unsupported Dragon predictive-coding head");
-        let [batch, time, dim] = hidden.shape().dims::<3>();
-        let vocab = head.shape().dims::<2>()[1];
+        let [batch, time, _dim] = hidden.shape().dims::<3>();
         assert_eq!(targets.shape().dims::<2>(), [batch, time]);
-
-        let logits = hidden
-            .clone()
-            .reshape([batch * time, dim])
-            .matmul(head.clone())
-            .reshape([batch, time, vocab]);
+        let logits = self.predictive_coding_logits(hidden.clone());
+        let vocab = logits.shape().dims::<3>()[2];
         let log_probs = activation::log_softmax(logits.clone(), 2);
         let selected = log_probs
             .clone()
@@ -1044,19 +1102,13 @@ where
         let grad_logits = (activation::softmax(logits, 2) - one_hot)
             * mask.reshape([batch, time, 1])
             / denominator.reshape([1, 1, 1]);
-        let hidden_flat = hidden.reshape([batch * time, dim]);
-        let grad_logits_flat = grad_logits.reshape([batch * time, vocab]);
-        let grad_hidden = grad_logits_flat
-            .clone()
-            .matmul(head.transpose())
-            .reshape([batch, time, dim]);
-        let grad_lm_head = hidden_flat.transpose().matmul(grad_logits_flat);
+        let vjp = self.predictive_coding_logits_vjp(hidden, grad_logits);
 
         DragonPredictiveCodingHeadVjp {
             loss,
             masked_token_losses,
-            grad_hidden,
-            grad_lm_head,
+            grad_hidden: vjp.grad_hidden,
+            grad_lm_head: vjp.grad_lm_head,
             supervised_tokens: supervised_tokens.reshape([1]),
         }
     }
@@ -1070,23 +1122,16 @@ where
         targets: Tensor<B, 2, Int>,
         loss_mask: Option<Tensor<B, 2, Int>>,
     ) -> DragonPredictiveCodingHeadActivityVjp<B> {
-        let head = self
-            .predictive_coding_head_weight()
-            .expect("unsupported Dragon predictive-coding head");
-        let [batch, time, dim] = hidden.shape().dims::<3>();
-        let vocab = head.shape().dims::<2>()[1];
+        let [batch, time, _dim] = hidden.shape().dims::<3>();
         assert_eq!(targets.shape().dims::<2>(), [batch, time]);
-
-        let logits = hidden
-            .reshape([batch * time, dim])
-            .matmul(head.clone())
-            .reshape([batch, time, vocab]);
+        let logits = self.predictive_coding_logits(hidden);
+        let vocab = logits.shape().dims::<3>()[2];
         let log_probs = activation::log_softmax(logits.clone(), 2);
         let selected = log_probs
             .gather(2, targets.clone().reshape([batch, time, 1]))
             .reshape([batch, time]);
         let mask = loss_mask.map_or_else(
-            || Tensor::<B, 2>::ones([batch, time], &head.device()),
+            || Tensor::<B, 2>::ones([batch, time], &logits.device()),
             |mask| mask.float(),
         );
         let denominator = mask.clone().sum().clamp_min(1.0);
@@ -1097,10 +1142,7 @@ where
         let grad_logits = (activation::softmax(logits, 2) - targets.one_hot::<3>(vocab).float())
             * mask.reshape([batch, time, 1])
             / denominator.clone().reshape([1, 1, 1]);
-        let grad_hidden = grad_logits
-            .reshape([batch * time, vocab])
-            .matmul(head.transpose())
-            .reshape([batch, time, dim]);
+        let grad_hidden = self.predictive_coding_logits_activity_vjp(grad_logits);
         DragonPredictiveCodingHeadActivityVjp {
             loss,
             grad_hidden,

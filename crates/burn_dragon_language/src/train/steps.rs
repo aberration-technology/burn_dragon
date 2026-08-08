@@ -1745,29 +1745,23 @@ fn verifier_equivalent_action_log_probabilities<B: Backend>(
     equivalent_mask: Tensor<B, 3>,
     normalization: crate::config::RuliadProofPolicyNormalization,
 ) -> Tensor<B, 1> {
-    let [row_count, branch_count, _] = branch_logits.shape().dims::<3>();
+    let [row_count, branch_count, vocab] = branch_logits.shape().dims::<3>();
     debug_assert_eq!(branch_count, 1);
-    let probabilities = log_probs_from_logits(branch_logits).exp();
-    let candidate_probability = (probabilities.clone() * candidate_mask)
-        .sum_dim(2)
-        .reshape([row_count])
-        .clamp_min(1.0e-12);
-    let equivalent_probability = (probabilities * equivalent_mask)
-        .sum_dim(2)
-        .reshape([row_count])
-        .clamp_min(1.0e-12);
-    let objective_probability = match normalization {
-        crate::config::RuliadProofPolicyNormalization::CandidateConditional => {
-            equivalent_probability
-                .div(candidate_probability)
-                .clamp_max(1.0)
+    let candidate_mask = match normalization {
+        crate::config::RuliadProofPolicyNormalization::CandidateConditional
+        | crate::config::RuliadProofPolicyNormalization::PrefixConditional => {
+            candidate_mask.reshape([row_count, vocab])
         }
-        crate::config::RuliadProofPolicyNormalization::PrefixConditional => equivalent_probability
-            .div(candidate_probability)
-            .clamp_max(1.0),
-        crate::config::RuliadProofPolicyNormalization::VocabularyMarginal => equivalent_probability,
+        crate::config::RuliadProofPolicyNormalization::VocabularyMarginal => {
+            Tensor::<B, 2>::ones([row_count, vocab], &branch_logits.device())
+        }
     };
-    objective_probability.clamp_min(1.0e-12).log()
+    burn_pc::categorical_conditional_set_log_probabilities(
+        branch_logits.reshape([row_count, vocab]),
+        candidate_mask,
+        equivalent_mask.reshape([row_count, vocab]),
+        1.0e-12,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11847,6 +11841,8 @@ impl<B: AutodiffBackend> LanguageTrainModel<B> {
                 gradient_tensors,
                 direct_forward_updates: 0,
                 feedback_parameter_updates: 0,
+                adjoint_teacher_updates: 0,
+                adjoint_local_updates: 0,
                 parameter_updates: config.inference.steps,
                 energy_before,
                 energy_after,
@@ -11861,6 +11857,95 @@ impl<B: AutodiffBackend> LanguageTrainModel<B> {
         }
         self.store_step_state(state);
         self
+    }
+
+    fn amortized_adjoint_predictive_coding_step(
+        &self,
+        batch: SequenceBatch<B>,
+    ) -> TrainOutput<LanguageModelTrainItem<B>>
+    where
+        B::Device: 'static,
+        B::FloatTensorPrimitive: 'static,
+    {
+        let [batch_size, block_size] = batch.inputs.shape().dims::<2>();
+        let chunk_size = self
+            .effective_tbptt_chunk_size(block_size)
+            .unwrap_or(block_size);
+        let mut state = self.load_step_state(batch.reset_stream_state, block_size);
+        let feedback_state = self.dkp_feedback_for_checkpoint();
+        let mut feedback = feedback_state.as_ref().map(|state| state.feedback.clone());
+        let mut feedback_updates = feedback_state.map_or(0, |state| state.updates);
+        let mut accumulator = GradientsAccumulator::new();
+        let mut total_loss: Option<Tensor<B, 1>> = None;
+        let mut total_supervised_tokens: Option<Tensor<B, 1>> = None;
+        let mut total_elapsed_ns = 0u128;
+
+        for start in (0..block_size).step_by(chunk_size) {
+            let end = (start + chunk_size).min(block_size);
+            let mut derivatives =
+                super::local_predictive_coding::amortized_adjoint_predictive_coding_train_step(
+                    &self.model,
+                    Self::slice_tokens(batch.inputs.clone(), batch_size, start, end),
+                    Self::slice_tokens(batch.targets.clone(), batch_size, start, end),
+                    batch
+                        .loss_mask
+                        .clone()
+                        .map(|mask| Self::slice_tokens(mask, batch_size, start, end)),
+                    state,
+                    feedback,
+                    feedback_updates,
+                    &self.local_predictive_coding,
+                    &self.local_predictive_coding_profile,
+                );
+            state = derivatives.terminal_state;
+            feedback = derivatives.dkp_feedback.take();
+            feedback_updates = feedback_updates.saturating_add(1);
+            let supervised_tokens = derivatives.supervised_tokens.clone();
+            rescale_gradients_by_device_scalar::<B, _>(
+                self,
+                &mut derivatives.grads,
+                supervised_tokens.clone().inner(),
+                false,
+            );
+            accumulator.accumulate(self, derivatives.grads);
+            let weighted_loss = derivatives.loss * supervised_tokens.clone();
+            total_loss = Some(match total_loss {
+                Some(accumulated) => accumulated + weighted_loss,
+                None => weighted_loss,
+            });
+            total_supervised_tokens = Some(match total_supervised_tokens {
+                Some(accumulated) => accumulated + supervised_tokens,
+                None => supervised_tokens,
+            });
+            total_elapsed_ns = total_elapsed_ns.saturating_add(derivatives.report.elapsed_ns);
+        }
+        self.restore_dkp_feedback_from_checkpoint(feedback.map(|feedback| {
+            super::local_predictive_coding::DkpFeedbackState {
+                feedback,
+                updates: feedback_updates,
+            }
+        }));
+        self.store_step_state(state);
+        if crate::train::profile::enabled() {
+            crate::train::profile::record_local_learning_step(total_elapsed_ns);
+        }
+        let supervised_tokens = total_supervised_tokens
+            .expect("amortized adjoint requires at least one chunk")
+            .clamp_min(1.0);
+        let mut grads = accumulator.grads();
+        rescale_gradients_by_device_scalar::<B, _>(
+            self,
+            &mut grads,
+            supervised_tokens.clone().inner(),
+            true,
+        );
+        TrainOutput {
+            grads: self.apply_gradient_scale_schedule(grads),
+            item: LanguageModelTrainItem::new(
+                total_loss.expect("amortized adjoint requires at least one chunk")
+                    / supervised_tokens,
+            ),
+        }
     }
 
     fn stage_dkp_predictive_coding_step(
@@ -11878,9 +11963,9 @@ impl<B: AutodiffBackend> LanguageTrainModel<B> {
             .unwrap_or(block_size);
         let initial_state = self.load_step_state(batch.reset_stream_state, block_size);
         let mut metric_state = initial_state.clone();
-        let mut feedback = self
-            .dkp_feedback_for_checkpoint()
-            .map(|state| state.feedback);
+        let feedback_state = self.dkp_feedback_for_checkpoint();
+        let mut feedback = feedback_state.as_ref().map(|state| state.feedback.clone());
+        let feedback_updates = feedback_state.map_or(0, |state| state.updates);
         let mut total_loss: Option<Tensor<B, 1>> = None;
         let mut total_supervised_tokens: Option<Tensor<B, 1>> = None;
         let mut first_chunk = None;
@@ -11901,6 +11986,7 @@ impl<B: AutodiffBackend> LanguageTrainModel<B> {
                     loss_mask,
                     metric_state,
                     feedback.clone(),
+                    feedback_updates,
                     &self.local_predictive_coding,
                 );
                 metric_state = chunk.terminal_state.clone();
@@ -12003,6 +12089,7 @@ impl<B: AutodiffBackend> LanguageTrainModel<B> {
             let mut chunk = if start == 0 {
                 first_chunk.take().expect("staged first DKP chunk")
             } else {
+                let feedback_state = self.dkp_feedback_for_checkpoint();
                 super::local_predictive_coding::prepare_dkp_predictive_coding_chunk(
                     &self.model,
                     Self::slice_tokens(batch.inputs.clone(), batch_size, start, end),
@@ -12012,8 +12099,10 @@ impl<B: AutodiffBackend> LanguageTrainModel<B> {
                         .clone()
                         .map(|mask| Self::slice_tokens(mask, batch_size, start, end)),
                     state,
-                    self.dkp_feedback_for_checkpoint()
-                        .map(|feedback| feedback.feedback),
+                    feedback_state
+                        .as_ref()
+                        .map(|feedback| feedback.feedback.clone()),
+                    feedback_state.map_or(0, |feedback| feedback.updates),
                     &config,
                 )
             };
@@ -12045,12 +12134,25 @@ impl<B: AutodiffBackend> LanguageTrainModel<B> {
         self
     }
 
-    pub(crate) fn uses_dkp_predictive_coding(&self) -> bool {
+    fn uses_two_phase_dkp_predictive_coding(&self) -> bool {
         matches!(self.training_algorithm, TrainingAlgorithm::PredictiveCoding)
             && matches!(
                 self.local_predictive_coding.solver,
                 LocalPredictiveCodingSolver::DirectKolenPollack
             )
+    }
+
+    pub(crate) fn uses_amortized_adjoint_predictive_coding(&self) -> bool {
+        matches!(self.training_algorithm, TrainingAlgorithm::PredictiveCoding)
+            && matches!(
+                self.local_predictive_coding.solver,
+                LocalPredictiveCodingSolver::AmortizedAdjoint
+            )
+    }
+
+    pub(crate) fn uses_dkp_predictive_coding(&self) -> bool {
+        self.uses_two_phase_dkp_predictive_coding()
+            || self.uses_amortized_adjoint_predictive_coding()
     }
 
     pub(crate) fn uses_incremental_predictive_coding(&self) -> bool {
@@ -12233,7 +12335,11 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
             &batch.inputs.device(),
             stochastic_step_seed(self.stochastic_seed, step_index, STOCHASTIC_STREAM_MAIN),
         );
-        if self.uses_dkp_predictive_coding() {
+        let ruliad_policy_batch = batch.ruliad_policy_batch.clone();
+        if self.uses_amortized_adjoint_predictive_coding() {
+            return self.amortized_adjoint_predictive_coding_step(batch);
+        }
+        if self.uses_two_phase_dkp_predictive_coding() {
             return self.stage_dkp_predictive_coding_step(batch);
         }
         if self.uses_incremental_predictive_coding() {
@@ -12242,8 +12348,85 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
         let clean_inputs = batch.inputs;
         let targets = batch.targets;
         let loss_mask = batch.loss_mask;
+        let [batch_size, block_size] = clean_inputs.shape().dims::<2>();
+        if matches!(self.training_algorithm, TrainingAlgorithm::Backpropagation)
+            && super::local_predictive_coding::verifier_terminal_due(
+                self.local_predictive_coding.terminal_criterion,
+                self.ruliad_supervision.proof_policy,
+                step_index,
+            )
+        {
+            let prepared = ruliad_policy_batch.as_deref().and_then(|policy_batch| {
+                super::local_predictive_coding::prepare_ruliad_verifier_terminal::<B>(
+                    policy_batch,
+                    self.ruliad_supervision.proof_policy,
+                    block_size,
+                    self.model.vocab_size(),
+                    &clean_inputs.device(),
+                )
+            });
+            if let Some(prepared) = prepared {
+                let started = Instant::now();
+                let semantic_states = prepared.semantic_states;
+                let decision_rows = prepared.decision_rows;
+                let logits = self.model.forward(prepared.inputs);
+                let loss = prepared
+                    .criterion
+                    .verifier_autodiff_loss(logits)
+                    .expect("Ruliad verifier preparation must produce a verifier criterion");
+                let grads = loss.backward();
+                self.local_predictive_coding_profile
+                    .record_global_structured_terminal(
+                        semantic_states,
+                        decision_rows,
+                        started.elapsed().as_nanos(),
+                    );
+                return TrainOutput {
+                    grads: self
+                        .apply_gradient_scale_schedule(GradientsParams::from_grads(grads, self)),
+                    item: LanguageModelTrainItem::new(loss),
+                };
+            }
+            self.local_predictive_coding_profile
+                .record_structured_terminal_skip();
+        }
         if matches!(self.training_algorithm, TrainingAlgorithm::PredictiveCoding) {
-            let [batch_size, block_size] = clean_inputs.shape().dims::<2>();
+            if super::local_predictive_coding::verifier_terminal_due(
+                self.local_predictive_coding.terminal_criterion,
+                self.ruliad_supervision.proof_policy,
+                step_index,
+            ) {
+                let prepared = ruliad_policy_batch.as_deref().and_then(|policy_batch| {
+                    super::local_predictive_coding::prepare_ruliad_verifier_terminal::<
+                        B::InnerBackend,
+                    >(
+                        policy_batch,
+                        self.ruliad_supervision.proof_policy,
+                        block_size,
+                        self.model.vocab_size(),
+                        &clean_inputs.device(),
+                    )
+                });
+                if let Some(prepared) = prepared {
+                    let step =
+                        super::local_predictive_coding::local_predictive_coding_verifier_train_step(
+                            &self.model,
+                            prepared,
+                            &self.local_predictive_coding,
+                            &self.local_predictive_coding_profile,
+                        );
+                    debug_assert_eq!(step.report.global_backward_calls, 0);
+                    if prof_enabled {
+                        crate::train::profile::record_local_learning_step(step.report.elapsed_ns);
+                    }
+                    return TrainOutput {
+                        grads: self.apply_gradient_scale_schedule(step.grads),
+                        item: LanguageModelTrainItem::new(step.loss),
+                    };
+                }
+                self.local_predictive_coding_profile
+                    .record_structured_terminal_skip();
+            }
             let chunk_size = self.effective_tbptt_chunk_size(block_size);
             if chunk_size.is_none() && !self.tbptt_persist_across_steps {
                 let step = super::local_predictive_coding::local_predictive_coding_train_step(
@@ -12329,7 +12512,6 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                 item: LanguageModelTrainItem::new(loss),
             };
         }
-        let ruliad_policy_batch = batch.ruliad_policy_batch;
         if !self.objective.is_next_token() {
             self.update_teacher_runtime();
             let loss = self.objective_loss(clean_inputs, targets);
@@ -13206,7 +13388,7 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
         O: Optimizer<Self, B2>,
         Self: AutodiffModule<B2>,
     {
-        if self.uses_dkp_predictive_coding() {
+        if self.uses_two_phase_dkp_predictive_coding() {
             return self.optimize_dkp_predictive_coding::<B2, O>(optim, lr);
         }
         if self.uses_incremental_predictive_coding() {
@@ -14449,6 +14631,323 @@ mod objective_step_tests {
         assert_eq!(snapshot.feedback_parameter_updates, 8);
         assert_eq!(snapshot.parameter_updates, 8);
         assert_eq!(snapshot.inference_steps, 4);
+    }
+
+    #[test]
+    fn amortized_dkp_alternates_exact_local_teachers_with_cheap_feedback_updates() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mut model_config = tiny_model_config();
+        model_config.n_layer = 2;
+        model_config.sequence_kernel =
+            burn_dragon_core::SequenceKernelConfig::dense_score_short_context();
+        model_config.fused_kernels.rotary_embedding = burn_dragon_core::RotaryEmbedding::Alibi;
+        let config = LocalPredictiveCodingConfig {
+            solver: LocalPredictiveCodingSolver::DirectKolenPollack,
+            inference: burn_pc::PcInferenceConfig {
+                steps: 1,
+                max_grad_norm: None,
+                ..burn_pc::PcInferenceConfig::default()
+            },
+            amortized_adjoint: burn_pc::PcAmortizedAdjointConfig {
+                enabled: true,
+                teacher_every_updates: 2,
+                calibration: burn_pc::PcAdjointCalibrationConfig {
+                    learning_rate: 0.1,
+                    max_update_norm: Some(1.0),
+                    ..burn_pc::PcAdjointCalibrationConfig::default()
+                },
+            },
+            ..LocalPredictiveCodingConfig::default()
+        };
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(model_config, &device))
+            .with_training_algorithm(TrainingAlgorithm::PredictiveCoding)
+            .with_local_predictive_coding(config);
+        let profile = model.local_predictive_coding_profile();
+        let batch = || SequenceBatch {
+            inputs: Tensor::from_data(TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]), &device),
+            targets: Tensor::from_data(TensorData::new(vec![2_i64, 3, 4, 5], [1, 4]), &device),
+            loss_mask: None,
+            summary_event_mask: None,
+            ruliad_policy_batch: None,
+            reset_stream_state: true,
+        };
+        let mut optimizer = SgdConfig::new().init::<TestBackend, LanguageTrainModel<TestBackend>>();
+
+        let step = burn_train::TrainStep::step(&model, batch());
+        let model = burn_train::TrainStep::optimize::<TestBackend, _>(
+            model,
+            &mut optimizer,
+            1.0e-3,
+            step.grads,
+        );
+        let after_teacher = profile.snapshot();
+        assert_eq!(after_teacher.adjoint_teacher_updates, 2);
+        assert_eq!(after_teacher.adjoint_local_updates, 0);
+        assert_eq!(after_teacher.global_backward_calls, 0);
+
+        let step = burn_train::TrainStep::step(&model, batch());
+        let model = burn_train::TrainStep::optimize::<TestBackend, _>(
+            model,
+            &mut optimizer,
+            1.0e-3,
+            step.grads,
+        );
+        let after_local = profile.snapshot();
+        assert_eq!(after_local.adjoint_teacher_updates, 2);
+        assert_eq!(after_local.adjoint_local_updates, 2);
+        assert_eq!(after_local.global_backward_calls, 0);
+        let feedback = model
+            .dkp_feedback_for_checkpoint()
+            .expect("amortized feedback checkpoint");
+        assert_eq!(feedback.updates, 2);
+        assert!(tensor_scalar(feedback.feedback.abs().max().reshape([1])).is_finite());
+    }
+
+    #[test]
+    fn amortized_adjoint_emits_one_outer_update_and_persists_its_feedback_bank() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mut model_config = tiny_model_config();
+        model_config.n_layer = 2;
+        model_config.sequence_kernel =
+            burn_dragon_core::SequenceKernelConfig::dense_score_short_context();
+        model_config.fused_kernels.rotary_embedding = burn_dragon_core::RotaryEmbedding::Alibi;
+        let config = LocalPredictiveCodingConfig {
+            solver: LocalPredictiveCodingSolver::AmortizedAdjoint,
+            factor_reduction: PredictiveCodingFactorReduction::Sum,
+            direct_feedback: burn_pc::PcDirectFeedbackConfig {
+                initialization: burn_pc::PcFeedbackInitialization::Identity,
+                ..burn_pc::PcDirectFeedbackConfig::default()
+            },
+            amortized_adjoint: burn_pc::PcAmortizedAdjointConfig {
+                enabled: true,
+                teacher_every_updates: 2,
+                calibration: burn_pc::PcAdjointCalibrationConfig {
+                    learning_rate: 0.1,
+                    max_update_norm: Some(1.0),
+                    ..burn_pc::PcAdjointCalibrationConfig::default()
+                },
+            },
+            ..LocalPredictiveCodingConfig::default()
+        };
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(model_config, &device))
+            .with_training_algorithm(TrainingAlgorithm::PredictiveCoding)
+            .with_local_predictive_coding(config);
+        let profile = model.local_predictive_coding_profile();
+        let batch = || SequenceBatch {
+            inputs: Tensor::from_data(TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]), &device),
+            targets: Tensor::from_data(TensorData::new(vec![2_i64, 3, 4, 5], [1, 4]), &device),
+            loss_mask: None,
+            summary_event_mask: None,
+            ruliad_policy_batch: None,
+            reset_stream_state: true,
+        };
+        let mut optimizer = SgdConfig::new().init::<TestBackend, LanguageTrainModel<TestBackend>>();
+
+        let teacher_step = burn_train::TrainStep::step(&model, batch());
+        assert_eq!(teacher_step.grads.len(), 9);
+        let model = burn_train::TrainStep::optimize::<TestBackend, _>(
+            model,
+            &mut optimizer,
+            1.0e-3,
+            teacher_step.grads,
+        );
+        let first_feedback = model
+            .dkp_feedback_for_checkpoint()
+            .expect("amortized-adjoint feedback after exact anchor");
+        assert_eq!(first_feedback.updates, 1);
+        let after_teacher = profile.snapshot();
+        assert_eq!(after_teacher.adjoint_teacher_updates, 2);
+        assert_eq!(after_teacher.adjoint_local_updates, 0);
+        assert_eq!(after_teacher.parameter_updates, 1);
+        assert_eq!(after_teacher.global_backward_calls, 0);
+
+        let local_step = burn_train::TrainStep::step(&model, batch());
+        assert_eq!(local_step.grads.len(), 9);
+        let model = burn_train::TrainStep::optimize::<TestBackend, _>(
+            model,
+            &mut optimizer,
+            1.0e-3,
+            local_step.grads,
+        );
+        let second_feedback = model
+            .dkp_feedback_for_checkpoint()
+            .expect("amortized-adjoint feedback after local use");
+        assert_eq!(second_feedback.updates, 2);
+        let after_local = profile.snapshot();
+        assert_eq!(after_local.adjoint_teacher_updates, 2);
+        assert_eq!(after_local.adjoint_local_updates, 2);
+        assert_eq!(after_local.parameter_updates, 2);
+        assert_eq!(after_local.global_backward_calls, 0);
+    }
+
+    #[test]
+    fn empty_verifier_terminal_panel_falls_back_and_records_the_skip() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mut model_config = tiny_model_config();
+        model_config.sequence_kernel =
+            burn_dragon_core::SequenceKernelConfig::dense_score_short_context();
+        model_config.fused_kernels.rotary_embedding = burn_dragon_core::RotaryEmbedding::Alibi;
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(model_config, &device))
+            .with_training_algorithm(TrainingAlgorithm::PredictiveCoding)
+            .with_local_predictive_coding(LocalPredictiveCodingConfig {
+                solver: LocalPredictiveCodingSolver::FixedPrediction,
+                terminal_criterion:
+                    crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSet,
+                ..LocalPredictiveCodingConfig::default()
+            })
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                proof_policy: crate::config::RuliadProofPolicyTrainingConfig {
+                    enabled: true,
+                    mode: crate::config::RuliadProofPolicyTrainingMode::StaticExpert,
+                    every_steps: 1,
+                    start_after_steps: 0,
+                    stratified_difficulty_levels: 1,
+                    ..crate::config::RuliadProofPolicyTrainingConfig::default()
+                },
+                ..RuliadSupervisionConfig::default()
+            });
+        let profile = model.local_predictive_coding_profile();
+        let output = burn_train::TrainStep::step(
+            &model,
+            SequenceBatch {
+                inputs: Tensor::from_data(TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]), &device),
+                targets: Tensor::from_data(TensorData::new(vec![2_i64, 3, 4, 5], [1, 4]), &device),
+                loss_mask: None,
+                summary_event_mask: None,
+                ruliad_policy_batch: None,
+                reset_stream_state: true,
+            },
+        );
+        assert!(!output.grads.is_empty());
+        let snapshot = profile.snapshot();
+        assert_eq!(snapshot.structured_terminal_steps, 0);
+        assert_eq!(snapshot.structured_terminal_skipped_steps, 1);
+        assert_eq!(snapshot.global_backward_calls, 0);
+    }
+
+    #[test]
+    fn backpropagation_executes_the_same_structured_verifier_terminal() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mut model_config = tiny_model_config();
+        model_config.vocab_size = 272;
+        model_config.sequence_kernel =
+            burn_dragon_core::SequenceKernelConfig::dense_score_short_context();
+        model_config.fused_kernels.rotary_embedding = burn_dragon_core::RotaryEmbedding::Alibi;
+        let proof_policy = crate::config::RuliadProofPolicyTrainingConfig {
+            enabled: true,
+            mode: crate::config::RuliadProofPolicyTrainingMode::StaticExpert,
+            scoring: crate::config::RuliadProofPolicyScoring::CompletionLikelihood,
+            gradient_scope: crate::config::RuliadProofPolicyGradientScope::FullModel,
+            normalization: crate::config::RuliadProofPolicyNormalization::PrefixConditional,
+            candidate_symmetry: crate::config::RuliadProofPolicyCandidateSymmetry::BalancedRotation,
+            presentation_risk: crate::config::RuliadProofPolicyPresentationRisk::Mean,
+            weight: 1.0,
+            every_steps: 1,
+            start_after_steps: 0,
+            max_rows_per_update: 1,
+            max_presentation_rows_per_update: 64,
+            candidates: 4,
+            max_completion_tokens: 128,
+            stratified_difficulty_levels: 1,
+            ..crate::config::RuliadProofPolicyTrainingConfig::default()
+        };
+        let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(model_config, &device))
+            .with_training_algorithm(TrainingAlgorithm::Backpropagation)
+            .with_local_predictive_coding(LocalPredictiveCodingConfig {
+                terminal_criterion:
+                    crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSet,
+                ..LocalPredictiveCodingConfig::default()
+            })
+            .with_ruliad_supervision(RuliadSupervisionConfig {
+                proof_policy,
+                ..RuliadSupervisionConfig::default()
+            });
+        let bundle = burn_dragon_universality::ruliad::formal::generate_formal_bundle(
+            41,
+            burn_dragon_universality::ruliad::formal::RuliadFormalGeneratorConfig {
+                rewrite_depth: 2,
+                leaf_count: 3,
+                context_depth: 1,
+                distractor_axioms: 1,
+                ..Default::default()
+            },
+        )
+        .expect("formal bundle");
+        let proof_step_index = 1.min(bundle.certificate.step_count().saturating_sub(1));
+        let actions = burn_dragon_universality::ruliad::oracle_proof_action_set(
+            &bundle.problem,
+            &bundle.certificate,
+            proof_step_index,
+            4,
+        )
+        .expect("proof actions");
+        let answer_contract =
+            burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::SemanticStep;
+        let item = burn_dragon_universality::RuliadEvalItem {
+            oracle_hash: bundle.problem.canonical_hash().expect("problem hash"),
+            sample_index: 41,
+            split: burn_dragon_universality::SampleSplit::Train,
+            family: "formal_proof".to_string(),
+            task_kind: burn_dragon_universality::RuliadTaskKind::SelectProofAction
+                .label()
+                .to_string(),
+            math_domains: vec!["formal_proof".to_string()],
+            reasoning_modes: vec!["proof_construction".to_string()],
+            prompt: burn_dragon_universality::ruliad::ruliad_proof_action_prompt(
+                &bundle.problem,
+                &actions,
+            )
+            .expect("proof prompt"),
+            expected_answer: burn_dragon_universality::ruliad::proof_action_answer(
+                &actions,
+                actions.selected_index,
+                answer_contract,
+            )
+            .expect("proof answer"),
+            difficulty_level: Some(0),
+            spec: Some(burn_dragon_universality::RuliadSampleSpec::FormalProof {
+                problem: bundle.problem,
+                certificate: bundle.certificate,
+                candidate: None,
+                proof_step_index: Some(proof_step_index),
+                action_presentation_rotation: Some(0),
+                action_answer_contract: answer_contract,
+                task: burn_dragon_universality::RuliadTaskKind::SelectProofAction,
+            }),
+        };
+        let policy_batch = Arc::new(crate::dataset::RuliadPolicyBatch {
+            samples: vec![crate::dataset::RuliadPolicySample {
+                item,
+                prompt_tokens: vec![1],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::StructuredSymbolic {
+                vocab_size: 272,
+                eos_id: Some(271),
+            },
+            stop_token_id: Some(271),
+        });
+        let profile = model.local_predictive_coding_profile();
+        let output = burn_train::TrainStep::step(
+            &model,
+            SequenceBatch {
+                inputs: Tensor::zeros([1, 512], &device),
+                targets: Tensor::zeros([1, 512], &device),
+                loss_mask: None,
+                summary_event_mask: None,
+                ruliad_policy_batch: Some(policy_batch),
+                reset_stream_state: true,
+            },
+        );
+
+        assert!(!output.grads.is_empty());
+        let snapshot = profile.snapshot();
+        assert_eq!(snapshot.steps, 1);
+        assert_eq!(snapshot.global_backward_calls, 1);
+        assert_eq!(snapshot.local_vjp_calls, 0);
+        assert_eq!(snapshot.structured_terminal_steps, 1);
+        assert_eq!(snapshot.structured_terminal_skipped_steps, 0);
+        assert_eq!(snapshot.structured_terminal_groups, 1);
+        assert!(snapshot.structured_terminal_rows > 0);
     }
 
     #[test]

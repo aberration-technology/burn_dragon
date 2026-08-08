@@ -66,7 +66,7 @@ struct RuliadSupervisedStreamRequest {
     emit_loss_masks: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct RuliadValidationProbeItem {
     pub item: burn_dragon_universality::RuliadEvalItem,
     pub prompt_tokens: Vec<i64>,
@@ -2202,6 +2202,47 @@ impl UniversalityDataset {
         items
     }
 
+    /// Sample an immutable validation panel without consulting live curriculum state.
+    pub fn sample_ruliad_validation_probe_items_fixed(
+        &self,
+        panel_seed: u64,
+        max_items: usize,
+        prompt_mode: RuliadValidationPromptMode,
+    ) -> Vec<RuliadValidationProbeItem> {
+        let UniversalityStorage::OnTheFly(storage) = &self.storage else {
+            return Vec::new();
+        };
+        if max_items == 0 || storage.corpus.ruliad_config().is_none() {
+            return Vec::new();
+        }
+        let sample_count = storage.corpus.validation_samples().max(1);
+        let mut items = Vec::with_capacity(max_items);
+        let mut used_samples = HashSet::<usize>::with_capacity(max_items);
+        for item_rank in 0..sample_count {
+            if items.len() >= max_items {
+                break;
+            }
+            let initial_sample_index =
+                fixed_seeded_validation_probe_sample_index(sample_count, panel_seed, item_rank);
+            let sample_index = (0..sample_count)
+                .map(|offset| initial_sample_index.wrapping_add(offset) % sample_count)
+                .find(|sample_index| used_samples.insert(*sample_index));
+            let Some(sample_index) = sample_index else {
+                continue;
+            };
+            if let Some(item) = ruliad_validation_probe_item(
+                storage,
+                RULIAD_VALIDATION_PROBE_PANEL_EPOCH,
+                sample_index,
+                None,
+                prompt_mode,
+            ) {
+                items.push(item);
+            }
+        }
+        items
+    }
+
     pub fn sample_ruliad_validation_probe_items_stratified(
         &self,
         _epoch_index: usize,
@@ -3552,6 +3593,20 @@ fn fixed_validation_probe_sample_index(
     let seed = 0x66E3_5A9C_C9D4_17BFu64
         ^ bucket_seed.rotate_left(17)
         ^ (bucket_rank as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ u64::from(SOURCE_WEIGHTED_VALIDATION_SPLIT_TAG).rotate_left(31);
+    let mut rng = StdRng::seed_from_u64(seed);
+    rng.gen_range(0..sample_count)
+}
+
+fn fixed_seeded_validation_probe_sample_index(
+    sample_count: usize,
+    panel_seed: u64,
+    item_rank: usize,
+) -> usize {
+    let sample_count = sample_count.max(1);
+    let seed = 0xF3A5_9C71_621B_4E0Du64
+        ^ panel_seed.rotate_left(23)
+        ^ (item_rank as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
         ^ u64::from(SOURCE_WEIGHTED_VALIDATION_SPLIT_TAG).rotate_left(31);
     let mut rng = StdRng::seed_from_u64(seed);
     rng.gen_range(0..sample_count)
@@ -5483,6 +5538,53 @@ mod tests {
                 "oracle completion should verify for {}",
                 probe.item.oracle_hash
             );
+        }
+    }
+
+    #[test]
+    fn fixed_validation_panel_is_seeded_and_independent_of_live_selection() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("ruliad-live.toml");
+        let config = live_ruliad_runtime_config();
+        fs::write(&config_path, toml::to_string_pretty(&config).expect("toml"))
+            .expect("write config");
+        let dataset = UniversalityDataset::new_ruliad_on_the_fly(
+            &config_path,
+            32,
+            2,
+            &pretokenized_tokenizer(),
+        )
+        .expect("load live Ruliad dataset");
+
+        let first = dataset.sample_ruliad_validation_probe_items_fixed(
+            71,
+            4,
+            RuliadValidationPromptMode::CanonicalTransfer,
+        );
+        dataset.apply_source_selection_dynamics_control(4.0, 0.0);
+        let after_control = dataset.sample_ruliad_validation_probe_items_fixed(
+            71,
+            4,
+            RuliadValidationPromptMode::CanonicalTransfer,
+        );
+        let other_seed = dataset.sample_ruliad_validation_probe_items_fixed(
+            72,
+            4,
+            RuliadValidationPromptMode::CanonicalTransfer,
+        );
+        assert_eq!(first.len(), 4);
+        assert_eq!(first, after_control);
+        assert_ne!(first, other_seed);
+
+        let training_serialization = dataset.sample_ruliad_validation_probe_items_fixed(
+            71,
+            4,
+            RuliadValidationPromptMode::TrainingSerialization,
+        );
+        assert_eq!(training_serialization.len(), first.len());
+        for (canonical, training) in first.iter().zip(&training_serialization) {
+            assert_eq!(canonical.item.oracle_hash, training.item.oracle_hash);
+            assert_eq!(canonical.item.sample_index, training.item.sample_index);
         }
     }
 

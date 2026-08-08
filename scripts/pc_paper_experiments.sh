@@ -33,7 +33,9 @@ SEEDS_CSV="${BURN_DRAGON_PC_PAPER_SEEDS:-}"
 ITERS_CSV="${BURN_DRAGON_PC_PAPER_ITERS:-}"
 ARMS_CSV="${BURN_DRAGON_PC_PAPER_ARMS:-}"
 LOCAL_LEARNING_RATE="${BURN_DRAGON_PC_PAPER_LOCAL_LEARNING_RATE:-0.001}"
+ADJOINT_CALIBRATION_LR="${BURN_DRAGON_PC_PAPER_ADJOINT_CALIBRATION_LR:-0.1}"
 SOURCE_SELECTION_FEEDBACK_UPDATES="${BURN_DRAGON_PC_PAPER_SOURCE_SELECTION_FEEDBACK_UPDATES:-}"
+RULIAD_PANEL_MODE="${BURN_DRAGON_PC_PAPER_RULIAD_PANEL_MODE:-auto}"
 
 usage() {
   cat <<'USAGE'
@@ -45,7 +47,8 @@ Options:
                                local-factor | local-solver-promotion | local-solver-open-loop |
                                local-solver-recurrent | local-solver-recurrent-open-loop |
                                local-incremental-byte | local-error-promotion |
-                               local-direct-feedback | hparam | nextlat-tbptt
+                               local-direct-feedback | local-verifier-terminal |
+                               hparam | nextlat-tbptt
   --profile <path>             Base training TOML. Default: ruliad-1m JEPA profile.
   --backend <cuda|wgpu|cpu>    Backend. Default: cuda.
   --features <features>        Cargo features. Default: train,cuda.
@@ -331,7 +334,23 @@ matrix_defaults() {
       : "${PROFILE:=config/language/experiments/predictive_coding/local-pc-1m.toml}"
       : "${SEEDS_CSV:=20260807,20260808,20260809}"
       : "${ITERS_CSV:=128,512}"
-      : "${ARMS_CSV:=local_backprop,local_pc_fixed_prediction,local_pc_dkp_pre01_fb001_steps1,local_pc_dkp_identity_pre01_fb001_steps1,local_pc_dkp_identity_pre025_fb001_steps1}"
+      : "${ARMS_CSV:=local_backprop,local_pc_fixed_prediction,local_pc_dkp_pre01_fb001_steps1,local_pc_dkp_identity_pre01_fb001_steps1,local_pc_dkp_calibrated}"
+      : "${BATCH_SIZE:=32}"
+      if [[ -z "${BURN_DRAGON_PC_PAPER_CHECKPOINT_INTERVAL_ITERS:-}" ]]; then
+        CHECKPOINT_INTERVAL_ITERS=512
+      fi
+      if [[ -z "${BURN_DRAGON_PC_PAPER_TBPTT_CHUNK_SIZE:-}" ]]; then
+        TBPTT_CHUNK_SIZE=0
+      fi
+      if [[ "$TIMEOUT_SECONDS" == "0" ]]; then
+        TIMEOUT_SECONDS=1800
+      fi
+      ;;
+    local-verifier-terminal)
+      : "${PROFILE:=config/language/experiments/predictive_coding/local-pc-verifier-1m.toml}"
+      : "${SEEDS_CSV:=20260810,20260811,20260812}"
+      : "${ITERS_CSV:=128,512}"
+      : "${ARMS_CSV:=local_backprop,local_backprop_verifier,local_pc_fixed_verifier,local_pc_epc_verifier}"
       : "${BATCH_SIZE:=32}"
       if [[ -z "${BURN_DRAGON_PC_PAPER_CHECKPOINT_INTERVAL_ITERS:-}" ]]; then
         CHECKPOINT_INTERVAL_ITERS=512
@@ -369,6 +388,25 @@ matrix_defaults() {
 }
 
 matrix_defaults
+
+if [[ "$RULIAD_PANEL_MODE" == "auto" ]]; then
+  PROFILE_PROBE_PATH="$PROFILE"
+  if [[ "$PROFILE_PROBE_PATH" != /* ]]; then
+    PROFILE_PROBE_PATH="$ROOT_DIR/$PROFILE_PROBE_PATH"
+  fi
+  if grep -Eq 'type[[:space:]]*=[[:space:]]*"universality_ruliad"' "$PROFILE_PROBE_PATH"; then
+    RULIAD_PANEL_MODE="create_or_reuse"
+  else
+    RULIAD_PANEL_MODE="dynamic"
+  fi
+fi
+case "$RULIAD_PANEL_MODE" in
+  dynamic|create_or_reuse|require_existing) ;;
+  *)
+    echo "BURN_DRAGON_PC_PAPER_RULIAD_PANEL_MODE must be auto, dynamic, create_or_reuse, or require_existing" >&2
+    exit 2
+    ;;
+esac
 
 : "${TBPTT_PERSIST_ACROSS_STEPS:=false}"
 : "${SEQUENCE_BATCHING:=auto}"
@@ -412,6 +450,7 @@ if (( DRY_RUN == 1 && BUILD_RELEASE == 1 )); then
 fi
 
 mkdir -p "$OUT_DIR/overlays" "$OUT_DIR/logs" "$OUT_DIR/manifests" "$OUT_DIR/run_roots" "$OUT_DIR/gpu"
+RULIAD_PANEL_PATH="$OUT_DIR/panels/ruliad-validation-panel.json"
 RUN_INDEX="$OUT_DIR/run-index.tsv"
 if [[ ! -f "$RUN_INDEX" ]]; then
   printf "trial_key\tmatrix\titers\tarm\tseed\tbatch_size\tstatus\telapsed_seconds\tpeak_used_mb\tmin_available_mb\trun_dir\tmanifest\tlog\n" > "$RUN_INDEX"
@@ -593,7 +632,7 @@ write_overlay() {
   local sequence_batching_line="sequence_batching = \"$SEQUENCE_BATCHING\""
 
   case "$arm" in
-    local_backprop)
+    local_backprop|local_backprop_verifier)
       algorithm_line='algorithm = "backpropagation"'
       ;;
     local_pc*)
@@ -654,6 +693,21 @@ enabled = false
 
 EOF
 
+  if [[ "$RULIAD_PANEL_MODE" == "dynamic" ]]; then
+    cat >> "$path" <<EOF
+[training.validation.ruliad_panel]
+mode = "dynamic"
+
+EOF
+  else
+    cat >> "$path" <<EOF
+[training.validation.ruliad_panel]
+mode = "$RULIAD_PANEL_MODE"
+path = "$RULIAD_PANEL_PATH"
+
+EOF
+  fi
+
   if [[ "$SEQUENCE_STATE_PROBE" == "true" ]]; then
     cat >> "$path" <<EOF
 [training.sequence_state_probe]
@@ -671,6 +725,52 @@ EOF
 name = "adamw"
 learning_rate = $LOCAL_LEARNING_RATE
 weight_decay = 0.01
+
+EOF
+      ;;
+    local_backprop_verifier)
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = $LOCAL_LEARNING_RATE
+weight_decay = 0.01
+
+[training.local_predictive_coding]
+terminal_criterion = "ruliad_verifier_set"
+
+EOF
+      ;;
+    local_pc_fixed_verifier)
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = $LOCAL_LEARNING_RATE
+weight_decay = 0.01
+
+[training.local_predictive_coding]
+solver = "fixed_prediction"
+terminal_criterion = "ruliad_verifier_set"
+
+EOF
+      ;;
+    local_pc_epc_verifier)
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = $LOCAL_LEARNING_RATE
+weight_decay = 0.01
+
+[training.local_predictive_coding]
+solver = "error_equilibrium"
+terminal_criterion = "ruliad_verifier_set"
+parameterization = "standard"
+shared_reuse_reduction = "root_mean_square"
+prediction_precision = 10.0
+
+[training.local_predictive_coding.inference]
+steps = 1
+step_size = 0.1
+max_grad_norm = 1000000.0
 
 EOF
       ;;
@@ -775,6 +875,107 @@ initialization = "$feedback_initialization"
 [training.local_predictive_coding.tied_consensus]
 damping = 0.001
 min_curvature = 0.000001
+eps = 0.00000001
+
+EOF
+      ;;
+    local_pc_dkp_calibrated|local_pc_dkp_calibrated_diagnostic)
+      local adjoint_sync_diagnostics="false"
+      if [[ "$arm" == "local_pc_dkp_calibrated_diagnostic" ]]; then
+        adjoint_sync_diagnostics="true"
+      fi
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = $LOCAL_LEARNING_RATE
+weight_decay = 0.01
+
+[training.local_predictive_coding]
+solver = "direct_kolen_pollack"
+parameterization = "standard"
+prediction_precision = 1.0
+factor_reduction = "mean"
+sync_diagnostics = $adjoint_sync_diagnostics
+
+[training.local_predictive_coding.inference]
+steps = 1
+step_size = 0.05
+max_grad_norm = 1.0
+gradient_norm_scope = "per_row"
+
+[training.local_predictive_coding.direct_feedback]
+preliminary_step_size = 0.1
+feedback_step_size = 0.001
+forward_weight_decay = 0.0
+feedback_weight_decay = 0.0001
+signal_scale = 1.0
+initialization = "identity"
+
+[training.local_predictive_coding.amortized_adjoint]
+enabled = true
+teacher_every_updates = 8
+
+[training.local_predictive_coding.amortized_adjoint.calibration]
+learning_rate = 0.01
+weight_decay = 0.0001
+max_update_norm = 1.0
+eps = 0.00000001
+
+[training.local_predictive_coding.tied_consensus]
+damping = 0.001
+min_curvature = 0.000001
+eps = 0.00000001
+
+EOF
+      ;;
+    local_pc_amortized_adjoint|local_pc_amortized_adjoint_diagnostic|local_pc_amortized_adjoint_every*)
+      local adjoint_sync_diagnostics="false"
+      local adjoint_teacher_every="8"
+      if [[ "$arm" == "local_pc_amortized_adjoint_diagnostic" ]]; then
+        adjoint_sync_diagnostics="true"
+      fi
+      if [[ "$arm" == local_pc_amortized_adjoint_every* ]]; then
+        adjoint_teacher_every="${arm#local_pc_amortized_adjoint_every}"
+        if [[ ! "$adjoint_teacher_every" =~ ^[1-9][0-9]*$ ]]; then
+          echo "invalid amortized-adjoint teacher cadence: $arm" >&2
+          return 2
+        fi
+      fi
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = $LOCAL_LEARNING_RATE
+weight_decay = 0.01
+
+[training.local_predictive_coding]
+solver = "amortized_adjoint"
+parameterization = "standard"
+prediction_precision = 1.0
+factor_reduction = "sum"
+sync_diagnostics = $adjoint_sync_diagnostics
+
+[training.local_predictive_coding.inference]
+steps = 1
+step_size = 0.05
+max_grad_norm = 1.0
+gradient_norm_scope = "per_row"
+
+[training.local_predictive_coding.direct_feedback]
+preliminary_step_size = 0.1
+feedback_step_size = 0.001
+forward_weight_decay = 0.0
+feedback_weight_decay = 0.0
+signal_scale = 1.0
+initialization = "identity"
+
+[training.local_predictive_coding.amortized_adjoint]
+enabled = true
+teacher_every_updates = $adjoint_teacher_every
+
+[training.local_predictive_coding.amortized_adjoint.calibration]
+learning_rate = $ADJOINT_CALIBRATION_LR
+weight_decay = 0.0001
+max_update_norm = 1.0
 eps = 0.00000001
 
 EOF
@@ -1293,6 +1494,33 @@ EOF
       return 2
       ;;
   esac
+
+  case "$arm" in
+    local_backprop_verifier|local_pc_fixed_verifier|local_pc_epc_verifier)
+      cat >> "$path" <<EOF
+[training.ruliad_supervision.proof_policy]
+enabled = true
+mode = "static_expert"
+scoring = "completion_likelihood"
+gradient_scope = "full_model"
+normalization = "prefix_conditional"
+candidate_symmetry = "balanced_rotation"
+presentation_risk = "mean"
+weight = 1.0
+every_steps = 4
+start_after_steps = 0
+dagger_start_after_steps = 512
+stratified_difficulty_levels = 4
+rollout_steps = 1
+max_rows_per_update = 8
+max_presentation_rows_per_update = 64
+counterfactual_targets_per_state = 0
+candidates = 4
+max_completion_tokens = 128
+
+EOF
+      ;;
+  esac
 }
 
 write_manifest() {
@@ -1448,6 +1676,7 @@ IFS=',' read -r -a ARMS <<< "$ARMS_CSV"
 echo "pc paper matrix: matrix=$MATRIX backend=$BACKEND profile=$PROFILE batch_size=$BATCH_SIZE out_dir=$OUT_DIR"
 echo "seeds=$SEEDS_CSV iters=$ITERS_CSV arms=$ARMS_CSV"
 echo "local_learning_rate=$LOCAL_LEARNING_RATE"
+echo "adjoint_calibration_learning_rate=$ADJOINT_CALIBRATION_LR"
 echo "tbptt_chunk_size=$TBPTT_CHUNK_SIZE tbptt_persist_across_steps=$TBPTT_PERSIST_ACROSS_STEPS sequence_batching=$SEQUENCE_BATCHING"
 echo "sequence_state_probe=$SEQUENCE_STATE_PROBE paired_batches=$SEQUENCE_STATE_PROBE_PAIRED_BATCHES"
 echo "source_selection_feedback_updates=$SOURCE_SELECTION_FEEDBACK_UPDATES"

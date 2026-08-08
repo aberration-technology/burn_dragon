@@ -51,6 +51,9 @@ SUMMARY_COLUMNS = [
     "source_norm_difficulty",
     "verifier_failures",
     "ruliad_verifier_accuracy",
+    "ruliad_constrained_equivalent_top1",
+    "ruliad_constrained_equivalent_nll",
+    "ruliad_constrained_valid_invalid_margin",
     "ruliad_partial_progress",
     "capability_allowed_max_difficulty",
     "output_entropy_bits",
@@ -96,6 +99,13 @@ EVENT_SUMMARY_COLUMNS = [
     "source_capability_allowed_max_difficulty_last",
     "source_verifier_failures_last",
     "ruliad_verifier_accuracy_last",
+    "ruliad_constrained_items_last",
+    "ruliad_constrained_equivalent_top1_last",
+    "ruliad_constrained_preferred_top1_last",
+    "ruliad_constrained_equivalent_nll_last",
+    "ruliad_constrained_valid_invalid_margin_last",
+    "ruliad_constrained_worst_presentation_top1_last",
+    "ruliad_constrained_orbit_js_last",
     "ruliad_partial_progress_last",
     "output_entropy_bits_last",
     "output_mean_max_probability_last",
@@ -116,7 +126,18 @@ EVENT_SUMMARY_COLUMNS = [
     "pc_local_vjp_calls_total",
     "pc_direct_forward_updates_total",
     "pc_feedback_parameter_updates_total",
+    "pc_adjoint_teacher_updates_total",
+    "pc_adjoint_local_updates_total",
+    "pc_adjoint_calibration_samples_total",
+    "pc_adjoint_calibration_loss_last",
+    "pc_adjoint_cosine_alignment_last",
+    "pc_adjoint_prediction_teacher_norm_ratio_last",
+    "pc_adjoint_update_rms_last",
     "pc_parameter_updates_total",
+    "pc_structured_terminal_steps_total",
+    "pc_structured_terminal_skipped_steps_total",
+    "pc_structured_terminal_groups_total",
+    "pc_structured_terminal_rows_total",
     "pc_factors_last",
     "pc_gradient_tensors_last",
     "pc_observation_contract_last",
@@ -516,6 +537,36 @@ def update_metric(summary: dict[str, Any], event: dict[str, Any]) -> None:
         summary["stream_carry_relative_gain_last"] = value
     elif split == "valid" and name == "Ruliad Verifier Accuracy":
         summary["ruliad_verifier_accuracy_last"] = value
+    elif split == "valid" and name == "Ruliad Correctness Constrained Items":
+        summary["ruliad_constrained_items_last"] = value
+    elif (
+        split == "valid"
+        and name == "Ruliad Correctness Constrained Equivalent Top-1 Rate"
+    ):
+        summary["ruliad_constrained_equivalent_top1_last"] = value
+    elif (
+        split == "valid"
+        and name == "Ruliad Correctness Constrained Preferred Top-1 Rate"
+    ):
+        summary["ruliad_constrained_preferred_top1_last"] = value
+    elif split == "valid" and name == "Ruliad Correctness Constrained Equivalent NLL":
+        summary["ruliad_constrained_equivalent_nll_last"] = value
+    elif (
+        split == "valid"
+        and name == "Ruliad Correctness Constrained Valid-Invalid Margin"
+    ):
+        summary["ruliad_constrained_valid_invalid_margin_last"] = value
+    elif (
+        split == "valid"
+        and name
+        == "Ruliad Correctness Constrained Worst-Presentation Equivalent Top-1 Rate"
+    ):
+        summary["ruliad_constrained_worst_presentation_top1_last"] = value
+    elif (
+        split == "valid"
+        and name == "Ruliad Correctness Constrained Orbit JS Divergence"
+    ):
+        summary["ruliad_constrained_orbit_js_last"] = value
     elif split == "valid" and name in {
         "Ruliad Partial Progress",
         "Ruliad Mean Partial Progress",
@@ -570,7 +621,14 @@ def default_event_summary(run: str, run_dir: Path) -> dict[str, Any]:
     summary["pc_local_vjp_calls_total"] = 0
     summary["pc_direct_forward_updates_total"] = 0
     summary["pc_feedback_parameter_updates_total"] = 0
+    summary["pc_adjoint_teacher_updates_total"] = 0
+    summary["pc_adjoint_local_updates_total"] = 0
+    summary["pc_adjoint_calibration_samples_total"] = 0
     summary["pc_parameter_updates_total"] = 0
+    summary["pc_structured_terminal_steps_total"] = 0
+    summary["pc_structured_terminal_skipped_steps_total"] = 0
+    summary["pc_structured_terminal_groups_total"] = 0
+    summary["pc_structured_terminal_rows_total"] = 0
     summary["_pc_ms_values"] = []
     summary["_source_loss_by_step"] = {}
     summary["_source_loss_unkeyed"] = []
@@ -672,8 +730,41 @@ def collect_event_summaries(
                 summary["pc_feedback_parameter_updates_total"] += as_int(
                     event.get("feedback_parameter_updates")
                 ) or 0
+                summary["pc_adjoint_teacher_updates_total"] += as_int(
+                    event.get("adjoint_teacher_updates")
+                ) or 0
+                summary["pc_adjoint_local_updates_total"] += as_int(
+                    event.get("adjoint_local_updates")
+                ) or 0
+                summary["pc_adjoint_calibration_samples_total"] += as_int(
+                    event.get("adjoint_calibration_samples")
+                ) or 0
+                summary["pc_adjoint_calibration_loss_last"] = as_float(
+                    event.get("adjoint_calibration_loss")
+                )
+                summary["pc_adjoint_cosine_alignment_last"] = as_float(
+                    event.get("adjoint_cosine_alignment")
+                )
+                summary["pc_adjoint_prediction_teacher_norm_ratio_last"] = as_float(
+                    event.get("adjoint_prediction_teacher_norm_ratio")
+                )
+                summary["pc_adjoint_update_rms_last"] = as_float(
+                    event.get("adjoint_update_rms")
+                )
                 summary["pc_parameter_updates_total"] += as_int(
                     event.get("parameter_updates")
+                ) or 0
+                summary["pc_structured_terminal_steps_total"] += as_int(
+                    event.get("structured_terminal_steps")
+                ) or 0
+                summary["pc_structured_terminal_skipped_steps_total"] += as_int(
+                    event.get("structured_terminal_skipped_steps")
+                ) or 0
+                summary["pc_structured_terminal_groups_total"] += as_int(
+                    event.get("structured_terminal_groups")
+                ) or 0
+                summary["pc_structured_terminal_rows_total"] += as_int(
+                    event.get("structured_terminal_rows")
                 ) or 0
                 summary["pc_factors_last"] = event.get("factors", "")
                 summary["pc_gradient_tensors_last"] = event.get(
@@ -793,6 +884,15 @@ def normalize_event_summaries(rows: Iterable[dict[str, Any]]) -> list[dict[str, 
                 ),
                 "ruliad_verifier_accuracy": as_float(
                     event.get("ruliad_verifier_accuracy_last")
+                ),
+                "ruliad_constrained_equivalent_top1": as_float(
+                    event.get("ruliad_constrained_equivalent_top1_last")
+                ),
+                "ruliad_constrained_equivalent_nll": as_float(
+                    event.get("ruliad_constrained_equivalent_nll_last")
+                ),
+                "ruliad_constrained_valid_invalid_margin": as_float(
+                    event.get("ruliad_constrained_valid_invalid_margin_last")
                 ),
                 "ruliad_partial_progress": as_float(
                     event.get("ruliad_partial_progress_last")
@@ -1000,6 +1100,9 @@ def grouped_summary(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "source_mean_difficulty",
         "source_norm_difficulty",
         "ruliad_verifier_accuracy",
+        "ruliad_constrained_equivalent_top1",
+        "ruliad_constrained_equivalent_nll",
+        "ruliad_constrained_valid_invalid_margin",
         "ruliad_partial_progress",
         "capability_allowed_max_difficulty",
         "output_entropy_bits",
@@ -1042,6 +1145,9 @@ def paired_deltas(rows: list[dict[str, Any]], baseline: str, compare: str) -> li
         "model_tok_s",
         "model_duty_fraction",
         "ruliad_verifier_accuracy",
+        "ruliad_constrained_equivalent_top1",
+        "ruliad_constrained_equivalent_nll",
+        "ruliad_constrained_valid_invalid_margin",
         "ruliad_partial_progress",
         "capability_allowed_max_difficulty",
         "output_entropy_bits",
@@ -1090,14 +1196,14 @@ def write_markdown(
     lines.append("## Fixed-Token Summary")
     lines.append("")
     lines.append(
-        "| Iters | Arm | Runs | Seeds | Cold valid | Stream warm | Validation objective | Source cadence | Verifier acc | Partial progress | Wall tok/s | Model tok/s | Duty | PC ms |"
+        "| Iters | Arm | Runs | Seeds | Cold valid | Stream warm | Validation objective | Source cadence | Verifier acc | Action top-1 | Action NLL | Partial progress | Wall tok/s | Model tok/s | Duty | PC ms |"
     )
     lines.append(
-        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
     )
     for row in summary_rows:
         lines.append(
-            "| {iters} | {arm} | {runs} | {seeds} | {valid} | {warm} | {objective} | {source} | {verifier} | {partial} | {tok} | {model_tok} | {duty} | {pc} |".format(
+            "| {iters} | {arm} | {runs} | {seeds} | {valid} | {warm} | {objective} | {source} | {verifier} | {action_top1} | {action_nll} | {partial} | {tok} | {model_tok} | {duty} | {pc} |".format(
                 iters=row.get("iters", ""),
                 arm=row.get("arm", ""),
                 runs=row.get("runs", ""),
@@ -1107,6 +1213,8 @@ def write_markdown(
                 objective=fmt_mean_ci(row, "validation_objective_loss"),
                 source=fmt_mean_ci(row, "source_loss_cadence_mean"),
                 verifier=fmt_mean_ci(row, "ruliad_verifier_accuracy"),
+                action_top1=fmt_mean_ci(row, "ruliad_constrained_equivalent_top1"),
+                action_nll=fmt_mean_ci(row, "ruliad_constrained_equivalent_nll"),
                 partial=fmt_mean_ci(row, "ruliad_partial_progress"),
                 tok=fmt_mean_ci(row, "tok_s"),
                 model_tok=fmt_mean_ci(row, "model_tok_s"),
@@ -1141,12 +1249,12 @@ def write_markdown(
             lines.append("## Local Learning Contract")
             lines.append("")
             lines.append(
-                "| Run | Contract | Derivatives | Global graph | Global backwards | Local VJPs | Direct updates | Feedback updates | Parameter updates | Factors | Gradient tensors |"
+                "| Run | Contract | Derivatives | Global graph | Global backwards | Local VJPs | Direct updates | Feedback updates | Adjoint teacher/local | Adjoint fit n/loss/cos/norm/update | Parameter updates | Structured steps/skips | Structured groups/rows | Factors | Gradient tensors |"
             )
-            lines.append("| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+            lines.append("| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |")
             for row in pc_rows[:40]:
                 lines.append(
-                    "| {run} | {contract} | v{version} activity={activity}, params={parameters} | {graph} | {backwards} | {vjps} | {direct} | {feedback} | {updates} | {factors} | {grads} |".format(
+                    "| {run} | {contract} | v{version} activity={activity}, params={parameters} | {graph} | {backwards} | {vjps} | {direct} | {feedback} | {adjoint_teacher}/{adjoint_local} | {adjoint_samples}/{adjoint_loss}/{adjoint_cosine}/{adjoint_norm_ratio}/{adjoint_update_rms} | {updates} | {structured_steps}/{structured_skips} | {structured_groups}/{structured_rows} | {factors} | {grads} |".format(
                         run=row.get("run", ""),
                         contract=row.get("pc_learning_contract_last", ""),
                         version=row.get("pc_execution_contract_version_last", ""),
@@ -1157,7 +1265,32 @@ def write_markdown(
                         vjps=row.get("pc_local_vjp_calls_total", ""),
                         direct=row.get("pc_direct_forward_updates_total", ""),
                         feedback=row.get("pc_feedback_parameter_updates_total", ""),
+                        adjoint_teacher=row.get("pc_adjoint_teacher_updates_total", ""),
+                        adjoint_local=row.get("pc_adjoint_local_updates_total", ""),
+                        adjoint_samples=row.get(
+                            "pc_adjoint_calibration_samples_total", ""
+                        ),
+                        adjoint_loss=fmt_scalar(
+                            row.get("pc_adjoint_calibration_loss_last")
+                        ),
+                        adjoint_cosine=fmt_scalar(
+                            row.get("pc_adjoint_cosine_alignment_last")
+                        ),
+                        adjoint_norm_ratio=fmt_scalar(
+                            row.get("pc_adjoint_prediction_teacher_norm_ratio_last")
+                        ),
+                        adjoint_update_rms=fmt_scalar(
+                            row.get("pc_adjoint_update_rms_last")
+                        ),
                         updates=row.get("pc_parameter_updates_total", ""),
+                        structured_steps=row.get("pc_structured_terminal_steps_total", ""),
+                        structured_skips=row.get(
+                            "pc_structured_terminal_skipped_steps_total", ""
+                        ),
+                        structured_groups=row.get(
+                            "pc_structured_terminal_groups_total", ""
+                        ),
+                        structured_rows=row.get("pc_structured_terminal_rows_total", ""),
                         factors=row.get("pc_factors_last", ""),
                         grads=row.get("pc_gradient_tensors_last", ""),
                     )

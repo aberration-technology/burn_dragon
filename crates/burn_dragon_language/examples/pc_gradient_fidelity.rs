@@ -333,6 +333,15 @@ where
         .map_err(anyhow::Error::msg)?;
     let parameters = model.num_params();
     let batch = deterministic_batch::<B>(args, &device);
+    if matches!(
+        args.solver,
+        LocalPredictiveCodingSolver::DirectKolenPollack
+            | LocalPredictiveCodingSolver::AmortizedAdjoint
+    ) {
+        return Err(anyhow!(
+            "feedback-bank solvers require the stateful LanguageTrainModel experiment runner"
+        ));
+    }
 
     let settings = match args.solver {
         LocalPredictiveCodingSolver::SynchronousEquilibrium
@@ -350,7 +359,8 @@ where
             .collect::<Vec<_>>(),
         LocalPredictiveCodingSolver::FixedPrediction
         | LocalPredictiveCodingSolver::LayerLocalPrediction
-        | LocalPredictiveCodingSolver::DirectKolenPollack => vec![None],
+        | LocalPredictiveCodingSolver::DirectKolenPollack
+        | LocalPredictiveCodingSolver::AmortizedAdjoint => vec![None],
     };
     let mut arms = Vec::with_capacity(settings.len());
     for setting in settings {

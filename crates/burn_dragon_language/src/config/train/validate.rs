@@ -93,6 +93,31 @@ impl TrainingConfig {
         if self.training.gradient_accumulation_steps == 0 {
             return Err(anyhow!("training.gradient_accumulation_steps must be > 0"));
         }
+        match (
+            self.training.validation.ruliad_panel.mode,
+            self.training.validation.ruliad_panel.path.as_ref(),
+        ) {
+            (crate::config::RuliadValidationPanelMode::Dynamic, None)
+            | (
+                crate::config::RuliadValidationPanelMode::CreateOrReuse
+                | crate::config::RuliadValidationPanelMode::RequireExisting,
+                Some(_),
+            ) => {}
+            (crate::config::RuliadValidationPanelMode::Dynamic, Some(_)) => {
+                return Err(anyhow!(
+                    "training.validation.ruliad_panel.path requires mode=create_or_reuse or require_existing"
+                ));
+            }
+            (
+                crate::config::RuliadValidationPanelMode::CreateOrReuse
+                | crate::config::RuliadValidationPanelMode::RequireExisting,
+                None,
+            ) => {
+                return Err(anyhow!(
+                    "training.validation.ruliad_panel.path is required for a persisted panel"
+                ));
+            }
+        }
         if !self.training.validation.execution.is_local() {
             if self.parallel.mode != ParallelismKind::Single {
                 return Err(anyhow!(
@@ -3593,6 +3618,24 @@ impl TrainingConfig {
 
     fn validate_training_algorithm(&self) -> Result<()> {
         let algorithm = self.resolved_training_algorithm();
+        let verifier_terminal = matches!(
+            self.training.local_predictive_coding.terminal_criterion,
+            crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSet
+        );
+        if verifier_terminal {
+            if !matches!(
+                algorithm,
+                TrainingAlgorithm::Backpropagation | TrainingAlgorithm::PredictiveCoding
+            ) {
+                return Err(anyhow!(
+                    "ruliad_verifier_set requires training.algorithm=backpropagation or predictive_coding"
+                ));
+            }
+            self.validate_ruliad_verifier_terminal(matches!(
+                algorithm,
+                TrainingAlgorithm::PredictiveCoding
+            ))?;
+        }
         match algorithm {
             TrainingAlgorithm::Auto => unreachable!("training algorithm must resolve"),
             TrainingAlgorithm::Backpropagation => {
@@ -3614,12 +3657,79 @@ impl TrainingConfig {
         Ok(())
     }
 
+    fn validate_ruliad_verifier_terminal(&self, require_local_solver: bool) -> Result<()> {
+        let pc = &self.training.local_predictive_coding;
+        let policy = self.training.ruliad_supervision.proof_policy;
+        if require_local_solver
+            && !matches!(
+                pc.solver,
+                crate::config::LocalPredictiveCodingSolver::FixedPrediction
+                    | crate::config::LocalPredictiveCodingSolver::ErrorEquilibrium
+            )
+        {
+            return Err(anyhow!(
+                "training.local_predictive_coding.terminal_criterion=ruliad_verifier_set currently requires solver=fixed_prediction or error_equilibrium"
+            ));
+        }
+        if !policy.enabled
+            || !matches!(
+                policy.mode,
+                crate::config::RuliadProofPolicyTrainingMode::StaticExpert
+            )
+            || !matches!(
+                policy.scoring,
+                crate::config::RuliadProofPolicyScoring::CompletionLikelihood
+            )
+            || !matches!(
+                policy.gradient_scope,
+                crate::config::RuliadProofPolicyGradientScope::FullModel
+            )
+            || !matches!(
+                policy.normalization,
+                crate::config::RuliadProofPolicyNormalization::PrefixConditional
+            )
+            || !matches!(
+                policy.presentation_risk,
+                crate::config::RuliadProofPolicyPresentationRisk::Mean
+            )
+            || (policy.weight - 1.0).abs() > f32::EPSILON
+            || policy.counterfactual_targets_per_state != 0
+            || policy.stratified_difficulty_levels == 0
+        {
+            return Err(anyhow!(
+                "ruliad_verifier_set requires an enabled static_expert completion-likelihood proof policy with full_model gradients, prefix_conditional normalization, mean presentation risk, weight=1, stratified_difficulty_levels>0, and no counterfactual targets"
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_local_predictive_coding(&self) -> Result<()> {
         let pc = &self.training.local_predictive_coding;
         pc.inference
             .validate("training.local_predictive_coding.inference")?;
         pc.direct_feedback.validate()?;
+        pc.amortized_adjoint.validate()?;
         pc.tied_consensus.validate()?;
+        if pc.amortized_adjoint.enabled
+            && !matches!(
+                pc.solver,
+                crate::config::LocalPredictiveCodingSolver::DirectKolenPollack
+                    | crate::config::LocalPredictiveCodingSolver::AmortizedAdjoint
+            )
+        {
+            return Err(anyhow!(
+                "training.local_predictive_coding.amortized_adjoint requires a direct-feedback solver"
+            ));
+        }
+        if matches!(
+            pc.solver,
+            crate::config::LocalPredictiveCodingSolver::AmortizedAdjoint
+        ) && !pc.amortized_adjoint.enabled
+        {
+            return Err(anyhow!(
+                "training.local_predictive_coding.solver=amortized_adjoint requires amortized_adjoint.enabled=true"
+            ));
+        }
         if pc.prediction_precision <= 0.0 || !pc.prediction_precision.is_finite() {
             return Err(anyhow!(
                 "training.local_predictive_coding.prediction_precision must be finite and > 0"
@@ -3641,6 +3751,7 @@ impl TrainingConfig {
                 | crate::config::LocalPredictiveCodingSolver::FixedPrediction
                 | crate::config::LocalPredictiveCodingSolver::LayerLocalPrediction
                 | crate::config::LocalPredictiveCodingSolver::DirectKolenPollack
+                | crate::config::LocalPredictiveCodingSolver::AmortizedAdjoint
         ) {
             return Err(anyhow!(
                 "training.local_predictive_coding.learning_schedule=incremental requires solver=synchronous_equilibrium or reverse_gauss_seidel"
@@ -3649,10 +3760,11 @@ impl TrainingConfig {
         if matches!(
             pc.solver,
             crate::config::LocalPredictiveCodingSolver::DirectKolenPollack
+                | crate::config::LocalPredictiveCodingSolver::AmortizedAdjoint
         ) && pc.direct_feedback.forward_weight_decay > f32::EPSILON
         {
             return Err(anyhow!(
-                "training.local_predictive_coding.direct_feedback.forward_weight_decay must be 0 for direct_kolen_pollack because the outer optimizer owns forward-parameter decay"
+                "training.local_predictive_coding.direct_feedback.forward_weight_decay must be 0 for direct-feedback solvers because the outer optimizer owns forward-parameter decay"
             ));
         }
         if matches!(pc.parameterization, burn_pc::PcParameterizationKind::MuPc)
@@ -3677,10 +3789,22 @@ impl TrainingConfig {
         if matches!(
             pc.solver,
             crate::config::LocalPredictiveCodingSolver::DirectKolenPollack
+                | crate::config::LocalPredictiveCodingSolver::AmortizedAdjoint
         ) && self.training.predictive_context_routing.enabled
         {
             return Err(anyhow!(
-                "direct_kolen_pollack does not yet compose with predictive_context_routing because both require optimizer-owned state"
+                "direct-feedback solvers do not yet compose with predictive_context_routing because both require optimizer-owned state"
+            ));
+        }
+        if matches!(
+            pc.solver,
+            crate::config::LocalPredictiveCodingSolver::AmortizedAdjoint
+        ) && !matches!(
+            pc.factor_reduction,
+            crate::config::PredictiveCodingFactorReduction::Sum
+        ) {
+            return Err(anyhow!(
+                "training.local_predictive_coding.solver=amortized_adjoint requires factor_reduction=sum so exact teacher steps preserve the terminal-loss derivative"
             ));
         }
         if matches!(
@@ -3741,18 +3865,22 @@ impl TrainingConfig {
             || self.training.greedy_rollout_unlikelihood.enabled
         {
             return Err(anyhow!(
-                "training.algorithm=predictive_coding currently supports only its local prediction factors and terminal next-token factor; input corruption and global auxiliary losses must be disabled"
+                "training.algorithm=predictive_coding supports only local prediction factors and its configured terminal factor; input corruption and global auxiliary losses must be disabled"
             ));
         }
         let ruliad = self.training.ruliad_supervision;
+        let verifier_terminal = matches!(
+            pc.terminal_criterion,
+            crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSet
+        );
         if ruliad.answer_ranking.enabled
             || ruliad.answer_denoising.enabled
             || ruliad.answer_contract.enabled
             || ruliad.verifier_reward.enabled
-            || ruliad.proof_policy.enabled
+            || (ruliad.proof_policy.enabled && !verifier_terminal)
         {
             return Err(anyhow!(
-                "training.algorithm=predictive_coding does not yet support Ruliad auxiliary objectives; token target masking and weighting remain supported"
+                "training.algorithm=predictive_coding supports only the explicit ruliad_verifier_set terminal program; other Ruliad auxiliary objectives remain unsupported"
             ));
         }
         if self.training.gdpo.is_some() {
@@ -3964,6 +4092,36 @@ prompt = ""
         config
             .validate()
             .expect("explicit live validation mode should remain supported");
+    }
+
+    #[test]
+    fn persisted_ruliad_validation_panel_requires_an_explicit_path_contract() {
+        let mut config = parse_config("");
+        config.training.validation.ruliad_panel.mode =
+            crate::config::RuliadValidationPanelMode::CreateOrReuse;
+        assert!(
+            config
+                .validate()
+                .expect_err("persisted panel without path must fail closed")
+                .to_string()
+                .contains("ruliad_panel.path is required")
+        );
+
+        config.training.validation.ruliad_panel.path =
+            Some(PathBuf::from("target/test-ruliad-panel.json"));
+        config
+            .validate()
+            .expect("create-or-reuse panel with explicit path should validate");
+
+        config.training.validation.ruliad_panel.mode =
+            crate::config::RuliadValidationPanelMode::Dynamic;
+        assert!(
+            config
+                .validate()
+                .expect_err("dynamic panel must not pretend to persist a path")
+                .to_string()
+                .contains("path requires mode")
+        );
     }
 
     #[test]
@@ -4671,6 +4829,78 @@ start_policy = "capability_gate"
                 .to_string()
                 .contains("outer optimizer owns")
         );
+
+        config
+            .training
+            .local_predictive_coding
+            .direct_feedback
+            .forward_weight_decay = 0.0;
+        config
+            .training
+            .local_predictive_coding
+            .amortized_adjoint
+            .enabled = true;
+        config
+            .validate()
+            .expect("DKP should accept a periodic exact-local adjoint teacher");
+
+        config.training.local_predictive_coding.solver =
+            crate::config::LocalPredictiveCodingSolver::FixedPrediction;
+        assert!(
+            config
+                .validate()
+                .expect_err("amortized feedback must not be ignored by another solver")
+                .to_string()
+                .contains("requires a direct-feedback solver")
+        );
+    }
+
+    #[test]
+    fn amortized_adjoint_validates_single_update_exact_anchor_contract() {
+        let mut config = parse_config("");
+        config.training.algorithm = TrainingAlgorithm::PredictiveCoding;
+        config.training.local_predictive_coding.solver =
+            crate::config::LocalPredictiveCodingSolver::AmortizedAdjoint;
+        config
+            .training
+            .local_predictive_coding
+            .amortized_adjoint
+            .enabled = true;
+        config.training.local_predictive_coding.factor_reduction =
+            crate::config::PredictiveCodingFactorReduction::Sum;
+        config.model.dropout = Some(0.0);
+        config.model.sequence_kernel = Some(SequenceKernelConfig::dense_score_short_context());
+        config.model.rotary_embedding = Some(RotaryEmbedding::Alibi);
+        config
+            .validate()
+            .expect("amortized adjoint should validate with exact anchors enabled");
+
+        config
+            .training
+            .local_predictive_coding
+            .amortized_adjoint
+            .enabled = false;
+        assert!(
+            config
+                .validate()
+                .expect_err("amortized adjoint requires its teacher schedule")
+                .to_string()
+                .contains("amortized_adjoint.enabled=true")
+        );
+        config
+            .training
+            .local_predictive_coding
+            .amortized_adjoint
+            .enabled = true;
+        config.training.local_predictive_coding.factor_reduction =
+            crate::config::PredictiveCodingFactorReduction::Mean;
+        assert!(
+            config
+                .validate()
+                .expect_err("exact anchors cannot be depth averaged")
+                .to_string()
+                .contains("factor_reduction=sum")
+        );
     }
 
     #[test]
@@ -4806,6 +5036,87 @@ start_policy = "capability_gate"
         assert!(
             err.to_string().contains("Ruliad auxiliary objectives"),
             "unexpected error: {err}"
+        );
+    }
+
+    fn verifier_terminal_config() -> TrainingConfig {
+        let mut config = parse_config("");
+        config.training.algorithm = TrainingAlgorithm::PredictiveCoding;
+        config.training.local_predictive_coding.solver =
+            crate::config::LocalPredictiveCodingSolver::FixedPrediction;
+        config.training.local_predictive_coding.terminal_criterion =
+            crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSet;
+        config.model.dropout = Some(0.0);
+        config.model.sequence_kernel = Some(SequenceKernelConfig::dense_score_short_context());
+        config.model.rotary_embedding = Some(RotaryEmbedding::Alibi);
+        config.training.ruliad_supervision.proof_policy =
+            crate::config::RuliadProofPolicyTrainingConfig {
+                enabled: true,
+                mode: crate::config::RuliadProofPolicyTrainingMode::StaticExpert,
+                scoring: crate::config::RuliadProofPolicyScoring::CompletionLikelihood,
+                gradient_scope: crate::config::RuliadProofPolicyGradientScope::FullModel,
+                normalization: crate::config::RuliadProofPolicyNormalization::PrefixConditional,
+                presentation_risk: crate::config::RuliadProofPolicyPresentationRisk::Mean,
+                weight: 1.0,
+                counterfactual_targets_per_state: 0,
+                stratified_difficulty_levels: 1,
+                ..crate::config::RuliadProofPolicyTrainingConfig::default()
+            };
+        config
+    }
+
+    #[test]
+    fn local_predictive_coding_accepts_explicit_static_verifier_terminal() {
+        verifier_terminal_config()
+            .validate()
+            .expect("static verifier-set terminal should be an executable local factor");
+    }
+
+    #[test]
+    fn backpropagation_accepts_the_matched_static_verifier_terminal() {
+        let mut config = verifier_terminal_config();
+        config.training.algorithm = TrainingAlgorithm::Backpropagation;
+        config
+            .validate()
+            .expect("global autodiff should accept the same static verifier factor");
+    }
+
+    #[test]
+    fn local_predictive_coding_verifier_terminal_rejects_dagger_and_unsupported_solver() {
+        let mut config = verifier_terminal_config();
+        config.training.ruliad_supervision.proof_policy.mode =
+            crate::config::RuliadProofPolicyTrainingMode::Dagger;
+        assert!(
+            config
+                .validate()
+                .expect_err("model-visited DAgger requires a separate PC execution contract")
+                .to_string()
+                .contains("static_expert")
+        );
+
+        let mut config = verifier_terminal_config();
+        config.training.local_predictive_coding.solver =
+            crate::config::LocalPredictiveCodingSolver::DirectKolenPollack;
+        assert!(
+            config
+                .validate()
+                .expect_err("verifier terminal must reject unsupported credit solvers")
+                .to_string()
+                .contains("fixed_prediction or error_equilibrium")
+        );
+
+        let mut config = verifier_terminal_config();
+        config
+            .training
+            .ruliad_supervision
+            .proof_policy
+            .normalization = crate::config::RuliadProofPolicyNormalization::CandidateConditional;
+        assert!(
+            config
+                .validate()
+                .expect_err("sequence-level normalization is not the trie terminal objective")
+                .to_string()
+                .contains("prefix_conditional")
         );
     }
 

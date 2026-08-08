@@ -3,6 +3,7 @@ mod huggingface;
 mod prepared_chunks;
 pub mod scheduler;
 mod universality;
+mod validation_panel;
 
 use crate::tokenizer::SharedTokenizer;
 use burn::tensor::backend::Backend;
@@ -18,6 +19,7 @@ pub use universality::{
     RuliadSourceSelectionStateSnapshot, RuliadValidationProbeItem, RuliadValidationPromptMode,
     UniversalityDataset,
 };
+pub(crate) use validation_panel::resolve_ruliad_validation_panel;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DatasetSplit {
@@ -181,6 +183,22 @@ impl Dataset {
                     absolute_step,
                     max_items,
                 ),
+        }
+    }
+
+    pub fn sample_ruliad_validation_probe_items_fixed(
+        &self,
+        panel_seed: u64,
+        max_items: usize,
+        prompt_mode: RuliadValidationPromptMode,
+    ) -> Vec<RuliadValidationProbeItem> {
+        match self {
+            Dataset::HuggingFace(_) => Vec::new(),
+            Dataset::Universality(dataset) => dataset.sample_ruliad_validation_probe_items_fixed(
+                panel_seed,
+                max_items,
+                prompt_mode,
+            ),
         }
     }
 

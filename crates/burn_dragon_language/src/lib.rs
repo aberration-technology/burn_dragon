@@ -47,11 +47,12 @@ pub mod api {
             LocalPredictiveCodingConfig, LocalPredictiveCodingSolver, PcGradientNormScope,
             PredictiveCodingBackwardMode, PredictiveCodingConfig, PredictiveCodingFactorReduction,
             PredictiveCodingMode, PredictiveCodingParameterUpdate, PredictiveCodingStateScope,
-            RepromptTruncation, RuliadProbeGenerationConfig, SdftObjectiveConfig,
-            SdftSdpoObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind,
-            TeacherRegularization, TrainingAlgorithm, TrainingConfig, TrainingHyperparameters,
-            TrainingObjectiveConfig, TrainingObjectiveKind, TrainingValidationConfig,
-            TrainingValidationExecution, load_training_config,
+            RepromptTruncation, RuliadProbeGenerationConfig, RuliadValidationPanelConfig,
+            RuliadValidationPanelMode, SdftObjectiveConfig, SdftSdpoObjectiveConfig,
+            SdpoObjectiveConfig, SelfDistillationKlKind, TeacherRegularization, TrainingAlgorithm,
+            TrainingConfig, TrainingHyperparameters, TrainingObjectiveConfig,
+            TrainingObjectiveKind, TrainingValidationConfig, TrainingValidationExecution,
+            load_training_config,
         };
     }
 
@@ -129,10 +130,11 @@ pub use config::{
     PredictiveCodingConfig, PredictiveCodingFactorReduction, PredictiveCodingMode,
     PredictiveCodingParameterUpdate, PredictiveCodingStateScope, RepromptTruncation,
     RuliadAnswerDenoisingConfig, RuliadAnswerRankingConfig, RuliadProbeGenerationConfig,
-    RuliadSupervisionConfig, RuliadSupervisionMode, SdftObjectiveConfig, SdpoObjectiveConfig,
-    SelfDistillationKlKind, TeacherRegularization, TrainingAlgorithm, TrainingConfig,
-    TrainingHyperparameters, TrainingObjectiveConfig, TrainingObjectiveKind,
-    TrainingValidationConfig, TrainingValidationExecution, load_training_config,
+    RuliadSupervisionConfig, RuliadSupervisionMode, RuliadValidationPanelConfig,
+    RuliadValidationPanelMode, SdftObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind,
+    TeacherRegularization, TrainingAlgorithm, TrainingConfig, TrainingHyperparameters,
+    TrainingObjectiveConfig, TrainingObjectiveKind, TrainingValidationConfig,
+    TrainingValidationExecution, load_training_config,
 };
 pub use generation::{
     ContextStrategy, GenerationProfileSnapshot, GenerationSettings,

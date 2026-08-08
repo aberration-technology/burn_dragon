@@ -580,7 +580,9 @@ mod tests {
         };
         config.sequence_kernel.executor = SequenceTrainingExecutor::DenseScoreShortContext;
         config.fused_kernels.rotary_embedding = RotaryEmbedding::Alibi;
-        let model = DragonModel::new(config, &device);
+        let model = crate::train::test_support::deterministic_matrix_parameters(DragonModel::new(
+            config, &device,
+        ));
         let (inputs, targets, mask) = batch(&device);
         let report = local_predictive_coding_gradient_fidelity(
             &model,
@@ -734,7 +736,6 @@ mod tests {
     #[test]
     fn reverse_gauss_seidel_propagates_credit_within_one_sweep() {
         let device = Default::default();
-        TestBackend::seed(&device, 20260804);
         let mut config = DragonConfig {
             n_layer: 4,
             n_embd: 8,
@@ -746,7 +747,9 @@ mod tests {
         };
         config.sequence_kernel.executor = SequenceTrainingExecutor::DenseScoreShortContext;
         config.fused_kernels.rotary_embedding = RotaryEmbedding::Alibi;
-        let model = DragonModel::new(config, &device);
+        let model = crate::train::test_support::deterministic_matrix_parameters(DragonModel::new(
+            config, &device,
+        ));
         let (inputs, targets, mask) = batch(&device);
         let inference = burn_pc::PcInferenceConfig {
             steps: 1,

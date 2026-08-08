@@ -211,7 +211,17 @@ fn configure_resume_source_selection_state(
     Ok(true)
 }
 
-fn validate_resolved_context_routing_batching(config: &TrainingConfig) -> Result<()> {
+fn validate_resolved_optimizer_owned_batching(config: &TrainingConfig) -> Result<()> {
+    if matches!(
+        config.training.algorithm,
+        TrainingAlgorithm::PredictiveCoding
+    ) && config.training.gradient_accumulation_steps != 1
+    {
+        return Err(anyhow!(
+            "startup batching resolved gradient_accumulation_steps={} for predictive coding; local parameter updates require one microbatch per optimizer boundary",
+            config.training.gradient_accumulation_steps
+        ));
+    }
     if config.training.predictive_context_routing.enabled
         && config.training.gradient_accumulation_steps != 1
     {
@@ -325,8 +335,7 @@ fn use_event_scheduler_for_training(
         || training.predictive_context_routing.enabled
         || (matches!(training.algorithm, TrainingAlgorithm::PredictiveCoding)
             && training.tbptt_persist_across_steps)
-        || (training.events.source_weighted_validation_batches > 0
-            && source_selection_uses_live_policy);
+        || source_selection_uses_live_policy;
 
     !training.validation.execution.is_local()
         || training.neuron_scaling.enabled
@@ -399,6 +408,26 @@ mod tests {
     }
 
     #[test]
+    fn live_source_selection_uses_checkpoint_complete_event_scheduler() {
+        let profile_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/language/experiments/predictive_coding/local-pc-smoke.toml");
+        let config = crate::config::train::load_training_config(&[profile_path])
+            .expect("load local PC smoke profile");
+        assert_eq!(config.training.events.source_weighted_validation_batches, 0);
+        assert!(!config.training.tbptt_persist_across_steps);
+        assert!(!use_event_scheduler_for_training(
+            &config.training,
+            ParallelismKind::Single,
+            false,
+        ));
+        assert!(use_event_scheduler_for_training(
+            &config.training,
+            ParallelismKind::Single,
+            true,
+        ));
+    }
+
+    #[test]
     fn offloaded_duty_profile_uses_external_evaluator_scheduler() {
         let config = load_profile("ruliad-r3.typed-policy-offloaded-duty-ablation.toml");
         config
@@ -413,6 +442,17 @@ mod tests {
             config.parallel.mode,
             true,
         ));
+    }
+
+    #[test]
+    fn resolved_batching_rejects_gradient_accumulation_for_predictive_coding() {
+        let mut config =
+            load_profile("ruliad-1m-la-16k.answer-completion.self-recovery.training.toml");
+        config.training.algorithm = TrainingAlgorithm::PredictiveCoding;
+        config.training.gradient_accumulation_steps = 2;
+        let error = validate_resolved_optimizer_owned_batching(&config)
+            .expect_err("startup autotune must not queue PC-owned updates");
+        assert!(error.to_string().contains("one microbatch"));
     }
 }
 
@@ -735,7 +775,7 @@ where
         .optimizer
         .apply_auto_eggroll_population(resolved_config.training.batch_size);
     resolved_config.optimizer.apply_effective_eggroll_config();
-    validate_resolved_context_routing_batching(&resolved_config)?;
+    validate_resolved_optimizer_owned_batching(&resolved_config)?;
 
     let datasets = if resolved_config.training.batch_size == config.training.batch_size
         && !resume_source_selection
@@ -1247,7 +1287,7 @@ where
     if matches!(resolved_config.optimizer.name, OptimizerKind::Eggroll) {
         resolved_config.optimizer.apply_effective_eggroll_config();
     }
-    validate_resolved_context_routing_batching(&resolved_config)?;
+    validate_resolved_optimizer_owned_batching(&resolved_config)?;
 
     let datasets = if resolved_config.training.batch_size == config.training.batch_size
         && !resume_source_selection

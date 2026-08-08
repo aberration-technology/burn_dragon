@@ -89,7 +89,7 @@ fn parse_args() -> Result<RunArgs> {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: cargo run -p burn_dragon_language --example train_language --features train[,cuda] -- --backend <cpu|cuda> --config <path> [--config <path>...] [--seed N] [--n-layer N] [--n-embd N] [--n-head N] [--latent-total N] [--block-size N] [--batch-size N] [--max-iters N] [--checkpoint-interval-iters N]"
+                    "usage: cargo run -p burn_dragon_language --example train_language --features train[,cuda] -- --backend <cpu|wgpu|cuda> --config <path> [--config <path>...] [--seed N] [--n-layer N] [--n-embd N] [--n-head N] [--latent-total N] [--block-size N] [--batch-size N] [--max-iters N] [--checkpoint-interval-iters N]"
                 );
                 std::process::exit(0);
             }
@@ -169,6 +169,28 @@ fn train_cpu(args: &RunArgs) -> Result<()> {
     }
 }
 
+#[cfg(feature = "train")]
+fn train_wgpu(args: &RunArgs) -> Result<()> {
+    let config = load_config(&args.config_paths, &args.overrides)?;
+    let dataset = train::prepare_dataset(&config.dataset, &config.training)?;
+    let runtime = config.wgpu.clone();
+    if train::optimizer_uses_forward_only_eggroll(&config) {
+        train::train_backend_forward_eggroll::<burn_wgpu::Wgpu<f32>, _>(
+            &config,
+            dataset,
+            "wgpu",
+            move |device| burn_dragon_train::api::wgpu::init_runtime(device, &runtime),
+        )
+    } else {
+        train::train_backend::<Autodiff<burn_wgpu::Wgpu<f32>>, _>(
+            &config,
+            dataset,
+            "wgpu",
+            move |device| burn_dragon_train::api::wgpu::init_runtime(device, &runtime),
+        )
+    }
+}
+
 #[cfg(all(feature = "train", feature = "cuda"))]
 fn train_cuda(args: &RunArgs) -> Result<()> {
     let config = load_config(&args.config_paths, &args.overrides)?;
@@ -208,6 +230,7 @@ fn main() -> Result<()> {
     );
     match args.backend.as_str() {
         "cpu" => train_cpu(&args)?,
+        "wgpu" => train_wgpu(&args)?,
         "cuda" => train_cuda(&args)?,
         other => return Err(anyhow!("unsupported backend {other}")),
     }

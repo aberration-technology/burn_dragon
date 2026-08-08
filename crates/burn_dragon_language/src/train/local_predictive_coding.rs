@@ -30,7 +30,38 @@ pub struct LocalPredictiveCodingDerivatives<B: AutodiffBackend> {
     /// Local activity inference is transient and never mutates this causal
     /// stream state.
     pub terminal_state: ModelState<B>,
+    /// Updated training-only DKP feedback bank. It is absent for every other
+    /// solver and never becomes an inference model parameter.
+    pub dkp_feedback: Option<Tensor<B, 3>>,
     pub report: LocalPredictiveCodingStepReport,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct DkpFeedbackState<B: Backend> {
+    pub(super) feedback: Tensor<B, 3>,
+    pub(super) updates: u64,
+}
+
+fn initial_dkp_feedback<B: Backend>(
+    layers: usize,
+    dim: usize,
+    initialization: burn_pc::PcFeedbackInitialization,
+    device: &B::Device,
+) -> Tensor<B, 3> {
+    match initialization {
+        burn_pc::PcFeedbackInitialization::Gaussian => Tensor::random(
+            [layers, dim, dim],
+            burn::tensor::Distribution::Normal(0.0, (dim.max(1) as f64).sqrt().recip()),
+            device,
+        ),
+        burn_pc::PcFeedbackInitialization::Identity => {
+            Tensor::<B, 1, Int>::arange(0..dim as i64, device)
+                .one_hot::<2>(dim)
+                .float()
+                .unsqueeze_dim::<3>(0)
+                .repeat_dim(0, layers)
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -47,6 +78,12 @@ pub struct LocalPredictiveCodingStepReport {
     pub local_vjp_calls: usize,
     pub global_backward_calls: usize,
     pub gradient_tensors: usize,
+    /// Logical direct-feedback forward-factor updates. These may be executed
+    /// by one batched kernel even when every depth factor contributes.
+    pub direct_forward_updates: usize,
+    /// Logical Kolen-Pollack feedback matrices updated by the step.
+    pub feedback_parameter_updates: usize,
+    pub parameter_updates: usize,
     pub energy_before: Option<f64>,
     pub energy_after: Option<f64>,
     pub elapsed_ns: u128,
@@ -60,6 +97,9 @@ pub struct LocalPredictiveCodingProfileSnapshot {
     pub local_vjp_calls: u64,
     pub global_backward_calls: u64,
     pub gradient_tensors: u64,
+    pub direct_forward_updates: u64,
+    pub feedback_parameter_updates: u64,
+    pub parameter_updates: u64,
     pub elapsed_ns: u128,
     pub last_energy_before: Option<f64>,
     pub last_energy_after: Option<f64>,
@@ -106,6 +146,91 @@ pub fn dragon_predictive_coding_graph(layers: usize) -> burn_pc::PcGraphSpec {
     burn_pc::PcGraphSpec::new(nodes, factors)
 }
 
+/// Stable identity persisted with exact-resume checkpoints and exchanged by
+/// distributed orchestration before a peer can participate in optimization.
+pub fn dragon_predictive_coding_checkpoint_manifest(
+    layers: usize,
+    config: &LocalPredictiveCodingConfig,
+) -> anyhow::Result<burn_pc::PcCheckpointManifest> {
+    let graph_digest = dragon_predictive_coding_graph(layers).stable_fingerprint()?;
+    let learning_schedule = match config.learning_schedule {
+        burn_pc::PcLearningSchedule::Equilibrium => "equilibrium",
+        burn_pc::PcLearningSchedule::Incremental => "incremental",
+    };
+    let parameterization = match config.parameterization {
+        burn_pc::PcParameterizationKind::Standard => "standard",
+        burn_pc::PcParameterizationKind::MuPc => "mu_pc",
+    };
+    let shared_reuse_reduction = match config.shared_reuse_reduction {
+        burn_pc::PcSharedReuseReduction::Sum => "sum",
+        burn_pc::PcSharedReuseReduction::Mean => "mean",
+        burn_pc::PcSharedReuseReduction::RootMeanSquare => "root_mean_square",
+    };
+    let factor_reduction = match config.factor_reduction {
+        PredictiveCodingFactorReduction::Sum => "sum",
+        PredictiveCodingFactorReduction::Mean => "mean",
+    };
+    let gradient_norm_scope = match config.inference.gradient_norm_scope {
+        burn_pc::PcGradientNormScope::Global => "global",
+        burn_pc::PcGradientNormScope::PerSample => "per_sample",
+        burn_pc::PcGradientNormScope::PerRow => "per_row",
+    };
+    let max_grad_norm = config.inference.max_grad_norm.map_or_else(
+        || "none".to_string(),
+        |value| format!("{:08x}", value.to_bits()),
+    );
+    let consensus_max_norm = config.tied_consensus.max_update_norm.map_or_else(
+        || "none".to_string(),
+        |value| format!("{:08x}", value.to_bits()),
+    );
+    let feedback_initialization = match config.direct_feedback.initialization {
+        burn_pc::PcFeedbackInitialization::Gaussian => "gaussian",
+        burn_pc::PcFeedbackInitialization::Identity => "identity",
+    };
+    let program_digest = format!(
+        "dragon-pc-program-v2;solver={};schedule={learning_schedule};parameterization={parameterization};shared_reuse={shared_reuse_reduction};factor_reduction={factor_reduction};inference_steps={};step_size={:08x};latent_decay={:08x};max_grad_norm={max_grad_norm};gradient_norm_scope={gradient_norm_scope};eps={:08x};prediction_precision={:08x};incremental_parameter_step_scale={:016x};dkp_preliminary_step={:08x};dkp_feedback_step={:08x};dkp_forward_decay={:08x};dkp_feedback_decay={:08x};dkp_signal_scale={:08x};dkp_feedback_initialization={feedback_initialization};consensus_damping={:08x};consensus_min_curvature={:08x};consensus_max_norm={consensus_max_norm};consensus_eps={:08x}",
+        config.solver.as_str(),
+        config.inference.steps,
+        config.inference.step_size.to_bits(),
+        config.inference.latent_decay.to_bits(),
+        config.inference.eps.to_bits(),
+        config.prediction_precision.to_bits(),
+        config.incremental_parameter_step_scale.to_bits(),
+        config.direct_feedback.preliminary_step_size.to_bits(),
+        config.direct_feedback.feedback_step_size.to_bits(),
+        config.direct_feedback.forward_weight_decay.to_bits(),
+        config.direct_feedback.feedback_weight_decay.to_bits(),
+        config.direct_feedback.signal_scale.to_bits(),
+        config.tied_consensus.damping.to_bits(),
+        config.tied_consensus.min_curvature.to_bits(),
+        config.tied_consensus.eps.to_bits(),
+    );
+    Ok(burn_pc::PcCheckpointManifest {
+        schema_version: burn_pc::PcCheckpointManifest::CURRENT_SCHEMA_VERSION,
+        graph_digest,
+        program_digest,
+        algorithm: "dragon_local_predictive_coding_v1".to_string(),
+        learning_schedule: config.learning_schedule,
+        execution_contract: config.execution_contract(),
+    })
+}
+
+pub(super) fn validate_step_execution_contract(
+    config: &LocalPredictiveCodingConfig,
+    report: &LocalPredictiveCodingStepReport,
+) {
+    burn_pc::PcExecutionCounters {
+        local_parameter_vjp_calls: report.local_vjp_calls as u64,
+        global_parameter_backward_calls: report.global_backward_calls as u64,
+        direct_forward_updates: report.direct_forward_updates as u64,
+        feedback_parameter_updates: report.feedback_parameter_updates as u64,
+        parameter_updates: report.parameter_updates as u64,
+        ..burn_pc::PcExecutionCounters::default()
+    }
+    .validate_against(&config.execution_contract())
+    .expect("local predictive-coding step violated its configured execution contract");
+}
+
 /// Run-scoped local-PC telemetry shared by the train model and its ECS run
 /// entity. Multiple pipelines in one process never contend on one global slot.
 #[derive(Debug, Clone, Default)]
@@ -134,7 +259,7 @@ impl LocalPredictiveCodingProfile {
             .unwrap_or_default()
     }
 
-    fn record(&self, report: LocalPredictiveCodingStepReport) {
+    pub(super) fn record(&self, report: LocalPredictiveCodingStepReport) {
         if let Ok(mut profile) = self.inner.lock() {
             profile.steps = profile.steps.saturating_add(1);
             profile.inference_steps = profile
@@ -150,6 +275,15 @@ impl LocalPredictiveCodingProfile {
             profile.gradient_tensors = profile
                 .gradient_tensors
                 .saturating_add(report.gradient_tensors as u64);
+            profile.direct_forward_updates = profile
+                .direct_forward_updates
+                .saturating_add(report.direct_forward_updates as u64);
+            profile.feedback_parameter_updates = profile
+                .feedback_parameter_updates
+                .saturating_add(report.feedback_parameter_updates as u64);
+            profile.parameter_updates = profile
+                .parameter_updates
+                .saturating_add(report.parameter_updates as u64);
             profile.elapsed_ns = profile.elapsed_ns.saturating_add(report.elapsed_ns);
             profile.last_energy_before = report.energy_before;
             profile.last_energy_after = report.energy_after;
@@ -461,9 +595,376 @@ struct FixedPredictionContext<B: Backend> {
     scale: f32,
 }
 
+pub(super) struct DkpPreparedChunk<B: AutodiffBackend> {
+    parameter_ids: DragonPredictiveCodingParameterIds,
+    inputs: Tensor<B::InnerBackend, 2, Int>,
+    targets: Tensor<B::InnerBackend, 2, Int>,
+    loss_mask: Option<Tensor<B::InnerBackend, 2, Int>>,
+    activities: Vec<Tensor<B::InnerBackend, 4>>,
+    initial_rhos: Vec<Option<Tensor<B::InnerBackend, 4>>>,
+    pub(super) feedback: Tensor<B::InnerBackend, 3>,
+    pub(super) preliminary_grads: GradientsParams,
+    pub(super) loss: Tensor<B, 1>,
+    pub(super) supervised_tokens: Tensor<B, 1>,
+    pub(super) terminal_state: ModelState<B>,
+    factors: usize,
+    scale: f32,
+}
+
+pub(super) struct DkpChunkObservation<B: AutodiffBackend> {
+    pub(super) loss: Tensor<B, 1>,
+    pub(super) supervised_tokens: Tensor<B, 1>,
+    pub(super) terminal_state: ModelState<B>,
+}
+
+fn tied_preliminary_gradient<B: Backend, const D: usize>(
+    gradient_sum: Tensor<B, D>,
+    factors: usize,
+    config: &burn_pc::PcTiedConsensusConfig,
+) -> Tensor<B, D> {
+    burn_pc::tied_uniform_consensus_from_sum(gradient_sum.mul_scalar(-1.0), factors, config)
+        .expect("validated tied DKP consensus")
+        .update
+        .mul_scalar(-1.0)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_dkp_predictive_coding_chunk<B: AutodiffBackend>(
+    model: &DragonModel<B>,
+    inputs: Tensor<B, 2, Int>,
+    targets: Tensor<B, 2, Int>,
+    loss_mask: Option<Tensor<B, 2, Int>>,
+    initial_state: ModelState<B>,
+    feedback: Option<Tensor<B, 3>>,
+    config: &LocalPredictiveCodingConfig,
+) -> DkpPreparedChunk<B>
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    debug_assert!(matches!(
+        config.solver,
+        LocalPredictiveCodingSolver::DirectKolenPollack
+    ));
+    let parameter_ids = model
+        .predictive_coding_parameter_ids()
+        .expect("validated DKP model parameter ids");
+    let plain = model.valid();
+    let mut terminal_state = initial_state.inner_cloned();
+    let block_time = inputs.shape().dims::<2>()[1];
+    let inputs = inputs.inner();
+    let targets = targets.inner();
+    let loss_mask = loss_mask.map(Tensor::inner);
+    let layers = plain.predictive_coding_layer_count();
+    let factors = layers + 1;
+    let scale = factor_scale(config, factors);
+    let mut activities = Vec::with_capacity(layers + 1);
+    let mut traces = Vec::with_capacity(layers);
+    activities.push(plain.predictive_coding_initial_activity(inputs.clone()));
+    for layer in 0..layers {
+        let trace = plain
+            .predictive_coding_forward_layer_with_recurrent_state(
+                activities[layer].clone(),
+                layer,
+                terminal_state.layers[layer].rho.clone(),
+                None,
+                None,
+            )
+            .expect("validated recurrent DKP layer factor");
+        terminal_state.layers[layer].rho = Some(plain.predictive_coding_terminal_rho(&trace));
+        terminal_state.layers[layer].rho_norm = None;
+        terminal_state.layers[layer].sequence_aux = None;
+        activities.push(trace.next.clone().detach());
+        traces.push(trace);
+    }
+    terminal_state.position = terminal_state.position.saturating_add(block_time);
+    terminal_state.detach_in_place();
+    let initial_rhos = traces
+        .iter()
+        .map(|trace| trace.initial_rho.clone())
+        .collect::<Vec<_>>();
+    let terminal_activity = activities.last().expect("terminal DKP activity");
+    let [batch, streams, time, dim] = terminal_activity.shape().dims::<4>();
+    let terminal_hidden = plain.predictive_coding_hidden_from_activity(terminal_activity.clone());
+    let terminal = plain.predictive_coding_head_activity_vjp(
+        terminal_hidden,
+        targets.clone(),
+        loss_mask.clone(),
+    );
+    let feedback = feedback.map(Tensor::inner).unwrap_or_else(|| {
+        initial_dkp_feedback::<B::InnerBackend>(
+            layers,
+            dim,
+            config.direct_feedback.initialization,
+            &terminal_activity.device(),
+        )
+    });
+    assert_eq!(
+        feedback.shape().dims::<3>(),
+        [layers, dim, dim],
+        "DKP feedback checkpoint geometry must match model depth and embedding"
+    );
+    let terminal_derivative = terminal.grad_hidden.reshape([batch * time, dim]);
+    let direct_derivatives = burn_pc::direct_feedback_signal_batched(
+        terminal_derivative
+            .reshape([1, batch * time, dim])
+            .repeat_dim(0, layers),
+        feedback.clone(),
+        config.direct_feedback.signal_scale,
+    )
+    .reshape([layers * batch, streams, time, dim]);
+    let batched_trace = concatenate_traces(&traces);
+    let preliminary =
+        layer_parameter_vjp(&plain, 0, &batched_trace, direct_derivatives, None, None);
+    let mut preliminary_grads = GradientsParams::new();
+    preliminary_grads.register(
+        parameter_ids.encoder,
+        tied_preliminary_gradient(preliminary.grad_encoder, layers, &config.tied_consensus),
+    );
+    preliminary_grads.register(
+        parameter_ids.encoder_v,
+        tied_preliminary_gradient(preliminary.grad_encoder_v, layers, &config.tied_consensus),
+    );
+    preliminary_grads.register(
+        parameter_ids.decoder,
+        tied_preliminary_gradient(preliminary.grad_decoder, layers, &config.tied_consensus),
+    );
+
+    DkpPreparedChunk {
+        parameter_ids,
+        inputs,
+        targets,
+        loss_mask,
+        activities,
+        initial_rhos,
+        feedback,
+        preliminary_grads,
+        loss: Tensor::<B, 1>::from_inner(terminal.loss),
+        supervised_tokens: Tensor::<B, 1>::from_inner(terminal.normalization.reshape([1])),
+        terminal_state: ModelState::<B>::from_inner_cloned(terminal_state),
+        factors,
+        scale,
+    }
+}
+
+/// Measure a later TBPTT chunk without constructing the preliminary DKP body
+/// derivative that must be recomputed after preceding chunks update weights.
+/// The full recurrent forward is retained so the displayed batch loss and rho
+/// carry remain exact at the pre-update snapshot.
+pub(super) fn observe_dkp_predictive_coding_chunk<B: AutodiffBackend>(
+    model: &DragonModel<B>,
+    inputs: Tensor<B, 2, Int>,
+    targets: Tensor<B, 2, Int>,
+    loss_mask: Option<Tensor<B, 2, Int>>,
+    initial_state: ModelState<B>,
+) -> DkpChunkObservation<B>
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    let plain = model.valid();
+    let mut terminal_state = initial_state.inner_cloned();
+    let hidden = plain.forward_hidden_with_state(inputs.inner(), &mut terminal_state);
+    let terminal = plain.predictive_coding_head_activity_vjp(
+        hidden,
+        targets.inner(),
+        loss_mask.map(Tensor::inner),
+    );
+    terminal_state.detach_in_place();
+    DkpChunkObservation {
+        loss: Tensor::<B, 1>::from_inner(terminal.loss),
+        supervised_tokens: Tensor::<B, 1>::from_inner(terminal.normalization.reshape([1])),
+        terminal_state: ModelState::<B>::from_inner_cloned(terminal_state),
+    }
+}
+
+pub(super) fn finish_dkp_predictive_coding_chunk<B: AutodiffBackend>(
+    model: &DragonModel<B>,
+    mut chunk: DkpPreparedChunk<B>,
+    config: &LocalPredictiveCodingConfig,
+    profile: &LocalPredictiveCodingProfile,
+) -> LocalPredictiveCodingDerivatives<B>
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    let started = Instant::now();
+    let plain = model.valid();
+    let layers = plain.predictive_coding_layer_count();
+    let energy_before = config.sync_diagnostics.then(|| {
+        burn_pc::diagnostic_scalar_f32(total_energy(
+            &plain,
+            &chunk.activities,
+            &chunk.initial_rhos,
+            chunk.targets.clone(),
+            chunk.loss_mask.clone(),
+            config,
+            (None, None),
+        )) as f64
+    });
+    let mut local_vjp_calls = 1usize;
+
+    for _ in 0..config.inference.steps {
+        let trace = forward_trace_batch(&plain, &chunk.activities, &chunk.initial_rhos, None, None);
+        let terminal_activity = chunk.activities.last().expect("terminal DKP activity");
+        let terminal_hidden =
+            plain.predictive_coding_hidden_from_activity(terminal_activity.clone());
+        let terminal = plain.predictive_coding_head_activity_vjp(
+            terminal_hidden,
+            chunk.targets.clone(),
+            chunk.loss_mask.clone(),
+        );
+        let terminal_grad = (terminal.grad_hidden * terminal.normalization.reshape([1, 1, 1]))
+            .reshape(terminal_activity.shape());
+        let [batch, streams, time, dim] = chunk.activities[0].shape().dims::<4>();
+        let inferred = Tensor::cat(chunk.activities.iter().skip(1).cloned().collect(), 0);
+        let errors = prediction_error(
+            trace.next.clone(),
+            inferred,
+            config.prediction_precision,
+            chunk.scale,
+        );
+        let internal_child_grads = (layers > 1).then(|| {
+            layer_activity_vjp(
+                &plain,
+                0,
+                &slice_trace_batch(&trace, batch, layers * batch),
+                slice_batch(errors.clone(), batch, layers * batch),
+                None,
+                None,
+            )
+        });
+        local_vjp_calls = local_vjp_calls.saturating_add(layers.saturating_sub(1) + 1);
+        let mut updates = Vec::with_capacity(layers);
+        for (activity_index, activity) in
+            chunk.activities.iter().enumerate().take(layers + 1).skip(1)
+        {
+            let own_offset = (activity_index - 1) * batch;
+            let own = slice_batch(errors.clone(), own_offset, own_offset + batch).mul_scalar(-1.0);
+            let child = if activity_index == layers {
+                terminal_grad.clone().mul_scalar(chunk.scale)
+            } else {
+                let offset = (activity_index - 1) * batch;
+                internal_child_grads
+                    .as_ref()
+                    .expect("non-terminal DKP activity has a child factor")
+                    .clone()
+                    .slice([offset..offset + batch, 0..streams, 0..time, 0..dim])
+            };
+            updates.push(
+                burn_pc::pc_sgd_update(activity.clone(), own + child, &config.inference).detach(),
+            );
+        }
+        for (activity, update) in chunk.activities.iter_mut().skip(1).zip(updates) {
+            *activity = update;
+        }
+    }
+
+    let energy_after = config.sync_diagnostics.then(|| {
+        burn_pc::diagnostic_scalar_f32(total_energy(
+            &plain,
+            &chunk.activities,
+            &chunk.initial_rhos,
+            chunk.targets.clone(),
+            chunk.loss_mask.clone(),
+            config,
+            (None, None),
+        )) as f64
+    });
+    let trace = forward_trace_batch(&plain, &chunk.activities, &chunk.initial_rhos, None, None);
+    let terminal_activity = chunk.activities.last().expect("terminal DKP activity");
+    let [batch, streams, time, dim] = terminal_activity.shape().dims::<4>();
+    let terminal_hidden = plain.predictive_coding_hidden_from_activity(terminal_activity.clone());
+    let terminal = plain.predictive_coding_head_vjp(
+        terminal_hidden,
+        chunk.targets.clone(),
+        chunk.loss_mask.clone(),
+    );
+    let normalization = terminal.supervised_tokens.clone().clamp_min(1.0);
+    let errors = prediction_error_gradient(
+        trace.next.clone(),
+        Tensor::cat(chunk.activities.iter().skip(1).cloned().collect(), 0),
+        config.prediction_precision,
+        chunk.scale,
+        normalization.clone(),
+    );
+    let batched_vjp = layer_parameter_vjp(&plain, 0, &trace, errors, None, None);
+    let initial_grad = batched_vjp
+        .grad_input
+        .slice([0..batch, 0..streams, 0..time, 0..dim]);
+    let initial_vjp = plain.predictive_coding_initial_vjp(chunk.inputs, initial_grad);
+    let mut grads = GradientsParams::new();
+    grads.register(chunk.parameter_ids.embedding, initial_vjp.grad_embedding);
+    grads.register(chunk.parameter_ids.encoder, batched_vjp.grad_encoder);
+    grads.register(chunk.parameter_ids.encoder_v, batched_vjp.grad_encoder_v);
+    grads.register(chunk.parameter_ids.decoder, batched_vjp.grad_decoder);
+    grads.register(
+        chunk.parameter_ids.norm_gamma,
+        batched_vjp.grad_norm_gamma + initial_vjp.grad_norm_gamma,
+    );
+    grads.register(
+        chunk.parameter_ids.norm_beta,
+        batched_vjp.grad_norm_beta + initial_vjp.grad_norm_beta,
+    );
+    grads.register(
+        chunk.parameter_ids.norm_alpha,
+        batched_vjp.grad_norm_alpha + initial_vjp.grad_norm_alpha,
+    );
+    grads.register(
+        chunk.parameter_ids.norm_shift,
+        batched_vjp.grad_norm_shift + initial_vjp.grad_norm_shift,
+    );
+    grads.register(
+        chunk.parameter_ids.lm_head,
+        terminal.grad_lm_head.mul_scalar(chunk.scale),
+    );
+    local_vjp_calls = local_vjp_calls.saturating_add(layers + 2);
+
+    let terminal_activity_error = terminal
+        .grad_hidden
+        .mul_scalar(-1.0)
+        .mul(normalization.reshape([1, 1, 1]))
+        .reshape([1, batch * time, dim])
+        .repeat_dim(0, layers);
+    let factor_activities = Tensor::cat(chunk.activities.iter().skip(1).cloned().collect(), 0)
+        .reshape([layers, batch * time, dim]);
+    let updated_feedback = burn_pc::kolen_pollack_feedback_update_batched(
+        chunk.feedback,
+        factor_activities,
+        terminal_activity_error,
+        &config.direct_feedback,
+    );
+
+    let report = LocalPredictiveCodingStepReport {
+        solver: LocalPredictiveCodingSolver::DirectKolenPollack,
+        inference_steps: config.inference.steps,
+        factors: chunk.factors,
+        local_vjp_calls,
+        global_backward_calls: 0,
+        gradient_tensors: grads.len() + 3,
+        direct_forward_updates: layers,
+        feedback_parameter_updates: layers,
+        parameter_updates: 2,
+        energy_before,
+        energy_after,
+        elapsed_ns: started.elapsed().as_nanos(),
+    };
+    validate_step_execution_contract(config, &report);
+    profile.record(report);
+    LocalPredictiveCodingDerivatives {
+        grads,
+        loss: chunk.loss,
+        supervised_tokens: chunk.supervised_tokens,
+        terminal_state: chunk.terminal_state,
+        dkp_feedback: Some(Tensor::<B, 3>::from_inner(updated_feedback)),
+        report,
+    }
+}
+
 fn fixed_prediction_train_step<B: AutodiffBackend>(
     plain: &DragonModel<B::InnerBackend>,
     context: FixedPredictionContext<B::InnerBackend>,
+    config: &LocalPredictiveCodingConfig,
     started: Instant,
     profile: &LocalPredictiveCodingProfile,
 ) -> LocalPredictiveCodingDerivatives<B>
@@ -555,16 +1056,329 @@ where
         local_vjp_calls: factors + 1,
         global_backward_calls: 0,
         gradient_tensors: grads.len(),
+        direct_forward_updates: 0,
+        feedback_parameter_updates: 0,
+        parameter_updates: 1,
         energy_before: None,
         energy_after: None,
         elapsed_ns: started.elapsed().as_nanos(),
     };
+    validate_step_execution_contract(config, &report);
     profile.record(report);
     LocalPredictiveCodingDerivatives {
         grads,
         loss: Tensor::<B, 1>::from_inner(terminal.loss),
         supervised_tokens: Tensor::<B, 1>::from_inner(terminal.supervised_tokens),
         terminal_state: ModelState::<B>::from_inner_cloned(terminal_state),
+        dkp_feedback: None,
+        report,
+    }
+}
+
+fn reconstruct_error_activities<B: Backend>(
+    model: &DragonModel<B>,
+    clamped_activity: Tensor<B, 4>,
+    errors: &[Tensor<B, 4>],
+    initial_rhos: &[Option<Tensor<B, 4>>],
+    neuron_mask: Option<&Tensor<B, 4>>,
+    activity_mask: Option<&Tensor<B, 4>>,
+) -> (Vec<Tensor<B, 4>>, Vec<DragonPredictiveCodingLayerTrace<B>>)
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    assert_eq!(errors.len(), model.predictive_coding_layer_count());
+    assert_eq!(initial_rhos.len(), errors.len());
+    let mut activities = Vec::with_capacity(errors.len() + 1);
+    let mut traces = Vec::with_capacity(errors.len());
+    activities.push(clamped_activity);
+    for layer in 0..errors.len() {
+        let mut trace = model
+            .predictive_coding_forward_layer_with_recurrent_state(
+                activities[layer].clone(),
+                layer,
+                initial_rhos[layer].clone(),
+                neuron_mask.cloned(),
+                activity_mask.cloned(),
+            )
+            .expect("validated ePC layer factor");
+        trace.next = apply_activity_mask(trace.next, activity_mask);
+        let activity =
+            apply_activity_mask(trace.next.clone() + errors[layer].clone(), activity_mask).detach();
+        traces.push(trace);
+        activities.push(activity);
+    }
+    (activities, traces)
+}
+
+fn error_coordinate_energy<B: Backend>(
+    model: &DragonModel<B>,
+    activities: &[Tensor<B, 4>],
+    errors: &[Tensor<B, 4>],
+    targets: Tensor<B, 2, Int>,
+    loss_mask: Option<Tensor<B, 2, Int>>,
+    config: &LocalPredictiveCodingConfig,
+) -> Tensor<B, 1>
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    let hidden = model.predictive_coding_hidden_from_activity(
+        activities.last().expect("terminal ePC activity").clone(),
+    );
+    let terminal = model.predictive_coding_head_activity_vjp(hidden, targets, loss_mask);
+    let normalization = terminal.normalization.clamp_min(1.0);
+    let error_energy = Tensor::cat(errors.to_vec(), 0)
+        .square()
+        .sum()
+        .div(normalization)
+        .mul_scalar(0.5 * config.prediction_precision)
+        .reshape([1]);
+    (terminal.loss + error_energy).mul_scalar(factor_scale(config, errors.len() + 1))
+}
+
+fn error_equilibrium_train_step<B: AutodiffBackend>(
+    plain: &DragonModel<B::InnerBackend>,
+    context: FixedPredictionContext<B::InnerBackend>,
+    config: &LocalPredictiveCodingConfig,
+    started: Instant,
+    profile: &LocalPredictiveCodingProfile,
+) -> LocalPredictiveCodingDerivatives<B>
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    let FixedPredictionContext {
+        parameter_ids,
+        inputs,
+        targets,
+        loss_mask,
+        activities: feedforward_activities,
+        traces: feedforward_traces,
+        neuron_mask,
+        activity_mask,
+        terminal_state,
+        factors,
+        scale,
+    } = context;
+    let layers = feedforward_traces.len();
+    let clamped_activity = feedforward_activities[0].clone();
+    let initial_rhos = feedforward_traces
+        .iter()
+        .map(|trace| trace.initial_rho.clone())
+        .collect::<Vec<_>>();
+    let feedforward_hidden = plain.predictive_coding_hidden_from_activity(
+        feedforward_activities
+            .last()
+            .expect("terminal feedforward activity")
+            .clone(),
+    );
+    let feedforward_terminal = plain.predictive_coding_head_activity_vjp(
+        feedforward_hidden,
+        targets.clone(),
+        loss_mask.clone(),
+    );
+    let supervised_tokens = feedforward_terminal.normalization.clone().reshape([1]);
+    let feedforward_loss = feedforward_terminal.loss.clone();
+    let mut errors = feedforward_activities
+        .iter()
+        .skip(1)
+        .map(Tensor::zeros_like)
+        .collect::<Vec<_>>();
+    let energy_before = config
+        .sync_diagnostics
+        .then(|| burn_pc::diagnostic_scalar_f32(feedforward_loss.clone().mul_scalar(scale)) as f64);
+    let mut local_vjp_calls = 1usize;
+
+    for inference_step in 0..config.inference.steps {
+        let (activities, traces, terminal) = if inference_step == 0 {
+            (
+                feedforward_activities.clone(),
+                feedforward_traces.clone(),
+                feedforward_terminal.clone(),
+            )
+        } else {
+            let (activities, traces) = reconstruct_error_activities(
+                plain,
+                clamped_activity.clone(),
+                &errors,
+                &initial_rhos,
+                neuron_mask.as_ref(),
+                activity_mask.as_ref(),
+            );
+            let terminal_activity = activities.last().expect("terminal ePC activity");
+            let hidden = plain.predictive_coding_hidden_from_activity(terminal_activity.clone());
+            let terminal = plain.predictive_coding_head_activity_vjp(
+                hidden,
+                targets.clone(),
+                loss_mask.clone(),
+            );
+            local_vjp_calls = local_vjp_calls.saturating_add(1);
+            (activities, traces, terminal)
+        };
+        let terminal_activity = activities.last().expect("terminal ePC activity");
+        // `head_activity_vjp` returns a mean derivative. Error optimization in
+        // ePC uses a sum over independent examples, so restore the token sum;
+        // parameter derivatives are normalized again below.
+        let mut downstream = (terminal.grad_hidden * terminal.normalization.reshape([1, 1, 1]))
+            .reshape(terminal_activity.shape());
+        let mut downstream_by_layer = errors.iter().map(Tensor::zeros_like).collect::<Vec<_>>();
+        for layer in (0..layers).rev() {
+            downstream_by_layer[layer] =
+                apply_activity_mask(downstream.clone(), activity_mask.as_ref());
+            downstream = layer_activity_vjp(
+                plain,
+                layer,
+                &traces[layer],
+                downstream,
+                neuron_mask.as_ref(),
+                activity_mask.as_ref(),
+            );
+            local_vjp_calls = local_vjp_calls.saturating_add(1);
+        }
+        errors = errors
+            .into_iter()
+            .zip(downstream_by_layer)
+            .map(|(error, downstream)| {
+                let gradient = burn_pc::epc_error_gradient(
+                    error.clone().mul_scalar(config.prediction_precision),
+                    downstream,
+                )
+                .mul_scalar(scale);
+                apply_activity_mask(
+                    burn_pc::pc_sgd_update(error, gradient, &config.inference),
+                    activity_mask.as_ref(),
+                )
+                .detach()
+            })
+            .collect();
+    }
+
+    let (activities, traces) = reconstruct_error_activities(
+        plain,
+        clamped_activity,
+        &errors,
+        &initial_rhos,
+        neuron_mask.as_ref(),
+        activity_mask.as_ref(),
+    );
+    let energy_after = config.sync_diagnostics.then(|| {
+        burn_pc::diagnostic_scalar_f32(error_coordinate_energy(
+            plain,
+            &activities,
+            &errors,
+            targets.clone(),
+            loss_mask.clone(),
+            config,
+        )) as f64
+    });
+    let terminal_activity = activities.last().expect("terminal ePC activity");
+    let terminal_hidden = plain.predictive_coding_hidden_from_activity(terminal_activity.clone());
+    let terminal = plain.predictive_coding_head_vjp(terminal_hidden, targets, loss_mask);
+    let normalization = terminal.supervised_tokens.clone().clamp_min(1.0);
+    let local_prediction_grads = Tensor::cat(
+        errors
+            .iter()
+            .map(|error| {
+                error
+                    .clone()
+                    .mul_scalar(-config.prediction_precision * scale)
+                    / normalization.clone().reshape([1, 1, 1, 1])
+            })
+            .collect(),
+        0,
+    );
+    let batched_trace = concatenate_traces(&traces);
+    let mut batched_vjp = layer_parameter_vjp(
+        plain,
+        0,
+        &batched_trace,
+        local_prediction_grads,
+        neuron_mask.as_ref(),
+        activity_mask.as_ref(),
+    );
+    local_vjp_calls = local_vjp_calls.saturating_add(layers);
+
+    let shared_scale = if matches!(
+        config.parameterization,
+        burn_pc::PcParameterizationKind::MuPc
+    ) {
+        burn_pc::shared_reuse_scale(layers, config.shared_reuse_reduction)
+            .expect("validated shared reuse geometry") as f32
+    } else {
+        1.0
+    };
+    batched_vjp.grad_encoder = batched_vjp.grad_encoder.mul_scalar(shared_scale);
+    batched_vjp.grad_encoder_v = batched_vjp.grad_encoder_v.mul_scalar(shared_scale);
+    batched_vjp.grad_decoder = batched_vjp.grad_decoder.mul_scalar(shared_scale);
+    batched_vjp.grad_norm_gamma = batched_vjp.grad_norm_gamma.mul_scalar(shared_scale);
+    batched_vjp.grad_norm_beta = batched_vjp.grad_norm_beta.mul_scalar(shared_scale);
+    batched_vjp.grad_norm_alpha = batched_vjp.grad_norm_alpha.mul_scalar(shared_scale);
+    batched_vjp.grad_norm_shift = batched_vjp.grad_norm_shift.mul_scalar(shared_scale);
+
+    let [batch, streams, time, dim] = activities[0].shape().dims::<4>();
+    let initial_grad = apply_activity_mask(
+        batched_vjp
+            .grad_input
+            .slice([0..batch, 0..streams, 0..time, 0..dim]),
+        activity_mask.as_ref(),
+    );
+    let initial_vjp = match activity_mask.as_ref() {
+        Some(mask) => plain.predictive_coding_initial_vjp_with_activity_mask(
+            inputs,
+            initial_grad,
+            mask.clone(),
+        ),
+        None => plain.predictive_coding_initial_vjp(inputs, initial_grad),
+    };
+    let mut grads = GradientsParams::new();
+    grads.register(parameter_ids.embedding, initial_vjp.grad_embedding);
+    grads.register(parameter_ids.encoder, batched_vjp.grad_encoder);
+    grads.register(parameter_ids.encoder_v, batched_vjp.grad_encoder_v);
+    grads.register(parameter_ids.decoder, batched_vjp.grad_decoder);
+    grads.register(
+        parameter_ids.norm_gamma,
+        batched_vjp.grad_norm_gamma + initial_vjp.grad_norm_gamma,
+    );
+    grads.register(
+        parameter_ids.norm_beta,
+        batched_vjp.grad_norm_beta + initial_vjp.grad_norm_beta,
+    );
+    grads.register(
+        parameter_ids.norm_alpha,
+        batched_vjp.grad_norm_alpha + initial_vjp.grad_norm_alpha,
+    );
+    grads.register(
+        parameter_ids.norm_shift,
+        batched_vjp.grad_norm_shift + initial_vjp.grad_norm_shift,
+    );
+    grads.register(
+        parameter_ids.lm_head,
+        terminal.grad_lm_head.mul_scalar(scale),
+    );
+
+    let report = LocalPredictiveCodingStepReport {
+        solver: LocalPredictiveCodingSolver::ErrorEquilibrium,
+        inference_steps: config.inference.steps,
+        factors,
+        local_vjp_calls,
+        global_backward_calls: 0,
+        gradient_tensors: grads.len(),
+        direct_forward_updates: 0,
+        feedback_parameter_updates: 0,
+        parameter_updates: 1,
+        energy_before,
+        energy_after,
+        elapsed_ns: started.elapsed().as_nanos(),
+    };
+    validate_step_execution_contract(config, &report);
+    profile.record(report);
+    LocalPredictiveCodingDerivatives {
+        grads,
+        loss: Tensor::<B, 1>::from_inner(feedforward_loss),
+        supervised_tokens: Tensor::<B, 1>::from_inner(supervised_tokens),
+        terminal_state: ModelState::<B>::from_inner_cloned(terminal_state),
+        dkp_feedback: None,
         report,
     }
 }
@@ -584,6 +1398,7 @@ struct LayerLocalPredictionContext<B: Backend> {
 fn layer_local_prediction_train_step<B: AutodiffBackend>(
     plain: &DragonModel<B::InnerBackend>,
     context: LayerLocalPredictionContext<B::InnerBackend>,
+    config: &LocalPredictiveCodingConfig,
     started: Instant,
     profile: &LocalPredictiveCodingProfile,
 ) -> LocalPredictiveCodingDerivatives<B>
@@ -695,16 +1510,21 @@ where
         local_vjp_calls: 3,
         global_backward_calls: 0,
         gradient_tensors: grads.len(),
+        direct_forward_updates: 0,
+        feedback_parameter_updates: 0,
+        parameter_updates: 1,
         energy_before: None,
         energy_after: None,
         elapsed_ns: started.elapsed().as_nanos(),
     };
+    validate_step_execution_contract(config, &report);
     profile.record(report);
     LocalPredictiveCodingDerivatives {
         grads,
         loss: Tensor::<B, 1>::from_inner(terminal_loss),
         supervised_tokens: Tensor::<B, 1>::from_inner(supervised_tokens),
         terminal_state: ModelState::<B>::from_inner_cloned(terminal_state),
+        dkp_feedback: None,
         report,
     }
 }
@@ -741,6 +1561,331 @@ where
         config,
         model.predictive_coding_layer_count() + 1,
     ))
+}
+
+/// Activity state retained across the interleaved inference/parameter phases
+/// of incremental predictive coding. All activities are plain-backend tensors,
+/// so this schedule never retains a global autodiff graph between updates.
+pub(super) struct IncrementalPredictiveCodingChunk<B: AutodiffBackend> {
+    inputs: Tensor<B::InnerBackend, 2, Int>,
+    targets: Tensor<B::InnerBackend, 2, Int>,
+    loss_mask: Option<Tensor<B::InnerBackend, 2, Int>>,
+    activities: Vec<Tensor<B::InnerBackend, 4>>,
+    initial_rhos: Vec<Option<Tensor<B::InnerBackend, 4>>>,
+    pub(super) loss: Tensor<B, 1>,
+    pub(super) supervised_tokens: Tensor<B, 1>,
+    pub(super) terminal_state: ModelState<B>,
+    factors: usize,
+    scale: f32,
+}
+
+pub(super) struct IncrementalPredictiveCodingParameterDerivatives {
+    pub(super) grads: GradientsParams,
+    pub(super) local_vjp_calls: usize,
+    pub(super) gradient_tensors: usize,
+}
+
+pub(super) fn prepare_incremental_predictive_coding_chunk<B: AutodiffBackend>(
+    model: &DragonModel<B>,
+    inputs: Tensor<B, 2, Int>,
+    targets: Tensor<B, 2, Int>,
+    loss_mask: Option<Tensor<B, 2, Int>>,
+    initial_state: ModelState<B>,
+    config: &LocalPredictiveCodingConfig,
+) -> IncrementalPredictiveCodingChunk<B>
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    let plain = model.valid();
+    plain
+        .predictive_coding_support()
+        .expect("validated incremental predictive-coding model");
+    let mut terminal_state = initial_state.inner_cloned();
+    assert_eq!(
+        terminal_state.layers.len(),
+        plain.predictive_coding_layer_count(),
+        "incremental PC recurrent-state layer count must match the model"
+    );
+    let block_time = inputs.shape().dims::<2>()[1];
+    let inputs = inputs.inner();
+    let targets = targets.inner();
+    let loss_mask = loss_mask.map(Tensor::inner);
+    let layers = plain.predictive_coding_layer_count();
+    let factors = layers + 1;
+    let scale = factor_scale(config, factors);
+    let mut activities = Vec::with_capacity(layers + 1);
+    let mut initial_rhos = Vec::with_capacity(layers);
+    activities.push(plain.predictive_coding_initial_activity(inputs.clone()));
+    for layer in 0..layers {
+        let trace = plain
+            .predictive_coding_forward_layer_with_recurrent_state(
+                activities[layer].clone(),
+                layer,
+                terminal_state.layers[layer].rho.clone(),
+                None,
+                None,
+            )
+            .expect("validated incremental local PC layer factor");
+        initial_rhos.push(trace.initial_rho.clone());
+        terminal_state.layers[layer].rho = Some(plain.predictive_coding_terminal_rho(&trace));
+        terminal_state.layers[layer].rho_norm = None;
+        terminal_state.layers[layer].sequence_aux = None;
+        activities.push(trace.next.detach());
+    }
+    terminal_state.position = terminal_state.position.saturating_add(block_time);
+    terminal_state.detach_in_place();
+    let hidden = plain.predictive_coding_hidden_from_activity(
+        activities
+            .last()
+            .expect("incremental PC terminal activity")
+            .clone(),
+    );
+    let [batch, time] = targets.shape().dims::<2>();
+    let supervised_tokens = loss_mask.clone().map_or_else(
+        || Tensor::<B::InnerBackend, 2>::ones([batch, time], &targets.device()).sum(),
+        |mask| mask.float().sum(),
+    );
+    let terminal =
+        plain.predictive_coding_head_activity_vjp(hidden, targets.clone(), loss_mask.clone());
+
+    IncrementalPredictiveCodingChunk {
+        inputs,
+        targets,
+        loss_mask,
+        activities,
+        initial_rhos,
+        loss: Tensor::<B, 1>::from_inner(terminal.loss),
+        supervised_tokens: Tensor::<B, 1>::from_inner(supervised_tokens.reshape([1])),
+        terminal_state: ModelState::<B>::from_inner_cloned(terminal_state),
+        factors,
+        scale,
+    }
+}
+
+/// Perform one activity-inference phase against the current parameter values.
+/// Inferred activities persist into the next call; the clamped token embedding
+/// is refreshed because its parameter may have changed in the preceding phase.
+pub(super) fn incremental_predictive_coding_infer<B: AutodiffBackend>(
+    model: &DragonModel<B>,
+    state: &mut IncrementalPredictiveCodingChunk<B>,
+    config: &LocalPredictiveCodingConfig,
+) -> usize
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    let plain = model.valid();
+    state.activities[0] = plain.predictive_coding_initial_activity(state.inputs.clone());
+    let layers = plain.predictive_coding_layer_count();
+    let trace = forward_trace_batch(&plain, &state.activities, &state.initial_rhos, None, None);
+    let hidden = plain.predictive_coding_hidden_from_activity(
+        state
+            .activities
+            .last()
+            .expect("incremental PC terminal activity")
+            .clone(),
+    );
+    let terminal = plain.predictive_coding_head_activity_vjp(
+        hidden,
+        state.targets.clone(),
+        state.loss_mask.clone(),
+    );
+    let terminal_grad = (terminal.grad_hidden * terminal.normalization.reshape([1, 1, 1])).reshape(
+        state
+            .activities
+            .last()
+            .expect("incremental PC terminal activity")
+            .shape(),
+    );
+    let [batch, streams, time, dim] = state.activities[0].shape().dims::<4>();
+    let mut local_vjp_calls = 1usize;
+
+    match config.solver {
+        LocalPredictiveCodingSolver::SynchronousEquilibrium => {
+            let inferred = Tensor::cat(state.activities.iter().skip(1).cloned().collect(), 0);
+            let errors = prediction_error(
+                trace.next.clone(),
+                inferred,
+                config.prediction_precision,
+                state.scale,
+            );
+            let internal_child_grads = (layers > 1).then(|| {
+                layer_activity_vjp(
+                    &plain,
+                    0,
+                    &slice_trace_batch(&trace, batch, layers * batch),
+                    slice_batch(errors.clone(), batch, layers * batch),
+                    None,
+                    None,
+                )
+            });
+            local_vjp_calls = local_vjp_calls.saturating_add(layers.saturating_sub(1));
+            let mut updates = Vec::with_capacity(layers);
+            for (activity_index, activity) in
+                state.activities.iter().enumerate().take(layers + 1).skip(1)
+            {
+                let own_offset = (activity_index - 1) * batch;
+                let own =
+                    slice_batch(errors.clone(), own_offset, own_offset + batch).mul_scalar(-1.0);
+                let child = if activity_index == layers {
+                    terminal_grad.clone().mul_scalar(state.scale)
+                } else {
+                    let offset = (activity_index - 1) * batch;
+                    internal_child_grads
+                        .as_ref()
+                        .expect("non-terminal PC activity has a child factor")
+                        .clone()
+                        .slice([offset..offset + batch, 0..streams, 0..time, 0..dim])
+                };
+                updates.push(burn_pc::pc_sgd_update(
+                    activity.clone(),
+                    own + child,
+                    &config.inference,
+                ));
+            }
+            for (activity, update) in state.activities.iter_mut().skip(1).zip(updates) {
+                *activity = update.detach();
+            }
+        }
+        LocalPredictiveCodingSolver::ReverseGaussSeidel => {
+            for activity_index in (1..=layers).rev() {
+                let own_offset = (activity_index - 1) * batch;
+                let own = prediction_error(
+                    slice_batch(trace.next.clone(), own_offset, own_offset + batch),
+                    state.activities[activity_index].clone(),
+                    config.prediction_precision,
+                    state.scale,
+                )
+                .mul_scalar(-1.0);
+                let child = if activity_index == layers {
+                    terminal_grad.clone().mul_scalar(state.scale)
+                } else {
+                    let child_offset = activity_index * batch;
+                    let child_error = prediction_error(
+                        slice_batch(trace.next.clone(), child_offset, child_offset + batch),
+                        state.activities[activity_index + 1].clone(),
+                        config.prediction_precision,
+                        state.scale,
+                    );
+                    local_vjp_calls = local_vjp_calls.saturating_add(1);
+                    layer_activity_vjp(
+                        &plain,
+                        activity_index,
+                        &slice_trace_batch(&trace, child_offset, child_offset + batch),
+                        child_error,
+                        None,
+                        None,
+                    )
+                };
+                state.activities[activity_index] = burn_pc::pc_sgd_update(
+                    state.activities[activity_index].clone(),
+                    own + child,
+                    &config.inference,
+                )
+                .detach();
+            }
+        }
+        LocalPredictiveCodingSolver::ErrorEquilibrium
+        | LocalPredictiveCodingSolver::FixedPrediction
+        | LocalPredictiveCodingSolver::LayerLocalPrediction
+        | LocalPredictiveCodingSolver::DirectKolenPollack => {
+            unreachable!("validated incremental PC solver")
+        }
+    }
+    local_vjp_calls
+}
+
+pub(super) fn incremental_predictive_coding_parameter_derivatives<B: AutodiffBackend>(
+    model: &DragonModel<B>,
+    state: &IncrementalPredictiveCodingChunk<B>,
+    config: &LocalPredictiveCodingConfig,
+) -> IncrementalPredictiveCodingParameterDerivatives
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    let parameter_ids = model
+        .predictive_coding_parameter_ids()
+        .expect("validated incremental predictive-coding model");
+    let plain = model.valid();
+    let layers = plain.predictive_coding_layer_count();
+    let trace = forward_trace_batch(&plain, &state.activities, &state.initial_rhos, None, None);
+    let hidden = plain.predictive_coding_hidden_from_activity(
+        state
+            .activities
+            .last()
+            .expect("incremental PC terminal activity")
+            .clone(),
+    );
+    let terminal =
+        plain.predictive_coding_head_vjp(hidden, state.targets.clone(), state.loss_mask.clone());
+    let normalization = terminal.supervised_tokens.clone().clamp_min(1.0);
+    let errors = prediction_error_gradient(
+        trace.next.clone(),
+        Tensor::cat(state.activities.iter().skip(1).cloned().collect(), 0),
+        config.prediction_precision,
+        state.scale,
+        normalization,
+    );
+    let batched_vjp = layer_parameter_vjp(&plain, 0, &trace, errors, None, None);
+    let [batch, streams, time, dim] = state.activities[0].shape().dims::<4>();
+    let initial_grad = batched_vjp
+        .grad_input
+        .slice([0..batch, 0..streams, 0..time, 0..dim]);
+    let initial_vjp = plain.predictive_coding_initial_vjp(state.inputs.clone(), initial_grad);
+    let mut grads = GradientsParams::new();
+    grads.register(parameter_ids.embedding, initial_vjp.grad_embedding);
+    grads.register(parameter_ids.encoder, batched_vjp.grad_encoder);
+    grads.register(parameter_ids.encoder_v, batched_vjp.grad_encoder_v);
+    grads.register(parameter_ids.decoder, batched_vjp.grad_decoder);
+    grads.register(
+        parameter_ids.norm_gamma,
+        batched_vjp.grad_norm_gamma + initial_vjp.grad_norm_gamma,
+    );
+    grads.register(
+        parameter_ids.norm_beta,
+        batched_vjp.grad_norm_beta + initial_vjp.grad_norm_beta,
+    );
+    grads.register(
+        parameter_ids.norm_alpha,
+        batched_vjp.grad_norm_alpha + initial_vjp.grad_norm_alpha,
+    );
+    grads.register(
+        parameter_ids.norm_shift,
+        batched_vjp.grad_norm_shift + initial_vjp.grad_norm_shift,
+    );
+    grads.register(
+        parameter_ids.lm_head,
+        terminal.grad_lm_head.mul_scalar(state.scale),
+    );
+    let gradient_tensors = grads.len();
+    IncrementalPredictiveCodingParameterDerivatives {
+        grads,
+        local_vjp_calls: layers.saturating_add(2),
+        gradient_tensors,
+    }
+}
+
+pub(super) fn incremental_predictive_coding_energy<B: AutodiffBackend>(
+    model: &DragonModel<B>,
+    state: &IncrementalPredictiveCodingChunk<B>,
+    config: &LocalPredictiveCodingConfig,
+) -> f64
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    let plain = model.valid();
+    burn_pc::diagnostic_scalar_f32(total_energy(
+        &plain,
+        &state.activities,
+        &state.initial_rhos,
+        state.targets.clone(),
+        state.loss_mask.clone(),
+        config,
+        (None, None),
+    )) as f64
 }
 
 pub(crate) fn local_predictive_coding_train_step<B: AutodiffBackend>(
@@ -887,6 +2032,27 @@ where
     terminal_state.position = terminal_state.position.saturating_add(block_time);
     terminal_state.detach_in_place();
 
+    if matches!(config.solver, LocalPredictiveCodingSolver::ErrorEquilibrium) {
+        return error_equilibrium_train_step::<B>(
+            &plain,
+            FixedPredictionContext {
+                parameter_ids,
+                inputs,
+                targets,
+                loss_mask,
+                activities,
+                traces: feedforward_traces,
+                neuron_mask,
+                activity_mask,
+                terminal_state,
+                factors,
+                scale,
+            },
+            config,
+            started,
+            profile,
+        );
+    }
     if matches!(config.solver, LocalPredictiveCodingSolver::FixedPrediction) {
         return fixed_prediction_train_step::<B>(
             &plain,
@@ -903,6 +2069,7 @@ where
                 factors,
                 scale,
             },
+            config,
             started,
             profile,
         );
@@ -924,6 +2091,7 @@ where
                 activity_mask,
                 terminal_state,
             },
+            config,
             started,
             profile,
         );
@@ -1095,11 +2263,17 @@ where
                 }
             }
         }
+        LocalPredictiveCodingSolver::ErrorEquilibrium => {
+            unreachable!("error-equilibrium solver returns before state activity inference")
+        }
         LocalPredictiveCodingSolver::FixedPrediction => {
             unreachable!("fixed-prediction solver returns before activity inference")
         }
         LocalPredictiveCodingSolver::LayerLocalPrediction => {
             unreachable!("layer-local solver returns before activity inference")
+        }
+        LocalPredictiveCodingSolver::DirectKolenPollack => {
+            unreachable!("DKP uses the optimizer-owned two-phase schedule")
         }
     }
 
@@ -1191,16 +2365,21 @@ where
         local_vjp_calls,
         global_backward_calls: 0,
         gradient_tensors: grads.len(),
+        direct_forward_updates: 0,
+        feedback_parameter_updates: 0,
+        parameter_updates: 1,
         energy_before,
         energy_after,
         elapsed_ns: started.elapsed().as_nanos(),
     };
+    validate_step_execution_contract(config, &report);
     profile.record(report);
     LocalPredictiveCodingDerivatives {
         grads,
         loss,
         supervised_tokens: Tensor::<B, 1>::from_inner(terminal.supervised_tokens),
         terminal_state: ModelState::<B>::from_inner_cloned(terminal_state),
+        dkp_feedback: None,
         report,
     }
 }
@@ -1441,6 +2620,14 @@ where
         .inference
         .validate("local_predictive_coding_derivatives.inference")
         .map_err(|error| error.to_string())?;
+    config
+        .direct_feedback
+        .validate()
+        .map_err(|error| error.to_string())?;
+    config
+        .tied_consensus
+        .validate()
+        .map_err(|error| error.to_string())?;
     if config.prediction_precision <= 0.0 || !config.prediction_precision.is_finite() {
         return Err(
             "local_predictive_coding_derivatives.prediction_precision must be finite and > 0"
@@ -1457,6 +2644,16 @@ where
         );
     }
     if matches!(
+        config.parameterization,
+        burn_pc::PcParameterizationKind::MuPc
+    ) && !matches!(config.solver, LocalPredictiveCodingSolver::ErrorEquilibrium)
+    {
+        return Err(
+            "local_predictive_coding_derivatives parameterization=mu_pc requires solver=error_equilibrium"
+                .to_string(),
+        );
+    }
+    if matches!(
         config.solver,
         LocalPredictiveCodingSolver::LayerLocalPrediction
     ) && !matches!(
@@ -1465,6 +2662,15 @@ where
     ) {
         return Err(
             "local_predictive_coding_derivatives layer_local_prediction requires factor_reduction=mean"
+                .to_string(),
+        );
+    }
+    if matches!(
+        config.solver,
+        LocalPredictiveCodingSolver::DirectKolenPollack
+    ) {
+        return Err(
+            "direct_kolen_pollack requires the optimizer-owned training step; use LanguageTrainModel rather than the derivative-only API"
                 .to_string(),
         );
     }
@@ -1555,6 +2761,29 @@ mod tests {
                 device,
             ),
         )
+    }
+
+    #[test]
+    fn identity_dkp_feedback_aligns_every_factor_in_the_shared_residual_basis() {
+        let device = Default::default();
+        let feedback = initial_dkp_feedback::<PlainBackend>(
+            3,
+            4,
+            burn_pc::PcFeedbackInitialization::Identity,
+            &device,
+        );
+        let values = feedback
+            .into_data()
+            .to_vec::<f32>()
+            .expect("identity feedback values");
+        for layer in 0..3 {
+            for row in 0..4 {
+                for column in 0..4 {
+                    let expected = f32::from(row == column);
+                    assert_eq!(values[layer * 16 + row * 4 + column], expected);
+                }
+            }
+        }
     }
 
     fn batch_for_step(
@@ -1930,18 +3159,130 @@ mod tests {
     }
 
     #[test]
+    fn error_equilibrium_descends_error_energy_without_global_backward() {
+        let device = Default::default();
+        TestBackend::seed(&device, 20260807);
+        let model = model(&device);
+        let config = LocalPredictiveCodingConfig {
+            solver: LocalPredictiveCodingSolver::ErrorEquilibrium,
+            inference: burn_pc::PcInferenceConfig {
+                steps: 8,
+                step_size: 0.01,
+                max_grad_norm: None,
+                gradient_norm_scope: burn_pc::PcGradientNormScope::PerRow,
+                ..burn_pc::PcInferenceConfig::default()
+            },
+            sync_diagnostics: true,
+            ..LocalPredictiveCodingConfig::default()
+        };
+        let (inputs, targets) = batch(&device);
+        let report = local_predictive_coding_train_step(
+            &model,
+            inputs,
+            targets,
+            None,
+            &config,
+            &LocalPredictiveCodingProfile::default(),
+        )
+        .report;
+
+        let before = report.energy_before.expect("initial ePC energy");
+        let after = report.energy_after.expect("relaxed ePC energy");
+        assert!(
+            after < before,
+            "error-coordinate inference must descend energy: before={before} after={after}"
+        );
+        assert_eq!(report.solver, LocalPredictiveCodingSolver::ErrorEquilibrium);
+        assert_eq!(report.global_backward_calls, 0);
+        assert_eq!(report.parameter_updates, 1);
+        assert_eq!(report.gradient_tensors, 9);
+    }
+
+    #[test]
+    fn error_equilibrium_keeps_transient_errors_out_of_stream_state() {
+        let device = Default::default();
+        TestBackend::seed(&device, 20260807);
+        let model = model(&device);
+        let (inputs, targets) = batch(&device);
+        let fixed = local_predictive_coding_train_step(
+            &model,
+            inputs.clone(),
+            targets.clone(),
+            None,
+            &LocalPredictiveCodingConfig {
+                solver: LocalPredictiveCodingSolver::FixedPrediction,
+                ..LocalPredictiveCodingConfig::default()
+            },
+            &LocalPredictiveCodingProfile::default(),
+        );
+        let epc = local_predictive_coding_train_step(
+            &model,
+            inputs,
+            targets,
+            None,
+            &LocalPredictiveCodingConfig {
+                solver: LocalPredictiveCodingSolver::ErrorEquilibrium,
+                inference: burn_pc::PcInferenceConfig {
+                    steps: 4,
+                    step_size: 0.01,
+                    max_grad_norm: None,
+                    ..burn_pc::PcInferenceConfig::default()
+                },
+                ..LocalPredictiveCodingConfig::default()
+            },
+            &LocalPredictiveCodingProfile::default(),
+        );
+
+        assert_eq!(fixed.terminal_state.position, epc.terminal_state.position);
+        assert_eq!(
+            fixed.terminal_state.layers.len(),
+            epc.terminal_state.layers.len()
+        );
+        for (layer, (fixed_layer, epc_layer)) in fixed
+            .terminal_state
+            .layers
+            .into_iter()
+            .zip(epc.terminal_state.layers)
+            .enumerate()
+        {
+            match (fixed_layer.rho, epc_layer.rho) {
+                (Some(fixed_rho), Some(epc_rho)) => {
+                    let difference = max_abs_diff(fixed_rho.inner(), epc_rho.inner());
+                    assert!(
+                        difference < 1.0e-6,
+                        "transient ePC errors changed layer {layer} stream rho: {difference}"
+                    );
+                }
+                (None, None) => {}
+                _ => panic!("solver controls disagree on layer {layer} rho presence"),
+            }
+        }
+    }
+
+    #[test]
+    fn derivative_api_rejects_mu_pc_on_non_error_solver() {
+        let device = Default::default();
+        let model = model(&device);
+        let (inputs, targets) = batch(&device);
+        let error = local_predictive_coding_derivatives(
+            &model,
+            inputs,
+            targets,
+            None,
+            &LocalPredictiveCodingConfig {
+                solver: LocalPredictiveCodingSolver::FixedPrediction,
+                parameterization: burn_pc::PcParameterizationKind::MuPc,
+                ..LocalPredictiveCodingConfig::default()
+            },
+        )
+        .expect_err("muPC must not silently alter a control solver");
+        assert!(error.contains("requires solver=error_equilibrium"));
+    }
+
+    #[test]
     fn local_pc_derivatives_are_invariant_to_batch_duplication() {
         let device = Default::default();
         let model = model(&device);
-        let config = LocalPredictiveCodingConfig {
-            inference: burn_pc::PcInferenceConfig {
-                steps: 4,
-                step_size: 0.05,
-                max_grad_norm: None,
-                ..burn_pc::PcInferenceConfig::default()
-            },
-            ..LocalPredictiveCodingConfig::default()
-        };
         let single_inputs =
             Tensor::from_data(TensorData::new(vec![1_i64, 2, 3, 1], [1, 4]), &device);
         let single_targets =
@@ -1954,53 +3295,83 @@ mod tests {
             TensorData::new(vec![2_i64, 3, 1, 2, 2, 3, 1, 2], [2, 4]),
             &device,
         );
-        let single = local_predictive_coding_train_step(
-            &model,
-            single_inputs,
-            single_targets,
-            None,
-            &config,
-            &LocalPredictiveCodingProfile::default(),
-        );
-        let doubled = local_predictive_coding_train_step(
-            &model,
-            double_inputs,
-            double_targets,
-            None,
-            &config,
-            &LocalPredictiveCodingProfile::default(),
-        );
-        let ids = model
-            .predictive_coding_parameter_ids()
-            .expect("supported PC model");
-        let encoder_diff = max_abs_diff(
-            single
-                .grads
-                .get::<PlainBackend, 3>(ids.encoder)
-                .expect("single encoder derivative"),
-            doubled
-                .grads
-                .get::<PlainBackend, 3>(ids.encoder)
-                .expect("doubled encoder derivative"),
-        );
-        let head_diff = max_abs_diff(
-            single
-                .grads
-                .get::<PlainBackend, 2>(ids.lm_head)
-                .expect("single head derivative"),
-            doubled
-                .grads
-                .get::<PlainBackend, 2>(ids.lm_head)
-                .expect("doubled head derivative"),
-        );
-        assert!(
-            encoder_diff < 1.0e-5,
-            "encoder derivative changed after duplicating the batch: {encoder_diff}"
-        );
-        assert!(
-            head_diff < 1.0e-5,
-            "head derivative changed after duplicating the batch: {head_diff}"
-        );
+        let configs = [
+            (
+                "state_equilibrium",
+                LocalPredictiveCodingConfig {
+                    inference: burn_pc::PcInferenceConfig {
+                        steps: 4,
+                        step_size: 0.05,
+                        max_grad_norm: None,
+                        ..burn_pc::PcInferenceConfig::default()
+                    },
+                    ..LocalPredictiveCodingConfig::default()
+                },
+            ),
+            (
+                "error_equilibrium",
+                LocalPredictiveCodingConfig {
+                    solver: LocalPredictiveCodingSolver::ErrorEquilibrium,
+                    prediction_precision: 10.0,
+                    inference: burn_pc::PcInferenceConfig {
+                        steps: 1,
+                        step_size: 0.1,
+                        max_grad_norm: None,
+                        ..burn_pc::PcInferenceConfig::default()
+                    },
+                    ..LocalPredictiveCodingConfig::default()
+                },
+            ),
+        ];
+        for (solver, config) in configs {
+            let single = local_predictive_coding_train_step(
+                &model,
+                single_inputs.clone(),
+                single_targets.clone(),
+                None,
+                &config,
+                &LocalPredictiveCodingProfile::default(),
+            );
+            let doubled = local_predictive_coding_train_step(
+                &model,
+                double_inputs.clone(),
+                double_targets.clone(),
+                None,
+                &config,
+                &LocalPredictiveCodingProfile::default(),
+            );
+            let ids = model
+                .predictive_coding_parameter_ids()
+                .expect("supported PC model");
+            let encoder_diff = max_abs_diff(
+                single
+                    .grads
+                    .get::<PlainBackend, 3>(ids.encoder)
+                    .expect("single encoder derivative"),
+                doubled
+                    .grads
+                    .get::<PlainBackend, 3>(ids.encoder)
+                    .expect("doubled encoder derivative"),
+            );
+            let head_diff = max_abs_diff(
+                single
+                    .grads
+                    .get::<PlainBackend, 2>(ids.lm_head)
+                    .expect("single head derivative"),
+                doubled
+                    .grads
+                    .get::<PlainBackend, 2>(ids.lm_head)
+                    .expect("doubled head derivative"),
+            );
+            assert!(
+                encoder_diff < 1.0e-5,
+                "{solver} encoder derivative changed after duplicating the batch: {encoder_diff}"
+            );
+            assert!(
+                head_diff < 1.0e-5,
+                "{solver} head derivative changed after duplicating the batch: {head_diff}"
+            );
+        }
     }
 
     #[test]
@@ -2012,5 +3383,35 @@ mod tests {
         assert_eq!(graph.factors.len(), 4);
         assert!(graph.nodes[0].clamped);
         assert!(graph.nodes[4].clamped);
+    }
+
+    #[test]
+    fn checkpoint_identity_covers_graph_and_inference_dynamics() {
+        let config = LocalPredictiveCodingConfig::default();
+        let manifest = dragon_predictive_coding_checkpoint_manifest(3, &config)
+            .expect("predictive-coding manifest");
+        assert_eq!(
+            manifest.execution_contract,
+            burn_pc::PcExecutionContract::strict_local()
+        );
+
+        let wider_graph = dragon_predictive_coding_checkpoint_manifest(4, &config)
+            .expect("wider predictive-coding graph");
+        assert_ne!(manifest.graph_digest, wider_graph.graph_digest);
+
+        let mut identity_feedback = config.clone();
+        identity_feedback.direct_feedback.initialization =
+            burn_pc::PcFeedbackInitialization::Identity;
+        let identity_feedback = dragon_predictive_coding_checkpoint_manifest(3, &identity_feedback)
+            .expect("identity-feedback predictive-coding program");
+        assert_eq!(manifest.graph_digest, identity_feedback.graph_digest);
+        assert_ne!(manifest.program_digest, identity_feedback.program_digest);
+
+        let mut changed = config;
+        changed.inference.step_size = 0.1;
+        let changed = dragon_predictive_coding_checkpoint_manifest(3, &changed)
+            .expect("changed predictive-coding program");
+        assert_eq!(manifest.graph_digest, changed.graph_digest);
+        assert_ne!(manifest.program_digest, changed.program_digest);
     }
 }

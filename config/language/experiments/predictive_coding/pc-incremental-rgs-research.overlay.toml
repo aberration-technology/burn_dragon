@@ -1,0 +1,12 @@
+# Research control only. The 2026-08-07 byte-text gate rejected this mode for
+# promotion; see docs/experiments/predictive-coding-incremental-20260807.json.
+[training.local_predictive_coding]
+solver = "reverse_gauss_seidel"
+learning_schedule = "incremental"
+incremental_parameter_step_scale = 1.0
+prediction_precision = 1.0
+
+[training.local_predictive_coding.inference]
+steps = 1
+step_size = 0.2
+

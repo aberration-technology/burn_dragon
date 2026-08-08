@@ -1,6 +1,8 @@
 #![cfg_attr(not(feature = "cli"), allow(dead_code))]
 
 mod prelude;
+#[cfg(test)]
+mod test_support;
 
 pub mod backend;
 mod context_routing;

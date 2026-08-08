@@ -44,9 +44,10 @@ Options:
   --matrix <name>              smoke | main-fixed-token | controls | wall-clock | stability |
                                local-factor | local-solver-promotion | local-solver-open-loop |
                                local-solver-recurrent | local-solver-recurrent-open-loop |
-                               hparam | nextlat-tbptt
+                               local-incremental-byte | local-error-promotion |
+                               local-direct-feedback | hparam | nextlat-tbptt
   --profile <path>             Base training TOML. Default: ruliad-1m JEPA profile.
-  --backend <cuda|cpu>         Backend. Default: cuda.
+  --backend <cuda|wgpu|cpu>    Backend. Default: cuda.
   --features <features>        Cargo features. Default: train,cuda.
   --out-dir <path>             Output directory for overlays, logs, manifests, and run roots.
   --seeds <csv>                Override matrix seeds.
@@ -146,7 +147,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "$BACKEND" == "cpu" && "$FEATURES" == "train,cuda" ]]; then
+if [[ "$BACKEND" != "cuda" && "$FEATURES" == "train,cuda" ]]; then
   FEATURES="train"
 fi
 
@@ -289,6 +290,54 @@ matrix_defaults() {
       fi
       if [[ -z "$SEQUENCE_STATE_PROBE" ]]; then
         SEQUENCE_STATE_PROBE=true
+      fi
+      if [[ "$TIMEOUT_SECONDS" == "0" ]]; then
+        TIMEOUT_SECONDS=1800
+      fi
+      ;;
+    local-incremental-byte)
+      : "${PROFILE:=config/language/experiments/predictive_coding/local-pc-byte-text-1m.toml}"
+      : "${SEEDS_CSV:=20260804,20260805,20260806}"
+      : "${ITERS_CSV:=128,512}"
+      : "${ARMS_CSV:=local_backprop,local_pc_fixed_prediction,local_pc_incremental_sync_steps1_eta05_scale1_lr001,local_pc_incremental_rgs_steps2_eta05_scale05_lr001,local_pc_incremental_rgs_steps4_eta05_scale025_lr001,local_pc_incremental_rgs_steps8_eta05_scale0125_lr001}"
+      : "${BATCH_SIZE:=32}"
+      if [[ -z "${BURN_DRAGON_PC_PAPER_CHECKPOINT_INTERVAL_ITERS:-}" ]]; then
+        CHECKPOINT_INTERVAL_ITERS=512
+      fi
+      if [[ -z "${BURN_DRAGON_PC_PAPER_TBPTT_CHUNK_SIZE:-}" ]]; then
+        TBPTT_CHUNK_SIZE=0
+      fi
+      if [[ "$TIMEOUT_SECONDS" == "0" ]]; then
+        TIMEOUT_SECONDS=1800
+      fi
+      ;;
+    local-error-promotion)
+      : "${PROFILE:=config/language/experiments/predictive_coding/local-pc-1m.toml}"
+      : "${SEEDS_CSV:=20260807,20260808,20260809}"
+      : "${ITERS_CSV:=128,512}"
+      : "${ARMS_CSV:=local_backprop,local_pc_fixed_prediction,local_pc_epc_steps1_eta10_prec10,local_pc_epc_steps4_eta10_prec10,local_pc_epc_mup_rms_steps1_eta10_prec10}"
+      : "${BATCH_SIZE:=32}"
+      if [[ -z "${BURN_DRAGON_PC_PAPER_CHECKPOINT_INTERVAL_ITERS:-}" ]]; then
+        CHECKPOINT_INTERVAL_ITERS=512
+      fi
+      if [[ -z "${BURN_DRAGON_PC_PAPER_TBPTT_CHUNK_SIZE:-}" ]]; then
+        TBPTT_CHUNK_SIZE=0
+      fi
+      if [[ "$TIMEOUT_SECONDS" == "0" ]]; then
+        TIMEOUT_SECONDS=1800
+      fi
+      ;;
+    local-direct-feedback)
+      : "${PROFILE:=config/language/experiments/predictive_coding/local-pc-1m.toml}"
+      : "${SEEDS_CSV:=20260807,20260808,20260809}"
+      : "${ITERS_CSV:=128,512}"
+      : "${ARMS_CSV:=local_backprop,local_pc_fixed_prediction,local_pc_dkp_pre01_fb001_steps1,local_pc_dkp_identity_pre01_fb001_steps1,local_pc_dkp_identity_pre025_fb001_steps1}"
+      : "${BATCH_SIZE:=32}"
+      if [[ -z "${BURN_DRAGON_PC_PAPER_CHECKPOINT_INTERVAL_ITERS:-}" ]]; then
+        CHECKPOINT_INTERVAL_ITERS=512
+      fi
+      if [[ -z "${BURN_DRAGON_PC_PAPER_TBPTT_CHUNK_SIZE:-}" ]]; then
+        TBPTT_CHUNK_SIZE=0
       fi
       if [[ "$TIMEOUT_SECONDS" == "0" ]]; then
         TIMEOUT_SECONDS=1800
@@ -647,6 +696,368 @@ weight_decay = 0.01
 
 [training.local_predictive_coding]
 solver = "fixed_prediction"
+
+EOF
+      ;;
+    local_pc_dkp_pre*_fb*_steps*|local_pc_dkp_identity_pre*_fb*_steps*)
+      local feedback_initialization="gaussian"
+      local parsed_arm="$arm"
+      if [[ "$arm" == local_pc_dkp_identity_pre* ]]; then
+        feedback_initialization="identity"
+        parsed_arm="${arm/local_pc_dkp_identity_pre/local_pc_dkp_pre}"
+      fi
+      if [[ ! "$parsed_arm" =~ ^local_pc_dkp_pre(005|01|025|05|1|2|4)_fb(0001|001|01)_steps(1|2|4)(_(sgd|momentum|adamw)_lr(0001|0003|001|003|01|03|10))?$ ]]; then
+        echo "unknown direct Kolen-Pollack arm: $arm" >&2
+        return 2
+      fi
+      local preliminary_code="${BASH_REMATCH[1]}"
+      local feedback_code="${BASH_REMATCH[2]}"
+      local local_steps="${BASH_REMATCH[3]}"
+      local local_transform="${BASH_REMATCH[5]:-adamw}"
+      local lr_code="${BASH_REMATCH[6]:-}"
+      local preliminary_step=""
+      local feedback_step=""
+      local local_lr="$LOCAL_LEARNING_RATE"
+      case "$preliminary_code" in
+        005) preliminary_step="0.05" ;;
+        01) preliminary_step="0.1" ;;
+        025) preliminary_step="0.25" ;;
+        05) preliminary_step="0.5" ;;
+        1) preliminary_step="1.0" ;;
+        2) preliminary_step="2.0" ;;
+        4) preliminary_step="4.0" ;;
+      esac
+      case "$feedback_code" in
+        0001) feedback_step="0.0001" ;;
+        001) feedback_step="0.001" ;;
+        01) feedback_step="0.01" ;;
+      esac
+      case "$lr_code" in
+        0001) local_lr="0.0001" ;;
+        0003) local_lr="0.0003" ;;
+        001) local_lr="0.001" ;;
+        003) local_lr="0.003" ;;
+        01) local_lr="0.01" ;;
+        03) local_lr="0.03" ;;
+        10) local_lr="0.1" ;;
+      esac
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = $local_lr
+weight_decay = 0.01
+
+[optimizer.predictive_coding]
+transform = "$local_transform"
+momentum = 0.9
+
+[training.local_predictive_coding]
+solver = "direct_kolen_pollack"
+parameterization = "standard"
+prediction_precision = 1.0
+factor_reduction = "mean"
+sync_diagnostics = false
+
+[training.local_predictive_coding.inference]
+steps = $local_steps
+step_size = 0.05
+max_grad_norm = 1.0
+gradient_norm_scope = "per_row"
+
+[training.local_predictive_coding.direct_feedback]
+preliminary_step_size = $preliminary_step
+feedback_step_size = $feedback_step
+forward_weight_decay = 0.0
+feedback_weight_decay = 0.0001
+signal_scale = 1.0
+initialization = "$feedback_initialization"
+
+[training.local_predictive_coding.tied_consensus]
+damping = 0.001
+min_curvature = 0.000001
+eps = 0.00000001
+
+EOF
+      ;;
+    local_pc_epc_steps*_eta*_prec*|local_pc_epc_mup_*_steps*_eta*_prec*)
+      local local_parameterization="standard"
+      local local_reduction="root_mean_square"
+      local local_steps=""
+      local eta_code=""
+      local precision_code=""
+      if [[ "$arm" =~ ^local_pc_epc_steps(1|2|4|8|16|32)_eta(001|003|005|01|03|05|10|20)_prec(1|3|10|30)$ ]]; then
+        local_steps="${BASH_REMATCH[1]}"
+        eta_code="${BASH_REMATCH[2]}"
+        precision_code="${BASH_REMATCH[3]}"
+      elif [[ "$arm" =~ ^local_pc_epc_mup_(sum|mean|rms)_steps(1|2|4|8|16|32)_eta(001|003|005|01|03|05|10|20)_prec(1|3|10|30)$ ]]; then
+        local_parameterization="mu_pc"
+        case "${BASH_REMATCH[1]}" in
+          sum) local_reduction="sum" ;;
+          mean) local_reduction="mean" ;;
+          rms) local_reduction="root_mean_square" ;;
+        esac
+        local_steps="${BASH_REMATCH[2]}"
+        eta_code="${BASH_REMATCH[3]}"
+        precision_code="${BASH_REMATCH[4]}"
+      else
+        echo "unknown error-equilibrium PC arm: $arm" >&2
+        return 2
+      fi
+      local local_eta=""
+      local local_precision=""
+      case "$eta_code" in
+        001) local_eta="0.001" ;;
+        003) local_eta="0.003" ;;
+        005) local_eta="0.005" ;;
+        01) local_eta="0.01" ;;
+        03) local_eta="0.03" ;;
+        05) local_eta="0.05" ;;
+        10) local_eta="0.1" ;;
+        20) local_eta="0.2" ;;
+      esac
+      case "$precision_code" in
+        1) local_precision="1.0" ;;
+        3) local_precision="3.0" ;;
+        10) local_precision="10.0" ;;
+        30) local_precision="30.0" ;;
+      esac
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = $LOCAL_LEARNING_RATE
+weight_decay = 0.01
+
+[training.local_predictive_coding]
+solver = "error_equilibrium"
+parameterization = "$local_parameterization"
+shared_reuse_reduction = "$local_reduction"
+prediction_precision = $local_precision
+
+[training.local_predictive_coding.inference]
+steps = $local_steps
+step_size = $local_eta
+max_grad_norm = 1000000.0
+
+EOF
+      ;;
+    local_pc_fixed_prediction_sgd_lr*|local_pc_fixed_prediction_momentum_lr*)
+      if [[ ! "$arm" =~ ^local_pc_fixed_prediction_(sgd|momentum)_lr(001|003|01|03|10)$ ]]; then
+        echo "unknown fixed-prediction parameter-transform arm: $arm" >&2
+        return 2
+      fi
+      local local_transform="${BASH_REMATCH[1]}"
+      local lr_code="${BASH_REMATCH[2]}"
+      local local_lr=""
+      case "$lr_code" in
+        001) local_lr="0.001" ;;
+        003) local_lr="0.003" ;;
+        01) local_lr="0.01" ;;
+        03) local_lr="0.03" ;;
+        10) local_lr="0.1" ;;
+      esac
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = $local_lr
+weight_decay = 0.01
+
+[optimizer.predictive_coding]
+transform = "$local_transform"
+momentum = 0.9
+
+[training.local_predictive_coding]
+solver = "fixed_prediction"
+
+EOF
+      ;;
+    local_pc_fixed_prediction_diagonal_natural_lr*)
+      if [[ ! "$arm" =~ ^local_pc_fixed_prediction_diagonal_natural_lr(0001|0003|001|003|01)$ ]]; then
+        echo "unknown fixed-prediction diagonal-natural arm: $arm" >&2
+        return 2
+      fi
+      local lr_code="${BASH_REMATCH[1]}"
+      local local_lr=""
+      case "$lr_code" in
+        0001) local_lr="0.0001" ;;
+        0003) local_lr="0.0003" ;;
+        001) local_lr="0.001" ;;
+        003) local_lr="0.003" ;;
+        01) local_lr="0.01" ;;
+      esac
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = $local_lr
+weight_decay = 0.01
+
+[optimizer.predictive_coding]
+transform = "diagonal_natural"
+fisher_decay = 0.95
+damping = 0.001
+
+[training.local_predictive_coding]
+solver = "fixed_prediction"
+
+EOF
+      ;;
+    local_pc_rgs_steps*_eta*_prec*_momentum_lr*)
+      if [[ ! "$arm" =~ ^local_pc_rgs_steps(4|8|16)_eta(05|10|20)_prec(001|003|01|03|1|3|10)_momentum_lr(001|003|01|03|10)$ ]]; then
+        echo "unknown prospective precision arm: $arm" >&2
+        return 2
+      fi
+      local local_steps="${BASH_REMATCH[1]}"
+      local eta_code="${BASH_REMATCH[2]}"
+      local precision_code="${BASH_REMATCH[3]}"
+      local lr_code="${BASH_REMATCH[4]}"
+      local local_eta=""
+      local local_precision=""
+      local local_lr=""
+      case "$eta_code" in
+        05) local_eta="0.05" ;;
+        10) local_eta="0.1" ;;
+        20) local_eta="0.2" ;;
+      esac
+      case "$precision_code" in
+        001) local_precision="0.01" ;;
+        003) local_precision="0.03" ;;
+        01) local_precision="0.1" ;;
+        03) local_precision="0.3" ;;
+        1) local_precision="1.0" ;;
+        3) local_precision="3.0" ;;
+        10) local_precision="10.0" ;;
+      esac
+      case "$lr_code" in
+        001) local_lr="0.001" ;;
+        003) local_lr="0.003" ;;
+        01) local_lr="0.01" ;;
+        03) local_lr="0.03" ;;
+        10) local_lr="0.1" ;;
+      esac
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = $local_lr
+weight_decay = 0.01
+
+[optimizer.predictive_coding]
+transform = "momentum"
+momentum = 0.9
+
+[training.local_predictive_coding]
+solver = "reverse_gauss_seidel"
+prediction_precision = $local_precision
+
+[training.local_predictive_coding.inference]
+steps = $local_steps
+step_size = $local_eta
+
+EOF
+      ;;
+    local_pc_rgs_steps*_eta*_sgd_lr*|local_pc_rgs_steps*_eta*_momentum_lr*)
+      if [[ ! "$arm" =~ ^local_pc_rgs_steps(4|8|16|32|64)_eta(05|10|15|20)_(sgd|momentum)_lr(001|003|01|03|10)$ ]]; then
+        echo "unknown prospective parameter-transform arm: $arm" >&2
+        return 2
+      fi
+      local local_steps="${BASH_REMATCH[1]}"
+      local eta_code="${BASH_REMATCH[2]}"
+      local local_transform="${BASH_REMATCH[3]}"
+      local lr_code="${BASH_REMATCH[4]}"
+      local local_eta=""
+      local local_lr=""
+      case "$eta_code" in
+        05) local_eta="0.05" ;;
+        10) local_eta="0.1" ;;
+        15) local_eta="0.15" ;;
+        20) local_eta="0.2" ;;
+      esac
+      case "$lr_code" in
+        001) local_lr="0.001" ;;
+        003) local_lr="0.003" ;;
+        01) local_lr="0.01" ;;
+        03) local_lr="0.03" ;;
+        10) local_lr="0.1" ;;
+      esac
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = $local_lr
+weight_decay = 0.01
+
+[optimizer.predictive_coding]
+transform = "$local_transform"
+momentum = 0.9
+
+[training.local_predictive_coding]
+solver = "reverse_gauss_seidel"
+
+[training.local_predictive_coding.inference]
+steps = $local_steps
+step_size = $local_eta
+
+EOF
+      ;;
+    local_pc_incremental_sync_steps*_eta*_scale*_lr*|local_pc_incremental_rgs_steps*_eta*_scale*_lr*)
+      if [[ ! "$arm" =~ ^local_pc_incremental_(sync|rgs)_steps(1|2|4|8)_eta(05|10|15|20|30|40|50|60|70|100)(_prec(03|1|3))?_scale(0125|025|05|1)_lr(0003|001|003)$ ]]; then
+        echo "unknown incremental PC arm: $arm" >&2
+        return 2
+      fi
+      local solver_code="${BASH_REMATCH[1]}"
+      local local_steps="${BASH_REMATCH[2]}"
+      local eta_code="${BASH_REMATCH[3]}"
+      local precision_code="${BASH_REMATCH[5]:-1}"
+      local scale_code="${BASH_REMATCH[6]}"
+      local lr_code="${BASH_REMATCH[7]}"
+      local local_solver="synchronous_equilibrium"
+      local local_eta=""
+      local local_precision=""
+      local local_scale=""
+      local local_lr=""
+      if [[ "$solver_code" == "rgs" ]]; then
+        local_solver="reverse_gauss_seidel"
+      fi
+      case "$eta_code" in
+        05) local_eta="0.05" ;;
+        10) local_eta="0.1" ;;
+        15) local_eta="0.15" ;;
+        20) local_eta="0.2" ;;
+        30) local_eta="0.3" ;;
+        40) local_eta="0.4" ;;
+        50) local_eta="0.5" ;;
+        60) local_eta="0.6" ;;
+        70) local_eta="0.7" ;;
+        100) local_eta="1.0" ;;
+      esac
+      case "$precision_code" in
+        03) local_precision="0.3" ;;
+        1) local_precision="1.0" ;;
+        3) local_precision="3.0" ;;
+      esac
+      case "$scale_code" in
+        0125) local_scale="0.125" ;;
+        025) local_scale="0.25" ;;
+        05) local_scale="0.5" ;;
+        1) local_scale="1.0" ;;
+      esac
+      case "$lr_code" in
+        0003) local_lr="0.0003" ;;
+        001) local_lr="0.001" ;;
+        003) local_lr="0.003" ;;
+      esac
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = $local_lr
+weight_decay = 0.01
+
+[training.local_predictive_coding]
+solver = "$local_solver"
+learning_schedule = "incremental"
+incremental_parameter_step_scale = $local_scale
+prediction_precision = $local_precision
+
+[training.local_predictive_coding.inference]
+steps = $local_steps
+step_size = $local_eta
 
 EOF
       ;;

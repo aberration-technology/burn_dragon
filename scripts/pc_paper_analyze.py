@@ -108,9 +108,15 @@ EVENT_SUMMARY_COLUMNS = [
     "pc_event_count",
     "pc_ms_mean",
     "pc_learning_contract_last",
+    "pc_execution_contract_version_last",
+    "pc_activity_derivative_contract_last",
+    "pc_parameter_derivative_contract_last",
     "pc_global_autodiff_graph_last",
     "pc_global_backward_calls_total",
     "pc_local_vjp_calls_total",
+    "pc_direct_forward_updates_total",
+    "pc_feedback_parameter_updates_total",
+    "pc_parameter_updates_total",
     "pc_factors_last",
     "pc_gradient_tensors_last",
     "pc_observation_contract_last",
@@ -562,6 +568,9 @@ def default_event_summary(run: str, run_dir: Path) -> dict[str, Any]:
     summary["pc_event_count"] = 0
     summary["pc_global_backward_calls_total"] = 0
     summary["pc_local_vjp_calls_total"] = 0
+    summary["pc_direct_forward_updates_total"] = 0
+    summary["pc_feedback_parameter_updates_total"] = 0
+    summary["pc_parameter_updates_total"] = 0
     summary["_pc_ms_values"] = []
     summary["_source_loss_by_step"] = {}
     summary["_source_loss_unkeyed"] = []
@@ -639,6 +648,15 @@ def collect_event_summaries(
                 summary["pc_learning_contract_last"] = event.get(
                     "learning_contract", ""
                 )
+                summary["pc_execution_contract_version_last"] = event.get(
+                    "execution_contract_version", ""
+                )
+                summary["pc_activity_derivative_contract_last"] = event.get(
+                    "activity_derivative_contract", ""
+                )
+                summary["pc_parameter_derivative_contract_last"] = event.get(
+                    "parameter_derivative_contract", ""
+                )
                 summary["pc_global_autodiff_graph_last"] = event.get(
                     "global_autodiff_graph", ""
                 )
@@ -647,6 +665,15 @@ def collect_event_summaries(
                 ) or 0
                 summary["pc_local_vjp_calls_total"] += as_int(
                     event.get("local_vjp_calls")
+                ) or 0
+                summary["pc_direct_forward_updates_total"] += as_int(
+                    event.get("direct_forward_updates")
+                ) or 0
+                summary["pc_feedback_parameter_updates_total"] += as_int(
+                    event.get("feedback_parameter_updates")
+                ) or 0
+                summary["pc_parameter_updates_total"] += as_int(
+                    event.get("parameter_updates")
                 ) or 0
                 summary["pc_factors_last"] = event.get("factors", "")
                 summary["pc_gradient_tensors_last"] = event.get(
@@ -1114,17 +1141,23 @@ def write_markdown(
             lines.append("## Local Learning Contract")
             lines.append("")
             lines.append(
-                "| Run | Contract | Global graph | Global backwards | Local VJPs | Factors | Gradient tensors |"
+                "| Run | Contract | Derivatives | Global graph | Global backwards | Local VJPs | Direct updates | Feedback updates | Parameter updates | Factors | Gradient tensors |"
             )
-            lines.append("| --- | --- | --- | ---: | ---: | ---: | ---: |")
+            lines.append("| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
             for row in pc_rows[:40]:
                 lines.append(
-                    "| {run} | {contract} | {graph} | {backwards} | {vjps} | {factors} | {grads} |".format(
+                    "| {run} | {contract} | v{version} activity={activity}, params={parameters} | {graph} | {backwards} | {vjps} | {direct} | {feedback} | {updates} | {factors} | {grads} |".format(
                         run=row.get("run", ""),
                         contract=row.get("pc_learning_contract_last", ""),
+                        version=row.get("pc_execution_contract_version_last", ""),
+                        activity=row.get("pc_activity_derivative_contract_last", ""),
+                        parameters=row.get("pc_parameter_derivative_contract_last", ""),
                         graph=row.get("pc_global_autodiff_graph_last", ""),
                         backwards=row.get("pc_global_backward_calls_total", ""),
                         vjps=row.get("pc_local_vjp_calls_total", ""),
+                        direct=row.get("pc_direct_forward_updates_total", ""),
+                        feedback=row.get("pc_feedback_parameter_updates_total", ""),
+                        updates=row.get("pc_parameter_updates_total", ""),
                         factors=row.get("pc_factors_last", ""),
                         grads=row.get("pc_gradient_tensors_last", ""),
                     )
@@ -1316,9 +1349,15 @@ def self_test() -> None:
                     "type": "predictive_coding",
                     "run_id": "run-a",
                     "learning_contract": "local_factor_vjp_v1",
+                    "execution_contract_version": 1,
+                    "activity_derivative_contract": "analytic_local",
+                    "parameter_derivative_contract": "analytic_local",
                     "global_autodiff_graph": False,
                     "global_backward_calls": 0,
                     "local_vjp_calls": 12,
+                    "direct_forward_updates": 6,
+                    "feedback_parameter_updates": 6,
+                    "parameter_updates": 3,
                     "factors": 4,
                     "gradient_tensors": 9,
                     "elapsed_ms": 3.5,
@@ -1475,9 +1514,15 @@ def self_test() -> None:
         assert event_rows[0]["source_loss_observations"] == "2"
         assert event_rows[0]["source_capability_allowed_max_difficulty_last"] == "5.0"
         assert event_rows[0]["pc_learning_contract_last"] == "local_factor_vjp_v1"
+        assert event_rows[0]["pc_execution_contract_version_last"] == "1"
+        assert event_rows[0]["pc_activity_derivative_contract_last"] == "analytic_local"
+        assert event_rows[0]["pc_parameter_derivative_contract_last"] == "analytic_local"
         assert event_rows[0]["pc_global_autodiff_graph_last"] == "False"
         assert event_rows[0]["pc_global_backward_calls_total"] == "0"
         assert event_rows[0]["pc_local_vjp_calls_total"] == "12"
+        assert event_rows[0]["pc_direct_forward_updates_total"] == "6"
+        assert event_rows[0]["pc_feedback_parameter_updates_total"] == "6"
+        assert event_rows[0]["pc_parameter_updates_total"] == "3"
         normalized = list(csv.DictReader((out / "normalized_summary.csv").open()))
         event_normalized = next(row for row in normalized if row["run"] == "run-a")
         assert event_normalized["tok_s"] == "512.0"

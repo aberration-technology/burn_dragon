@@ -37,9 +37,9 @@ pub enum EggrollPerturbationScope {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PredictiveCodingOptimizerTransform {
-    #[default]
     Sgd,
     Momentum,
+    #[default]
     Adamw,
     DiagonalNatural,
 }

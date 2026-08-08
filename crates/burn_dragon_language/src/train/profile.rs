@@ -441,6 +441,12 @@ pub fn record_local_learning_step(elapsed_ns: u128) {
     });
 }
 
+pub fn record_local_learning(elapsed_ns: u128) {
+    record(|profile| {
+        profile.local_learning_ns = profile.local_learning_ns.saturating_add(elapsed_ns);
+    });
+}
+
 pub fn record_auxiliary_objectives(elapsed_ns: u128, proof_policy_ns: u128) {
     record(|profile| {
         profile.auxiliary_objective_ns = profile.auxiliary_objective_ns.saturating_add(elapsed_ns);

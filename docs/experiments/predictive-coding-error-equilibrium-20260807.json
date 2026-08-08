@@ -1,0 +1,186 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-07",
+  "backend": "cuda",
+  "device": "NVIDIA GB10",
+  "claim_scope": "three-seed early-optimization and implementation gate; not long-horizon continual-learning evidence",
+  "model": {
+    "parameters": 937154,
+    "shared_layer_uses": 4,
+    "embedding": 96,
+    "heads": 4,
+    "latent_total": 3072,
+    "vocabulary_size": 272,
+    "batch_size": 32,
+    "block_size": 128
+  },
+  "execution_contract": {
+    "version": 1,
+    "activity_derivatives": "analytic_local",
+    "parameter_derivatives": "analytic_local",
+    "global_parameter_backward_allowed": false,
+    "checkpoint_schema_version": 2,
+    "exact_resume_identity": [
+      "factor_graph",
+      "solver",
+      "learning_schedule",
+      "parameterization",
+      "shared_reuse_reduction",
+      "factor_reduction",
+      "inference_dynamics"
+    ]
+  },
+  "error_equilibrium": {
+    "inference_steps": 1,
+    "step_size": 0.1,
+    "prediction_precision": 10.0,
+    "max_gradient_norm": null,
+    "parameterization": "standard",
+    "shared_reuse_reduction": "sum"
+  },
+  "matrix_128_updates": [
+    {
+      "arm": "adamw_backpropagation",
+      "runs": 3,
+      "validation_mean": 2.083,
+      "validation_ci95": 0.129,
+      "source_cadence_mean": 2.927,
+      "verifier_accuracy_mean": 0.0625,
+      "partial_progress_mean": 0.2483,
+      "wall_tokens_per_second": 57070,
+      "model_tokens_per_second": 82520,
+      "model_duty_fraction": 0.6916
+    },
+    {
+      "arm": "fixed_prediction",
+      "runs": 3,
+      "validation_mean": 2.049,
+      "validation_ci95": 0.0473,
+      "source_cadence_mean": 2.925,
+      "verifier_accuracy_mean": 0.04167,
+      "partial_progress_mean": 0.2187,
+      "wall_tokens_per_second": 38060,
+      "model_tokens_per_second": 51320,
+      "model_duty_fraction": 0.7415
+    },
+    {
+      "arm": "error_equilibrium",
+      "runs": 3,
+      "validation_mean": 2.101,
+      "validation_ci95": 0.0944,
+      "source_cadence_mean": 2.917,
+      "verifier_accuracy_mean": 0.0625,
+      "partial_progress_mean": 0.2613,
+      "wall_tokens_per_second": 21510,
+      "model_tokens_per_second": 27690,
+      "model_duty_fraction": 0.7768,
+      "predictive_coding_step_ms": 2367
+    }
+  ],
+  "matrix_512_updates": [
+    {
+      "arm": "adamw_backpropagation",
+      "runs": 3,
+      "validation_mean": 2.0251674751440683,
+      "validation_ci95": 0.07505056190507761,
+      "source_cadence_mean": 1.3798468955208334,
+      "source_cadence_ci95": 0.021060698516748775,
+      "verifier_accuracy_mean": 0.1875,
+      "partial_progress_mean": 0.37760406732559204,
+      "wall_tokens_per_second": 67052.32666666666,
+      "model_tokens_per_second": 80595.56466666666,
+      "model_duty_fraction": 0.8319733333333333
+    },
+    {
+      "arm": "fixed_prediction",
+      "runs": 3,
+      "validation_mean": 2.0525369296471276,
+      "validation_ci95": 0.06384128586951802,
+      "source_cadence_mean": 1.3812011025,
+      "source_cadence_ci95": 0.011555508598248575,
+      "verifier_accuracy_mean": 0.19791666666666666,
+      "partial_progress_mean": 0.37673600514729816,
+      "wall_tokens_per_second": 41673.70333333333,
+      "model_tokens_per_second": 49530.438,
+      "model_duty_fraction": 0.8413756666666666,
+      "predictive_coding_step_ms": 1323.1861621666667
+    },
+    {
+      "arm": "error_equilibrium",
+      "runs": 3,
+      "validation_mean": 2.062762886285782,
+      "validation_ci95": 0.039251736921274615,
+      "source_cadence_mean": 1.3780118820833334,
+      "source_cadence_ci95": 0.014955595203849639,
+      "verifier_accuracy_mean": 0.21875,
+      "partial_progress_mean": 0.3949651817480723,
+      "wall_tokens_per_second": 23114.674333333332,
+      "model_tokens_per_second": 27733.076333333334,
+      "model_duty_fraction": 0.833468,
+      "predictive_coding_step_ms": 2363.1143145
+    }
+  ],
+  "paired_error_equilibrium_minus_adamw_512": {
+    "validation_mean": 0.03759541114171346,
+    "validation_ci95": 0.04341185814191765,
+    "source_cadence_mean": -0.0018350134375000327,
+    "source_cadence_ci95": 0.010681275734614644,
+    "verifier_accuracy_mean": 0.03125,
+    "verifier_accuracy_ci95": 0.13446875,
+    "partial_progress_mean": 0.017361114422480266,
+    "partial_progress_ci95": 0.179097005654853,
+    "model_tokens_per_second": -52862.488333333335,
+    "model_tokens_per_second_ci95": 4847.278676571037
+  },
+  "cuda_gradient_fidelity": {
+    "batch_size": 4,
+    "block_size": 32,
+    "fixed_prediction": {
+      "loss_absolute_error": 0.0,
+      "global_cosine": 0.9999999421438446,
+      "norm_ratio": 0.9999998751016052,
+      "relative_l2_error": 0.00020537549541100374,
+      "nonnegative_product_fraction": 0.9999349093105295,
+      "local_vjp_calls": 6,
+      "global_backward_calls": 0,
+      "elapsed_ms": 57.558952
+    },
+    "error_equilibrium": {
+      "loss_absolute_error": 0.000002384185791015625,
+      "global_cosine": 0.9996074783,
+      "norm_ratio": 1.00051648,
+      "relative_l2_error": 0.0280288586,
+      "nonnegative_product_fraction": 0.9947714,
+      "energy_before": 5.62201166,
+      "energy_after": 5.61413288,
+      "local_vjp_calls": 9,
+      "global_backward_calls": 0,
+      "elapsed_ms": 163.043
+    }
+  },
+  "wgpu_lifecycle_smoke": {
+    "fixed_prediction_global_cosine": 0.9999999815,
+    "fixed_prediction_relative_l2_error": 0.000000112,
+    "train_steps": 1,
+    "checkpoint_complete": true,
+    "run_program_manifest_matches_checkpoint_sidecar": true,
+    "exact_resume_succeeded": true,
+    "fresh_training_elapsed_ms": 3483,
+    "exact_resume_elapsed_ms": 842,
+    "throughput_claim": false,
+    "artifact": "target/pc-wgpu-checkpoint-20260807-v5"
+  },
+  "promotion": {
+    "default": "adamw_backpropagation",
+    "fixed_prediction": "retain as exact no-global-backward control",
+    "error_equilibrium": "rejected: no resolved quality advantage and 34.4 percent of AdamW model throughput",
+    "mu_pc": "research approximation rejected by gradient-fidelity gate",
+    "dkp_pc": "implemented as a tied-consensus optimizer-owned research solver; separately rejected by the 2026-08-07 local quality and throughput gate",
+    "p2p": "not propagated because the local promotion gate failed"
+  },
+  "artifacts": [
+    "target/pc-paper/epc-optimized-128-20260807",
+    "target/pc-paper/epc-optimized-512-20260807",
+    "target/pc-wgpu-checkpoint-20260807-v5"
+  ]
+}

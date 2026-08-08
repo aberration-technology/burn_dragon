@@ -7,7 +7,8 @@ use burn_dragon_train::ContinualBackpropTarget;
 use burn_dragon_train::train::continual_backprop::{
     ContinualBackpropAdapter, ContinualBackpropFeatureMetrics, ContinualBackpropOptimizer,
     ContinualBackpropOptimizerRecord, ContinualBackpropParamResetTargets,
-    attach_continual_backprop_runtime, resolve_optimizer_with_continual_backprop,
+    attach_continual_backprop_runtime,
+    resolve_optimizer_with_continual_backprop_and_local_derivative,
     validate_continual_backprop_world_size,
 };
 use std::marker::PhantomData;
@@ -153,7 +154,7 @@ pub fn resolve_dragon_language_optimizer<B>(
 where
     B: AutodiffBackend,
 {
-    resolve_optimizer_with_continual_backprop::<
+    resolve_optimizer_with_continual_backprop_and_local_derivative::<
         B,
         LanguageTrainModel<B>,
         DragonLanguageContinualBackpropAdapter<B>,
@@ -162,6 +163,8 @@ where
         total_steps,
         &training.continual_backprop,
         fresh_model,
+        matches!(training.algorithm, TrainingAlgorithm::PredictiveCoding)
+            .then_some(optimizer_cfg.predictive_coding.transform),
     )
 }
 

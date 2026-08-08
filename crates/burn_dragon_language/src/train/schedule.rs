@@ -2,7 +2,8 @@ use crate::dataset::scheduler::TokenSequenceDataset;
 use crate::train::dynamics::{ActiveDynamicsControl, DragonDynamicsControlSlot};
 use crate::train::prelude::*;
 use crate::train::runtime_checkpoint::{
-    load_runtime_state_checkpoint, save_runtime_state_checkpoint,
+    load_runtime_state_checkpoint, prepare_predictive_coding_checkpoint_contract,
+    save_runtime_state_checkpoint, synchronize_predictive_coding_checkpoint_manifests,
 };
 use crate::train::utils::log_theoretical_profile;
 #[cfg(feature = "ddp")]
@@ -993,6 +994,28 @@ fn parameter_updates_enabled(training: &TrainingHyperparameters) -> bool {
         )
 }
 
+fn prepare_local_predictive_coding_contract<B>(
+    env: &TrainEnvironment<'_, B>,
+    model: &LanguageTrainModel<B>,
+) -> Result<Option<burn_pc::PcCheckpointManifest>>
+where
+    B: AutodiffBackend + Clone + 'static,
+    B::Device: Clone,
+{
+    let manifest = model.predictive_coding_checkpoint_manifest();
+    let require_exact = matches!(
+        env.training.launch_mode,
+        burn_dragon_train::train::pipeline::TrainingLaunchMode::ResumeExactRun
+    );
+    prepare_predictive_coding_checkpoint_contract(
+        env.run_dir,
+        env.resume_checkpoint_epoch,
+        manifest.as_ref(),
+        require_exact,
+    )?;
+    Ok(manifest)
+}
+
 pub(crate) fn train_with_scheduler<B, O, S>(
     env: &TrainEnvironment<'_, B>,
     model: LanguageTrainModel<B>,
@@ -1006,6 +1029,7 @@ where
     S: LrScheduler + 'static,
 {
     fs::create_dir_all(env.run_dir)?;
+    let pc_manifest = prepare_local_predictive_coding_contract(env, &model)?;
 
     let source_selection_dataset = env.source_selection_dataset.as_ref().cloned();
     let train_loss_metric_every = crate::train::events::train_loss_metric_frequency(
@@ -1100,6 +1124,7 @@ where
 
     let learner = burn_train::Learner::new(model, optimizer, scheduler);
     let TrainingResult { model, .. } = builder.launch(learner);
+    synchronize_predictive_coding_checkpoint_manifests(env.run_dir, pc_manifest.as_ref())?;
 
     log_theoretical_profile(
         env.model_config,
@@ -2291,6 +2316,7 @@ where
     S: LrScheduler + Clone + 'static,
 {
     fs::create_dir_all(env.run_dir)?;
+    prepare_local_predictive_coding_contract(env, &model)?;
     let source_selection_dataset = env.source_selection_dataset.clone();
     let dynamics_control_slot = DragonDynamicsControlSlot::default();
     let event_handles =
@@ -2507,14 +2533,15 @@ where
                 }
                 let lr = scheduler.step() * dynamics_control.lr_scale;
                 let grads = accumulator.grads();
-                let optimizer_started =
-                    crate::train::profile::enabled().then(burn_dragon_time::Instant::now);
+                let optimizer_started = (crate::train::profile::enabled()
+                    && !model.uses_incremental_predictive_coding())
+                .then(burn_dragon_time::Instant::now);
                 model = if let (Some(routing), Some(identity)) =
                     (context_routing.as_mut(), selected_context)
                 {
                     routing.optimizer_mut(identity)?.step(lr, model, grads)
                 } else {
-                    optimizer.step(lr, model, grads)
+                    burn_train::TrainStep::optimize::<B, _>(model, &mut optimizer, lr, grads)
                 };
                 if let Some(started) = optimizer_started {
                     crate::train::profile::record_optimizer(started.elapsed().as_nanos());
@@ -2605,15 +2632,16 @@ where
             }
             let lr = scheduler.step() * dynamics_control.lr_scale;
             let grads = accumulator.grads();
-            let optimizer_started =
-                crate::train::profile::enabled().then(burn_dragon_time::Instant::now);
+            let optimizer_started = (crate::train::profile::enabled()
+                && !model.uses_incremental_predictive_coding())
+            .then(burn_dragon_time::Instant::now);
             model = if let Some(routing) = context_routing.as_mut() {
                 let identity = routing.current_identity().ok_or_else(|| {
                     anyhow!("predictive context gradient remainder has no selected context")
                 })?;
                 routing.optimizer_mut(identity)?.step(lr, model, grads)
             } else {
-                optimizer.step(lr, model, grads)
+                burn_train::TrainStep::optimize::<B, _>(model, &mut optimizer, lr, grads)
             };
             if let Some(started) = optimizer_started {
                 crate::train::profile::record_optimizer(started.elapsed().as_nanos());
@@ -8874,6 +8902,9 @@ fn emit_predictive_coding_telemetry<B>(
         absolute_step,
         optimizer_step,
         learning_contract: "recurrent_state_replay_auxiliary".to_string(),
+        execution_contract_version: burn_pc::PcExecutionContract::CURRENT_VERSION,
+        activity_derivative_contract: "global_autodiff".to_string(),
+        parameter_derivative_contract: "global_autodiff".to_string(),
         global_autodiff_graph: true,
         observation_contract: observation_contract.to_string(),
         deployment_aligned,
@@ -8885,6 +8916,12 @@ fn emit_predictive_coding_telemetry<B>(
         local_vjp_calls: 0,
         global_backward_calls: usize::from(snapshot.chunks_corrected > 0),
         gradient_tensors: 0,
+        direct_forward_updates: 0,
+        feedback_parameter_updates: 0,
+        parameter_updates: usize::from(matches!(
+            env.training.predictive_coding.parameter_update,
+            PredictiveCodingParameterUpdate::Optimizer
+        )),
         energy_before: snapshot.energy_before_mean(),
         energy_after: snapshot.energy_after_mean(),
         energy_delta,
@@ -16018,6 +16055,22 @@ mod tests {
 
         let _trained = train_with_dynamic_neuron_scaling_scheduler(&env, model, optimizer, 1e-3)
             .expect("dynamic local-PC train");
+
+        let run_manifest: burn_pc::PcCheckpointManifest = serde_json::from_slice(
+            &std::fs::read(run_dir.join("predictive-coding-program.json"))
+                .expect("dynamic scheduler PC run manifest"),
+        )
+        .expect("parse dynamic scheduler PC run manifest");
+        let checkpoint_manifest: burn_pc::PcCheckpointManifest = serde_json::from_slice(
+            &std::fs::read(
+                run_dir
+                    .join("checkpoint")
+                    .join("predictive-coding-manifest-1.json"),
+            )
+            .expect("dynamic scheduler PC checkpoint manifest"),
+        )
+        .expect("parse dynamic scheduler PC checkpoint manifest");
+        assert_eq!(run_manifest, checkpoint_manifest);
 
         let events = read_training_events(&run_dir);
         let sample = events

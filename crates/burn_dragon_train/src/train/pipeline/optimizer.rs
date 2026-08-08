@@ -256,6 +256,44 @@ where
     }
 }
 
+/// Resolve a parameter transform for derivatives supplied by a local-learning
+/// algorithm. This is intentionally separate from [`resolve_optimizer`]: the
+/// transform does not select or implement the learning algorithm itself.
+pub fn resolve_local_derivative_optimizer<B, M>(
+    optimizer_cfg: &OptimizerConfig,
+    transform: PredictiveCodingOptimizerTransform,
+) -> Result<ResolvedOptimizer<B, M>>
+where
+    B: AutodiffBackend,
+    M: AutodiffModule<B>,
+{
+    anyhow::ensure!(
+        matches!(optimizer_cfg.name, OptimizerKind::Adamw),
+        "local-derivative parameter transforms require optimizer.name=adamw as the ordinary-gradient baseline"
+    );
+    Ok(match transform {
+        PredictiveCodingOptimizerTransform::Sgd => ResolvedOptimizer::PredictiveCodingSgd(
+            sgd_config_from_predictive_coding(optimizer_cfg, false).init::<B, M>(),
+        ),
+        PredictiveCodingOptimizerTransform::Momentum => {
+            ResolvedOptimizer::PredictiveCodingMomentum(
+                sgd_config_from_predictive_coding(optimizer_cfg, true).init::<B, M>(),
+            )
+        }
+        PredictiveCodingOptimizerTransform::Adamw => {
+            ResolvedOptimizer::AdamW(adamw_config_from_optimizer(optimizer_cfg).init::<B, M>())
+        }
+        PredictiveCodingOptimizerTransform::DiagonalNatural => {
+            ResolvedOptimizer::PredictiveCodingDiagonalNatural(OptimizerAdaptor::from(
+                PredictiveCodingDiagonalNatural::new(
+                    &optimizer_cfg.predictive_coding,
+                    optimizer_cfg.weight_decay,
+                ),
+            ))
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,5 +355,33 @@ mod tests {
         assert_retired_transform_rejected(PredictiveCodingOptimizerTransform::Momentum);
         assert_retired_transform_rejected(PredictiveCodingOptimizerTransform::Adamw);
         assert_retired_transform_rejected(PredictiveCodingOptimizerTransform::DiagonalNatural);
+    }
+
+    #[test]
+    fn local_derivative_transforms_resolve_without_reviving_retired_optimizer_name() {
+        for (transform, expected_name) in [
+            (
+                PredictiveCodingOptimizerTransform::Sgd,
+                "predictive_coding_sgd",
+            ),
+            (
+                PredictiveCodingOptimizerTransform::Momentum,
+                "predictive_coding_momentum",
+            ),
+            (PredictiveCodingOptimizerTransform::Adamw, "adamw"),
+            (
+                PredictiveCodingOptimizerTransform::DiagonalNatural,
+                "predictive_coding_diagonal_natural",
+            ),
+        ] {
+            let mut config = base_optimizer_config(transform);
+            config.name = OptimizerKind::Adamw;
+            let optimizer = resolve_local_derivative_optimizer::<
+                TestBackend,
+                TestModule<TestBackend>,
+            >(&config, transform)
+            .expect("local derivative transform resolves");
+            assert_eq!(optimizer.name(), expected_name);
+        }
     }
 }

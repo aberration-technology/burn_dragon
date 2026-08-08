@@ -9,7 +9,10 @@ use burn::optim::record::AdaptorRecord;
 use hashbrown::{HashMap, HashSet};
 use std::marker::PhantomData;
 
-use crate::train::pipeline::{ResolvedOptimizer, ResolvedOptimizerRecord, resolve_optimizer};
+use crate::train::pipeline::{
+    ResolvedOptimizer, ResolvedOptimizerRecord, resolve_local_derivative_optimizer,
+    resolve_optimizer,
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct ContinualBackpropFeatureMetrics {
@@ -278,15 +281,42 @@ where
     M: AutodiffModule<B> + Clone + Send,
     A: ContinualBackpropAdapter<B, M>,
 {
+    resolve_optimizer_with_continual_backprop_and_local_derivative(
+        optimizer_cfg,
+        total_steps,
+        config,
+        fresh_model,
+        None,
+    )
+}
+
+pub fn resolve_optimizer_with_continual_backprop_and_local_derivative<B, M, A>(
+    optimizer_cfg: &OptimizerConfig,
+    total_steps: usize,
+    config: &ContinualBackpropConfig,
+    fresh_model: A::FreshModel,
+    local_derivative_transform: Option<PredictiveCodingOptimizerTransform>,
+) -> Result<ContinualBackpropOptimizer<B, M, A>>
+where
+    B: AutodiffBackend,
+    M: AutodiffModule<B> + Clone + Send,
+    A: ContinualBackpropAdapter<B, M>,
+{
     let kind = if config.enabled {
+        anyhow::ensure!(
+            local_derivative_transform.is_none(),
+            "continual backpropagation cannot wrap a local-derivative parameter transform"
+        );
         ContinualBackpropOptimizerKind::ContinualBackprop(Box::new(
             ContinualBackpropAdamWOptimizer::new(optimizer_cfg, config.clone(), fresh_model)?,
         ))
     } else {
-        ContinualBackpropOptimizerKind::Standard(resolve_optimizer::<B, M>(
-            optimizer_cfg,
-            total_steps,
-        )?)
+        ContinualBackpropOptimizerKind::Standard(match local_derivative_transform {
+            Some(transform) => {
+                resolve_local_derivative_optimizer::<B, M>(optimizer_cfg, transform)?
+            }
+            None => resolve_optimizer::<B, M>(optimizer_cfg, total_steps)?,
+        })
     };
     Ok(ContinualBackpropOptimizer { kind })
 }

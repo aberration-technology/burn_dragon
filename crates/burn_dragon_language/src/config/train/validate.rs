@@ -2,8 +2,9 @@ use anyhow::{Result, anyhow};
 use std::collections::HashSet;
 
 use burn_dragon_core::{
-    DragonConfig, LanguageHeadConfig, ResidualConnectorKind, RotaryEmbedding, SequenceMemorySystem,
-    SequenceTrainingExecutor, objective::validate_training_objective_config,
+    DragonConfig, DragonResidualScalingKind, LanguageHeadConfig, ResidualConnectorKind,
+    RotaryEmbedding, SequenceMemorySystem, SequenceTrainingExecutor,
+    objective::validate_training_objective_config,
 };
 use burn_dragon_train::{
     LearningRateScheduleConfig, OptimizerKind, ParallelismKind, PipelineCommunicationKind,
@@ -3617,17 +3618,69 @@ impl TrainingConfig {
         let pc = &self.training.local_predictive_coding;
         pc.inference
             .validate("training.local_predictive_coding.inference")?;
+        pc.direct_feedback.validate()?;
+        pc.tied_consensus.validate()?;
         if pc.prediction_precision <= 0.0 || !pc.prediction_precision.is_finite() {
             return Err(anyhow!(
                 "training.local_predictive_coding.prediction_precision must be finite and > 0"
             ));
         }
-        if !matches!(
+        if pc.incremental_parameter_step_scale <= 0.0
+            || !pc.incremental_parameter_step_scale.is_finite()
+        {
+            return Err(anyhow!(
+                "training.local_predictive_coding.incremental_parameter_step_scale must be finite and > 0"
+            ));
+        }
+        if matches!(
             pc.learning_schedule,
-            burn_pc::PcLearningSchedule::Equilibrium
+            burn_pc::PcLearningSchedule::Incremental
+        ) && matches!(
+            pc.solver,
+            crate::config::LocalPredictiveCodingSolver::ErrorEquilibrium
+                | crate::config::LocalPredictiveCodingSolver::FixedPrediction
+                | crate::config::LocalPredictiveCodingSolver::LayerLocalPrediction
+                | crate::config::LocalPredictiveCodingSolver::DirectKolenPollack
         ) {
             return Err(anyhow!(
-                "Dragon local PC currently supports learning_schedule=equilibrium; incremental updates require an in-executor optimizer state"
+                "training.local_predictive_coding.learning_schedule=incremental requires solver=synchronous_equilibrium or reverse_gauss_seidel"
+            ));
+        }
+        if matches!(
+            pc.solver,
+            crate::config::LocalPredictiveCodingSolver::DirectKolenPollack
+        ) && pc.direct_feedback.forward_weight_decay > f32::EPSILON
+        {
+            return Err(anyhow!(
+                "training.local_predictive_coding.direct_feedback.forward_weight_decay must be 0 for direct_kolen_pollack because the outer optimizer owns forward-parameter decay"
+            ));
+        }
+        if matches!(pc.parameterization, burn_pc::PcParameterizationKind::MuPc)
+            && !matches!(
+                pc.solver,
+                crate::config::LocalPredictiveCodingSolver::ErrorEquilibrium
+            )
+        {
+            return Err(anyhow!(
+                "training.local_predictive_coding.parameterization=mu_pc currently requires solver=error_equilibrium so its shared-depth reduction cannot silently change another control"
+            ));
+        }
+        if matches!(
+            pc.learning_schedule,
+            burn_pc::PcLearningSchedule::Incremental
+        ) && self.training.predictive_context_routing.enabled
+        {
+            return Err(anyhow!(
+                "incremental local predictive coding does not yet compose with training.predictive_context_routing; routed optimizers require an explicit per-context incremental schedule"
+            ));
+        }
+        if matches!(
+            pc.solver,
+            crate::config::LocalPredictiveCodingSolver::DirectKolenPollack
+        ) && self.training.predictive_context_routing.enabled
+        {
+            return Err(anyhow!(
+                "direct_kolen_pollack does not yet compose with predictive_context_routing because both require optimizer-owned state"
             ));
         }
         if matches!(
@@ -3731,6 +3784,16 @@ impl TrainingConfig {
         if model.resolved_residual_connector_kind() != ResidualConnectorKind::Vanilla {
             return Err(anyhow!(
                 "training.algorithm=predictive_coding currently requires model.residual_connector=vanilla"
+            ));
+        }
+        if matches!(pc.parameterization, burn_pc::PcParameterizationKind::MuPc)
+            && !matches!(
+                model.initialization.residual_scaling.kind,
+                DragonResidualScalingKind::DepthScaled
+            )
+        {
+            return Err(anyhow!(
+                "training.local_predictive_coding.parameterization=mu_pc requires model.initialization.residual_scaling.kind=depth_scaled"
             ));
         }
         if model.sequence_kernel.memory_system != SequenceMemorySystem::LinearAttention
@@ -4491,6 +4554,49 @@ start_policy = "capability_gate"
     }
 
     #[test]
+    fn incremental_local_predictive_coding_validates_only_interleaved_solvers() {
+        let mut config = parse_config("");
+        config.training.algorithm = TrainingAlgorithm::PredictiveCoding;
+        config.training.local_predictive_coding.learning_schedule =
+            burn_pc::PcLearningSchedule::Incremental;
+        config.training.local_predictive_coding.solver =
+            crate::config::LocalPredictiveCodingSolver::ReverseGaussSeidel;
+        config
+            .training
+            .local_predictive_coding
+            .incremental_parameter_step_scale = 0.25;
+        config.model.dropout = Some(0.0);
+        config.model.sequence_kernel = Some(SequenceKernelConfig::dense_score_short_context());
+        config.model.rotary_embedding = Some(RotaryEmbedding::Alibi);
+        config
+            .validate()
+            .expect("incremental local PC should own its optimizer schedule");
+
+        config.training.local_predictive_coding.solver =
+            crate::config::LocalPredictiveCodingSolver::FixedPrediction;
+        assert!(
+            config
+                .validate()
+                .expect_err("fixed prediction has no inferred activity schedule")
+                .to_string()
+                .contains("synchronous_equilibrium or reverse_gauss_seidel")
+        );
+        config.training.local_predictive_coding.solver =
+            crate::config::LocalPredictiveCodingSolver::ReverseGaussSeidel;
+        config
+            .training
+            .local_predictive_coding
+            .incremental_parameter_step_scale = 0.0;
+        assert!(
+            config
+                .validate()
+                .expect_err("zero iPC parameter scale must fail closed")
+                .to_string()
+                .contains("incremental_parameter_step_scale")
+        );
+    }
+
+    #[test]
     fn local_fixed_prediction_solver_validates_with_plain_vjp_contract() {
         let mut config = parse_config("");
         config.training.algorithm = TrainingAlgorithm::PredictiveCoding;
@@ -4503,6 +4609,68 @@ start_policy = "capability_gate"
         config
             .validate()
             .expect("fixed-prediction local PC contract should validate");
+    }
+
+    #[test]
+    fn local_error_equilibrium_validates_standard_and_mu_pc_contracts() {
+        let mut config = parse_config("");
+        config.training.algorithm = TrainingAlgorithm::PredictiveCoding;
+        config.training.local_predictive_coding.solver =
+            crate::config::LocalPredictiveCodingSolver::ErrorEquilibrium;
+        config.model.dropout = Some(0.0);
+        config.model.sequence_kernel = Some(SequenceKernelConfig::dense_score_short_context());
+        config.model.rotary_embedding = Some(RotaryEmbedding::Alibi);
+
+        config
+            .validate()
+            .expect("standard error-equilibrium contract should validate");
+        config.training.local_predictive_coding.parameterization =
+            burn_pc::PcParameterizationKind::MuPc;
+        config
+            .validate()
+            .expect("muPC requires and inherits depth-scaled initialization");
+
+        config.model.initialization = Some(burn_dragon_core::DragonInitializationConfig {
+            residual_scaling: burn_dragon_core::DragonResidualScalingConfig {
+                kind: DragonResidualScalingKind::Disabled,
+                ..burn_dragon_core::DragonResidualScalingConfig::default()
+            },
+            ..burn_dragon_core::DragonInitializationConfig::default()
+        });
+        assert!(
+            config
+                .validate()
+                .expect_err("muPC must fail closed without depth scaling")
+                .to_string()
+                .contains("residual_scaling.kind=depth_scaled")
+        );
+    }
+
+    #[test]
+    fn direct_kolen_pollack_validates_two_phase_tied_contract() {
+        let mut config = parse_config("");
+        config.training.algorithm = TrainingAlgorithm::PredictiveCoding;
+        config.training.local_predictive_coding.solver =
+            crate::config::LocalPredictiveCodingSolver::DirectKolenPollack;
+        config.model.dropout = Some(0.0);
+        config.model.sequence_kernel = Some(SequenceKernelConfig::dense_score_short_context());
+        config.model.rotary_embedding = Some(RotaryEmbedding::Alibi);
+        config
+            .validate()
+            .expect("DKP should validate with tied consensus and optimizer-owned decay");
+
+        config
+            .training
+            .local_predictive_coding
+            .direct_feedback
+            .forward_weight_decay = 0.1;
+        assert!(
+            config
+                .validate()
+                .expect_err("DKP forward decay has one owner")
+                .to_string()
+                .contains("outer optimizer owns")
+        );
     }
 
     #[test]
@@ -6957,6 +7125,33 @@ start_policy = "capability_gate"
         assert_eq!(
             config.training.local_predictive_coding.solver,
             crate::config::LocalPredictiveCodingSolver::FixedPrediction
+        );
+    }
+
+    #[test]
+    fn local_incremental_research_overlay_selects_the_interleaved_contract() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/language/experiments/predictive_coding");
+        let paths = [
+            root.join("local-pc-1m.toml"),
+            root.join("pc-incremental-rgs-research.overlay.toml"),
+        ];
+        let config = load_training_config(&paths).expect("load incremental PC research overlay");
+        config
+            .validate()
+            .expect("validate incremental PC research overlay");
+        assert_eq!(
+            config.training.local_predictive_coding.solver,
+            crate::config::LocalPredictiveCodingSolver::ReverseGaussSeidel
+        );
+        assert_eq!(
+            config.training.local_predictive_coding.learning_schedule,
+            burn_pc::PcLearningSchedule::Incremental
+        );
+        assert_eq!(config.training.local_predictive_coding.inference.steps, 1);
+        assert_eq!(
+            config.training.local_predictive_coding.inference.step_size,
+            0.2
         );
     }
 

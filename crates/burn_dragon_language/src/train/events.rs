@@ -128,11 +128,32 @@ pub struct PredictiveContextRoutingTelemetryState {
 struct LocalPredictiveCodingTelemetryConfig {
     profile: crate::train::local_predictive_coding::LocalPredictiveCodingProfile,
     solver: LocalPredictiveCodingSolver,
+    learning_schedule: burn_pc::PcLearningSchedule,
+    execution_contract: burn_pc::PcExecutionContract,
 }
 
 fn local_predictive_coding_event_contract(
     solver: LocalPredictiveCodingSolver,
+    learning_schedule: burn_pc::PcLearningSchedule,
 ) -> (&'static str, &'static str) {
+    if matches!(learning_schedule, burn_pc::PcLearningSchedule::Incremental) {
+        return match solver {
+            LocalPredictiveCodingSolver::SynchronousEquilibrium => (
+                "local_incremental_factor_vjp_v1",
+                "interleaved_synchronous_activities",
+            ),
+            LocalPredictiveCodingSolver::ReverseGaussSeidel => (
+                "local_incremental_factor_vjp_v1",
+                "interleaved_gauss_seidel_activities",
+            ),
+            LocalPredictiveCodingSolver::ErrorEquilibrium
+            | LocalPredictiveCodingSolver::FixedPrediction
+            | LocalPredictiveCodingSolver::LayerLocalPrediction
+            | LocalPredictiveCodingSolver::DirectKolenPollack => {
+                unreachable!("validated incremental PC solver")
+            }
+        };
+    }
     match solver {
         LocalPredictiveCodingSolver::SynchronousEquilibrium => {
             ("local_factor_vjp_v1", "equilibrium_layer_activities")
@@ -141,12 +162,19 @@ fn local_predictive_coding_event_contract(
             "local_prospective_gauss_seidel_v1",
             "settled_layer_activities",
         ),
+        LocalPredictiveCodingSolver::ErrorEquilibrium => {
+            ("local_error_equilibrium_v1", "inferred_error_coordinates")
+        }
         LocalPredictiveCodingSolver::FixedPrediction => {
             ("local_fixed_prediction_v1", "fixed_feedforward_predictions")
         }
         LocalPredictiveCodingSolver::LayerLocalPrediction => {
             ("local_layer_prediction_v1", "detached_layer_predictions")
         }
+        LocalPredictiveCodingSolver::DirectKolenPollack => (
+            "local_direct_kolen_pollack_v1",
+            "tied_direct_feedback_activities",
+        ),
     }
 }
 
@@ -213,6 +241,8 @@ pub fn build_training_event_handles_with_local_predictive_coding(
             LocalPredictiveCodingTelemetryConfig {
                 profile,
                 solver: training.local_predictive_coding.solver,
+                learning_schedule: training.local_predictive_coding.learning_schedule,
+                execution_contract: training.local_predictive_coding.execution_contract(),
             }
         });
     let neuron_scaling = (training
@@ -399,13 +429,24 @@ fn record_local_predictive_coding_from_loss(
             continue;
         }
         let (learning_contract, observation_contract) =
-            local_predictive_coding_event_contract(config.solver);
+            local_predictive_coding_event_contract(config.solver, config.learning_schedule);
         output.write(PredictiveCodingSample {
             run_id: sample.run_id.clone(),
             epoch: Some(sample.epoch),
             absolute_step: sample.absolute_step,
             optimizer_step: sample.absolute_step,
             learning_contract: learning_contract.to_string(),
+            execution_contract_version: config.execution_contract.version,
+            activity_derivative_contract: config
+                .execution_contract
+                .activity_derivatives
+                .as_str()
+                .to_string(),
+            parameter_derivative_contract: config
+                .execution_contract
+                .parameter_derivatives
+                .as_str()
+                .to_string(),
             global_autodiff_graph: false,
             observation_contract: observation_contract.to_string(),
             deployment_aligned: false,
@@ -417,6 +458,9 @@ fn record_local_predictive_coding_from_loss(
             local_vjp_calls: snapshot.local_vjp_calls as usize,
             global_backward_calls: snapshot.global_backward_calls as usize,
             gradient_tensors: snapshot.gradient_tensors as usize,
+            direct_forward_updates: snapshot.direct_forward_updates as usize,
+            feedback_parameter_updates: snapshot.feedback_parameter_updates as usize,
+            parameter_updates: snapshot.parameter_updates as usize,
             energy_before: snapshot.last_energy_before,
             energy_after: snapshot.last_energy_after,
             energy_delta: snapshot
@@ -638,19 +682,41 @@ mod tests {
     fn local_pc_event_contract_distinguishes_error_solvers() {
         assert_eq!(
             local_predictive_coding_event_contract(
-                LocalPredictiveCodingSolver::SynchronousEquilibrium
+                LocalPredictiveCodingSolver::SynchronousEquilibrium,
+                burn_pc::PcLearningSchedule::Equilibrium,
             ),
             ("local_factor_vjp_v1", "equilibrium_layer_activities")
         );
         assert_eq!(
-            local_predictive_coding_event_contract(LocalPredictiveCodingSolver::FixedPrediction),
+            local_predictive_coding_event_contract(
+                LocalPredictiveCodingSolver::FixedPrediction,
+                burn_pc::PcLearningSchedule::Equilibrium,
+            ),
             ("local_fixed_prediction_v1", "fixed_feedforward_predictions")
         );
         assert_eq!(
             local_predictive_coding_event_contract(
-                LocalPredictiveCodingSolver::LayerLocalPrediction
+                LocalPredictiveCodingSolver::ErrorEquilibrium,
+                burn_pc::PcLearningSchedule::Equilibrium,
+            ),
+            ("local_error_equilibrium_v1", "inferred_error_coordinates")
+        );
+        assert_eq!(
+            local_predictive_coding_event_contract(
+                LocalPredictiveCodingSolver::LayerLocalPrediction,
+                burn_pc::PcLearningSchedule::Equilibrium,
             ),
             ("local_layer_prediction_v1", "detached_layer_predictions")
+        );
+        assert_eq!(
+            local_predictive_coding_event_contract(
+                LocalPredictiveCodingSolver::ReverseGaussSeidel,
+                burn_pc::PcLearningSchedule::Incremental,
+            ),
+            (
+                "local_incremental_factor_vjp_v1",
+                "interleaved_gauss_seidel_activities"
+            )
         );
     }
 

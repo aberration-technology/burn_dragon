@@ -1,0 +1,256 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-07",
+  "backend": "cuda",
+  "device": "NVIDIA GB10",
+  "claim_scope": "single-seed optimizer and implementation gate; not a promotion or statistical superiority result",
+  "implementation_contract": {
+    "learning_schedule": "incremental",
+    "learning_contract": "local_incremental_factor_vjp_v1",
+    "global_autodiff_graph": false,
+    "global_backward_calls": 0,
+    "parameter_update_timing": "one optimizer application after every activity-inference phase",
+    "supported_solvers": [
+      "synchronous_equilibrium",
+      "reverse_gauss_seidel"
+    ],
+    "unsupported_composition": "predictive_context_routing",
+    "gradient_accumulation_steps": 1,
+    "startup_autotune_contract": "post-autotune validation rejects any resolved gradient accumulation above one",
+    "tbptt": "detached recurrent rho is carried across chunks and outer steps",
+    "checkpoint_state": "model and ordinary optimizer records; transient staged activities are consumed before checkpoint boundaries"
+  },
+  "model": {
+    "parameters": 934082,
+    "shared_layer_uses": 4,
+    "embedding": 96,
+    "heads": 4,
+    "latent_total": 3072,
+    "vocabulary_size": 256,
+    "block_size": 128,
+    "batch_size": 32
+  },
+  "training": {
+    "profile": "config/language/experiments/predictive_coding/local-pc-byte-text-1m.toml",
+    "seed": 20260807,
+    "optimizer_transform": "adamw",
+    "learning_rate": 0.001,
+    "prediction_precision": 1.0,
+    "incremental_parameter_step_scale": 1.0,
+    "validation": "fixed_holdout"
+  },
+  "activity_step_screen_revision": "initial canonical executor before first-chunk reuse; selected eta 0.2 repeated below with the final executable",
+  "activity_step_screen_128_updates": [
+    {
+      "arm": "backpropagation_adamw",
+      "validation_mean": 1.907900184392929,
+      "train_last": 1.7738693952560425,
+      "wall_tokens_per_second": 68109.632
+    },
+    {
+      "arm": "fixed_prediction_adamw",
+      "validation_mean": 1.9064720124006271,
+      "train_last": 1.7709972858428955,
+      "wall_tokens_per_second": 40048.829
+    },
+    {
+      "arm": "incremental_rgs",
+      "activity_step": 0.05,
+      "validation_mean": 2.2303527295589447,
+      "train_last": 2.211642026901245,
+      "wall_tokens_per_second": 20380.975
+    },
+    {
+      "arm": "incremental_rgs",
+      "activity_step": 0.1,
+      "validation_mean": 2.1755445301532745,
+      "train_last": 2.145798683166504,
+      "wall_tokens_per_second": 19885.621
+    },
+    {
+      "arm": "incremental_rgs",
+      "activity_step": 0.15,
+      "validation_mean": 2.141108602285385,
+      "train_last": 2.101534605026245,
+      "wall_tokens_per_second": 19720.205
+    },
+    {
+      "arm": "incremental_rgs",
+      "activity_step": 0.2,
+      "validation_mean": 2.118712067604065,
+      "train_last": 2.069632053375244,
+      "wall_tokens_per_second": 20102.892
+    },
+    {
+      "arm": "incremental_rgs",
+      "activity_step": 0.3,
+      "validation_mean": 2.3159486055374146,
+      "train_last": 2.310609817504883,
+      "wall_tokens_per_second": 19580.598
+    },
+    {
+      "arm": "incremental_rgs",
+      "activity_step": 0.4,
+      "validation_mean": 2.477697789669037,
+      "train_last": 2.4730048179626465,
+      "wall_tokens_per_second": 19672.961
+    },
+    {
+      "arm": "incremental_rgs",
+      "activity_step": 0.5,
+      "validation_mean": 2.819739431142807,
+      "train_last": 2.8366122245788574,
+      "wall_tokens_per_second": 19264.685
+    }
+  ],
+  "optimized_repeat_128_updates": [
+    {
+      "arm": "backpropagation_adamw",
+      "validation_mean": 1.9075748473405838,
+      "train_last": 1.7743546962738037,
+      "wall_tokens_per_second": 70984.174
+    },
+    {
+      "arm": "fixed_prediction_adamw",
+      "validation_mean": 1.9050238281488419,
+      "train_last": 1.7737114429473877,
+      "wall_tokens_per_second": 44503.392
+    },
+    {
+      "arm": "incremental_rgs_steps1_eta0.2",
+      "validation_mean": 2.115884453058243,
+      "train_last": 2.0669994354248047,
+      "wall_tokens_per_second": 24333.714
+    }
+  ],
+  "promotion_gate_512_updates": [
+    {
+      "arm": "backpropagation_adamw",
+      "validation_mean": 1.625484219619206,
+      "train_last": 1.4552521705627441,
+      "wall_tokens_per_second": 71321.455,
+      "gpu_utilization_mean_percent": 78.75,
+      "gpu_power_mean_watts": 42.40375
+    },
+    {
+      "arm": "fixed_prediction_adamw",
+      "validation_mean": 1.625285301889692,
+      "train_last": 1.4419561624526978,
+      "wall_tokens_per_second": 44445.086,
+      "gpu_utilization_mean_percent": 83.88,
+      "gpu_power_mean_watts": 39.684
+    },
+    {
+      "arm": "incremental_rgs_steps1_eta0.2",
+      "validation_mean": 1.9077502276216234,
+      "train_last": 1.7492042779922485,
+      "wall_tokens_per_second": 23444.693,
+      "gpu_utilization_mean_percent": 88.15217391304348,
+      "gpu_power_mean_watts": 39.93217391304348
+    }
+  ],
+  "incremental_minus_backpropagation_512": {
+    "validation_mean": 0.2822660080024174,
+    "train_last": 0.2939521074295044,
+    "wall_tokens_per_second": -47876.762,
+    "wall_throughput_retained_fraction": 0.3287186583616388,
+    "first_chunk_reuse_wall_throughput_gain_fraction": 0.20197943406509178
+  },
+  "gradient_fidelity": {
+    "parameters": 937154,
+    "vocabulary_size": 272,
+    "batch_size": 32,
+    "block_size": 128,
+    "solver": "reverse_gauss_seidel",
+    "inference_steps": 1,
+    "max_grad_norm": 1.0,
+    "arms": [
+      {
+        "activity_step": 0.3,
+        "global_cosine": 0.35823745171758686,
+        "global_norm_ratio": 0.20237174307185388,
+        "shared_encoder_cosine": 0.42177290553483826,
+        "shared_value_encoder_cosine": 0.41076234774475817,
+        "language_head_cosine": 0.9997718620435021
+      },
+      {
+        "activity_step": 0.4,
+        "global_cosine": 0.346683615146754,
+        "global_norm_ratio": 0.22524098992848482,
+        "shared_encoder_cosine": 0.24355280805369917,
+        "shared_value_encoder_cosine": 0.22543211398273455,
+        "language_head_cosine": 0.9995940101612182
+      },
+      {
+        "activity_step": 0.5,
+        "global_cosine": 0.2743166907490976,
+        "global_norm_ratio": 0.2782682913603212,
+        "shared_encoder_cosine": 0.07757848542319432,
+        "shared_value_encoder_cosine": 0.05430353162409088,
+        "language_head_cosine": 0.9993654024628824
+      },
+      {
+        "activity_step": 0.6,
+        "global_cosine": 0.16838153834656852,
+        "global_norm_ratio": 0.3848818692922773,
+        "shared_encoder_cosine": -0.04136170526125255,
+        "shared_value_encoder_cosine": -0.06792184466628727,
+        "language_head_cosine": 0.9990856533703975
+      }
+    ]
+  },
+  "diagonal_natural_fixed_prediction_screen_128": [
+    {
+      "learning_rate": 0.0001,
+      "validation_mean": 4.44695
+    },
+    {
+      "learning_rate": 0.0003,
+      "validation_mean": 3.59560
+    },
+    {
+      "learning_rate": 0.001,
+      "validation_mean": 2.68710
+    },
+    {
+      "learning_rate": 0.003,
+      "validation_mean": 2.25799
+    },
+    {
+      "learning_rate": 0.01,
+      "validation_mean": 2.42744
+    }
+  ],
+  "recurrent_accounting_smoke": {
+    "build_profile": "dev CUDA",
+    "outer_steps": 4,
+    "batch_size": 4,
+    "block_size": 128,
+    "tbptt_chunk_size": 8,
+    "persistent_rho": true,
+    "inference_steps_per_chunk": 2,
+    "chunks_per_outer_step": 16,
+    "parameter_updates_per_outer_step": 32,
+    "global_backward_calls": 0,
+    "profile_train_steps": 4,
+    "profile_train_tokens": 2048,
+    "profile_accounted_fraction": 0.985921
+  },
+  "artifacts": [
+    "target/pc-incremental-byte-128-screen-20260807",
+    "target/pc-incremental-byte-128-low-eta-screen-20260807",
+    "target/pc-incremental-byte-128-eta-screen-20260807",
+    "target/pc-incremental-byte-512-gate-20260807",
+    "target/pc-incremental-byte-final-gate-20260807",
+    "target/pc-fixed-diagonal-natural-128-screen-20260807",
+    "target/pc-incremental-accounting-smoke-20260807"
+  ],
+  "decision": {
+    "default": "backpropagation with AdamW",
+    "fixed_prediction": "retain as the exact no-global-backward convergence control",
+    "incremental_predictive_coding": "retain as a mechanically complete research mode; rejected for promotion",
+    "diagonal_natural_transform": "rejected for promotion",
+    "quality_claim": "no evidence that the tested PC-native schedules exceed AdamW quality or throughput",
+    "identified_blocker": "finite-step local inference preserves the terminal derivative but attenuates and distorts shared-body credit; extra local VJPs and optimizer applications serialize useful work"
+  }
+}

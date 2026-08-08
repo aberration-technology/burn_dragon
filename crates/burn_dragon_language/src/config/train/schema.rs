@@ -602,6 +602,12 @@ pub enum LocalPredictiveCodingSolver {
     /// already-updated child error can influence every shallower activity in
     /// the same sweep while parameter learning remains factor-local.
     ReverseGaussSeidel,
+    /// Error-coordinate predictive coding (ePC). Hidden activities are
+    /// reconstructed as local predictions plus inferred error variables. The
+    /// inference wave may transport terminal derivatives through activities,
+    /// but model-parameter derivatives remain factor-local and use detached
+    /// reconstructed activities.
+    ErrorEquilibrium,
     /// Solve the fixed-prediction triangular error system with one reverse
     /// local-VJP wave. This is a backprop-equivalent PC control, but it never
     /// creates a global autodiff graph or calls global backward.
@@ -612,6 +618,24 @@ pub enum LocalPredictiveCodingSolver {
     /// This removes the reverse depth chain at the cost of optimizing a
     /// layer-local semi-gradient rather than the terminal-loss derivative.
     LayerLocalPrediction,
+    /// Direct Kolen-Pollack predictive coding. A terminal hidden residual is
+    /// projected to every depth use in one factor batch, a preliminary shared
+    /// body update is projected onto Dragon's tied-parameter manifold, and the
+    /// feedback bank is updated with local Kolen-Pollack correlations.
+    DirectKolenPollack,
+}
+
+impl LocalPredictiveCodingSolver {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SynchronousEquilibrium => "synchronous_equilibrium",
+            Self::ReverseGaussSeidel => "reverse_gauss_seidel",
+            Self::ErrorEquilibrium => "error_equilibrium",
+            Self::FixedPrediction => "fixed_prediction",
+            Self::LayerLocalPrediction => "layer_local_prediction",
+            Self::DirectKolenPollack => "direct_kolen_pollack",
+        }
+    }
 }
 
 /// Canonical layer-local predictive-coding learning configuration.
@@ -624,6 +648,20 @@ pub struct LocalPredictiveCodingConfig {
     pub solver: LocalPredictiveCodingSolver,
     pub inference: burn_pc::PcInferenceConfig,
     pub learning_schedule: burn_pc::PcLearningSchedule,
+    /// Width/depth scaling contract used by the PC factor program.
+    pub parameterization: burn_pc::PcParameterizationKind,
+    /// Reduction applied when one shared Dragon tensor receives derivatives
+    /// from multiple recurrent depth uses under the muPC research profile.
+    pub shared_reuse_reduction: burn_pc::PcSharedReuseReduction,
+    /// Direct-feedback and local feedback-learning settings used only by the
+    /// `direct_kolen_pollack` solver.
+    pub direct_feedback: burn_pc::PcDirectFeedbackConfig,
+    /// Shared-manifold projection used for DKP preliminary body updates.
+    pub tied_consensus: burn_pc::PcTiedConsensusConfig,
+    /// Multiplier applied to the outer learning rate for every interleaved
+    /// parameter update in the incremental schedule. It is deliberately
+    /// explicit: one batch performs `inference.steps` optimizer updates.
+    pub incremental_parameter_step_scale: f64,
     pub prediction_precision: f32,
     pub factor_reduction: PredictiveCodingFactorReduction,
     pub sync_diagnostics: bool,
@@ -642,10 +680,24 @@ impl Default for LocalPredictiveCodingConfig {
                 eps: 1.0e-8,
             },
             learning_schedule: burn_pc::PcLearningSchedule::Equilibrium,
+            parameterization: burn_pc::PcParameterizationKind::Standard,
+            shared_reuse_reduction: burn_pc::PcSharedReuseReduction::RootMeanSquare,
+            direct_feedback: burn_pc::PcDirectFeedbackConfig::default(),
+            tied_consensus: burn_pc::PcTiedConsensusConfig::default(),
+            incremental_parameter_step_scale: 1.0,
             prediction_precision: 1.0,
             factor_reduction: PredictiveCodingFactorReduction::Sum,
             sync_diagnostics: false,
         }
+    }
+}
+
+impl LocalPredictiveCodingConfig {
+    /// Derivative boundary enforced by every production local-PC solver.
+    /// Dragon's ePC implementation uses analytic activity VJPs; it does not
+    /// retain an autodiff graph over either errors or model parameters.
+    pub const fn execution_contract(&self) -> burn_pc::PcExecutionContract {
+        burn_pc::PcExecutionContract::strict_local()
     }
 }
 

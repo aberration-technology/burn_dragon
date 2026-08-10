@@ -1481,6 +1481,7 @@ mod eggroll;
 mod latent_validation;
 mod ruliad_evaluation;
 mod ruliad_rollout;
+mod ruliad_suite;
 mod ruliad_validation;
 mod telemetry;
 
@@ -1502,6 +1503,10 @@ pub(crate) use eggroll::{
     autotune_eggroll_population_chunk_size, train_with_eggroll_forward_only, train_with_scheduler,
 };
 pub use ruliad_evaluation::{RuliadModelEvaluation, evaluate_ruliad_model_free_run};
+pub use ruliad_suite::{
+    RuliadConstrainedPolicyEvaluation, RuliadEvaluationSuiteOptions, RuliadEvaluationSuiteReport,
+    RuliadPolicyRolloutEvaluation, evaluate_ruliad_model_suite,
+};
 
 #[cfg(test)]
 mod tests;

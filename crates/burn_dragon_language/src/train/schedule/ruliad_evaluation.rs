@@ -2,7 +2,7 @@
 
 use super::*;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct RuliadModelEvaluation {
     pub report: burn_dragon_universality::RuliadEvalReport,
     pub item_count: usize,

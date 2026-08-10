@@ -614,6 +614,11 @@ pub enum LocalPredictiveCodingSolver {
     /// already-updated child error can influence every shallower activity in
     /// the same sweep while parameter learning remains factor-local.
     ReverseGaussSeidel,
+    /// Augmented-Lagrangian predictive coding (PC-ALM). Activity descent is
+    /// interleaved with per-factor dual ascent, yielding the local composite
+    /// signal `lambda + rho * residual`. Shared Dragon weights receive the
+    /// sum of all logical depth-factor derivatives after finite inference.
+    AugmentedLagrangian,
     /// Error-coordinate predictive coding (ePC). Hidden activities are
     /// reconstructed as local predictions plus inferred error variables. The
     /// inference wave may transport terminal derivatives through activities,
@@ -640,6 +645,11 @@ pub enum LocalPredictiveCodingSolver {
     /// anchor the parameter update and calibrate the intervening direct
     /// signals. One outer optimizer update is applied per training step.
     AmortizedAdjoint,
+    /// Probe every residual factor with the terminal error in one batched
+    /// local VJP, then compose the first-order residual-Jacobian corrections
+    /// with an exclusive suffix sum. This removes the serial reverse-depth
+    /// wave without introducing a learned feedback bank or teacher schedule.
+    FirstOrderAdjoint,
 }
 
 impl LocalPredictiveCodingSolver {
@@ -647,13 +657,32 @@ impl LocalPredictiveCodingSolver {
         match self {
             Self::SynchronousEquilibrium => "synchronous_equilibrium",
             Self::ReverseGaussSeidel => "reverse_gauss_seidel",
+            Self::AugmentedLagrangian => "augmented_lagrangian",
             Self::ErrorEquilibrium => "error_equilibrium",
             Self::FixedPrediction => "fixed_prediction",
             Self::LayerLocalPrediction => "layer_local_prediction",
             Self::DirectKolenPollack => "direct_kolen_pollack",
             Self::AmortizedAdjoint => "amortized_adjoint",
+            Self::FirstOrderAdjoint => "first_order_adjoint",
         }
     }
+}
+
+/// Dragon trace feature supplied to a residual-conditioned adjoint predictor.
+///
+/// This remains downstream-owned because the useful state summary depends on
+/// the model factorization; `burn_pc` only defines how an arbitrary condition
+/// is normalized and consumed.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalPredictiveCodingAdjointConditioning {
+    /// Residual emitted by the factor whose output adjoint is predicted.
+    #[default]
+    LocalResidual,
+    /// Difference between this factor's output and the terminal hidden state.
+    /// This summarizes the downstream residual computation responsible for
+    /// transforming terminal credit before it reaches the factor.
+    TerminalDisplacement,
 }
 
 /// Canonical layer-local predictive-coding learning configuration.
@@ -665,7 +694,13 @@ impl LocalPredictiveCodingSolver {
 pub struct LocalPredictiveCodingConfig {
     pub solver: LocalPredictiveCodingSolver,
     pub terminal_criterion: LocalPredictiveCodingTerminalCriterion,
+    /// Penalty-PC activity settings used by synchronous and Gauss-Seidel
+    /// solvers. PC-ALM uses `augmented_lagrangian` instead.
     pub inference: burn_pc::PcInferenceConfig,
+    /// Primal-dual finite-inference settings used only by the PC-ALM solver.
+    pub augmented_lagrangian: burn_pc::PcAlmConfig,
+    /// Credit carried through recurrent rho states across TBPTT chunks.
+    pub temporal_credit: burn_pc::PcTemporalCreditConfig,
     pub learning_schedule: burn_pc::PcLearningSchedule,
     /// Width/depth scaling contract used by the PC factor program.
     pub parameterization: burn_pc::PcParameterizationKind,
@@ -677,6 +712,8 @@ pub struct LocalPredictiveCodingConfig {
     pub direct_feedback: burn_pc::PcDirectFeedbackConfig,
     /// Periodic exact-local-VJP teacher for an amortized feedback bank.
     pub amortized_adjoint: burn_pc::PcAmortizedAdjointConfig,
+    /// Dragon trace feature used by residual-conditioned adjoints.
+    pub adjoint_conditioning: LocalPredictiveCodingAdjointConditioning,
     /// Shared-manifold projection used for DKP preliminary body updates.
     pub tied_consensus: burn_pc::PcTiedConsensusConfig,
     /// Multiplier applied to the outer learning rate for every interleaved
@@ -701,11 +738,22 @@ impl Default for LocalPredictiveCodingConfig {
                 gradient_norm_scope: burn_pc::PcGradientNormScope::PerRow,
                 eps: 1.0e-8,
             },
+            augmented_lagrangian: burn_pc::PcAlmConfig {
+                steps: 8,
+                primal_step_size: 0.03,
+                dual_step_size: 0.1,
+                penalty: 1.0,
+                max_primal_grad_norm: Some(1.0),
+                gradient_norm_scope: burn_pc::PcGradientNormScope::PerRow,
+                eps: 1.0e-8,
+            },
+            temporal_credit: burn_pc::PcTemporalCreditConfig::default(),
             learning_schedule: burn_pc::PcLearningSchedule::Equilibrium,
             parameterization: burn_pc::PcParameterizationKind::Standard,
             shared_reuse_reduction: burn_pc::PcSharedReuseReduction::RootMeanSquare,
             direct_feedback: burn_pc::PcDirectFeedbackConfig::default(),
             amortized_adjoint: burn_pc::PcAmortizedAdjointConfig::default(),
+            adjoint_conditioning: LocalPredictiveCodingAdjointConditioning::default(),
             tied_consensus: burn_pc::PcTiedConsensusConfig::default(),
             incremental_parameter_step_scale: 1.0,
             prediction_precision: 1.0,
@@ -1211,6 +1259,35 @@ impl TrainingValidationSampling {
     }
 }
 
+/// Selects the validation loss consumed by gates, checkpoint promotion, and
+/// continual-learning dynamics.
+///
+/// All available validation views remain observable. This setting only names
+/// the one distribution that is allowed to drive control decisions, avoiding
+/// silent fallback between a fixed holdout, the live curriculum, and carried
+/// recurrent state.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainingValidationObjective {
+    /// Seed-stable teacher-forced holdout selected by `validation.sampling`.
+    #[default]
+    FixedHoldout,
+    /// Teacher-forced batches sampled from the effective live source policy.
+    SourceWeighted,
+    /// Ordered validation stream evaluated with recurrent state carried.
+    StreamWarm,
+}
+
+impl TrainingValidationObjective {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FixedHoldout => "fixed_holdout",
+            Self::SourceWeighted => "source_weighted",
+            Self::StreamWarm => "stream_warm",
+        }
+    }
+}
+
 fn default_validation_seed() -> u64 {
     0xD12A_60A5
 }
@@ -1229,11 +1306,26 @@ pub enum RuliadValidationPanelMode {
     RequireExisting,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct RuliadValidationPanelConfig {
     pub mode: RuliadValidationPanelMode,
     pub path: Option<PathBuf>,
+    /// Number of lowest materialized difficulty strata represented in the
+    /// immutable base correctness panel. `0` retains legacy unstratified
+    /// sampling; positive values balance items across difficulty before
+    /// cycling across source family/task contracts within each stratum.
+    pub base_difficulty_levels: usize,
+}
+
+impl Default for RuliadValidationPanelConfig {
+    fn default() -> Self {
+        Self {
+            mode: RuliadValidationPanelMode::default(),
+            path: None,
+            base_difficulty_levels: 4,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -1241,6 +1333,8 @@ pub struct RuliadValidationPanelConfig {
 pub struct TrainingValidationConfig {
     pub execution: TrainingValidationExecution,
     pub sampling: TrainingValidationSampling,
+    /// Single named loss contract consumed by validation-driven control logic.
+    pub objective: TrainingValidationObjective,
     /// Sampling seed for the fixed teacher-forced holdout. This is deliberately independent of
     /// the training seed so training-seed ablations evaluate identical examples.
     pub seed: u64,
@@ -1253,6 +1347,7 @@ impl Default for TrainingValidationConfig {
         Self {
             execution: TrainingValidationExecution::default(),
             sampling: TrainingValidationSampling::default(),
+            objective: TrainingValidationObjective::default(),
             seed: default_validation_seed(),
             ruliad_panel: RuliadValidationPanelConfig::default(),
         }
@@ -1306,6 +1401,24 @@ pub struct SequenceStateProbeConfig {
     pub max_rho_slots: usize,
 }
 
+/// Explicit opt-in for extending the stopping horizon of an exact resumed run.
+///
+/// The experiment manifest still requires every learning-semantic field to
+/// match the checkpointed run. Only `training.max_iters` may increase, and the
+/// validator restricts this mode to schedules that do not derive their shape
+/// from that stopping horizon.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct ResumeHorizonExtensionConfig {
+    pub enabled: bool,
+}
+
+impl ResumeHorizonExtensionConfig {
+    pub(crate) fn is_disabled(&self) -> bool {
+        !self.enabled
+    }
+}
+
 impl Default for SequenceStateProbeConfig {
     fn default() -> Self {
         Self {
@@ -1323,6 +1436,14 @@ pub struct TrainingHyperparameters {
     pub block_size: usize,
     #[serde(default)]
     pub tbptt_chunk_size: Option<usize>,
+    /// Number of adjacent TBPTT chunks retained in one exact autodiff window.
+    ///
+    /// `1` preserves conventional detached TBPTT. Larger values retain the
+    /// recurrent-state graph only within each bounded window and detach at the
+    /// window boundary, providing a matched control for bounded local-PC
+    /// temporal credit without unbounded activation retention.
+    #[serde(default = "default_tbptt_credit_window_chunks")]
+    pub tbptt_credit_window_chunks: usize,
     #[serde(default)]
     pub tbptt_persist_across_steps: bool,
     #[serde(default)]
@@ -1352,6 +1473,11 @@ pub struct TrainingHyperparameters {
     pub resume_run_dir: Option<PathBuf>,
     #[serde(default)]
     pub resume_checkpoint_epoch: Option<usize>,
+    #[serde(
+        default,
+        skip_serializing_if = "ResumeHorizonExtensionConfig::is_disabled"
+    )]
+    pub resume_horizon_extension: ResumeHorizonExtensionConfig,
     #[serde(default)]
     pub init_checkpoint_path: Option<PathBuf>,
     #[serde(default)]
@@ -1519,6 +1645,12 @@ pub struct RuliadPolicyProbeConfig {
     /// Model contract used to rank verifier-enumerated proof actions.
     #[serde(default)]
     pub scoring: RuliadProofPolicyScoring,
+    /// Probability contract used to rank autoregressive semantic actions.
+    ///
+    /// This should match proof-policy training. `PrefixConditional` scores only legal branching
+    /// tokens in the semantic action trie; deterministic serialization is not part of the policy.
+    #[serde(default)]
+    pub normalization: RuliadProofPolicyNormalization,
     /// Run the same-item and counterfactual constrained-action scorers every N validation epochs.
     /// Teacher-forced and free-generation validation retain their own cadence.
     #[serde(default = "default_ruliad_policy_probe_every_epochs")]
@@ -1555,6 +1687,13 @@ pub struct RuliadPolicyProbeConfig {
     /// proof-menu order from becoming an evaluator shortcut while preserving action semantics.
     #[serde(default = "default_ruliad_policy_probe_candidate_symmetry")]
     pub candidate_symmetry: RuliadProofPolicyCandidateSymmetry,
+    /// Capability contract used by checkpoint promotion and continual-learning recovery.
+    ///
+    /// This is deliberately independent from the validation loss objective. Semantic-action
+    /// models can be deployed through verifier-constrained proof search even when unrestricted
+    /// text generation is not their serving contract.
+    #[serde(default)]
+    pub checkpoint_capability_contract: RuliadCheckpointCapabilityContract,
     #[serde(default)]
     pub promotion_gate: RuliadPolicyPromotionGateConfig,
 }
@@ -1564,6 +1703,7 @@ impl Default for RuliadPolicyProbeConfig {
         Self {
             enabled: false,
             scoring: RuliadProofPolicyScoring::default(),
+            normalization: RuliadProofPolicyNormalization::default(),
             every_epochs: default_ruliad_policy_probe_every_epochs(),
             closed_loop_every_epochs: None,
             items: default_ruliad_policy_probe_items(),
@@ -1576,6 +1716,7 @@ impl Default for RuliadPolicyProbeConfig {
             stratified_difficulty_levels: default_ruliad_policy_probe_stratified_difficulty_levels(
             ),
             candidate_symmetry: RuliadProofPolicyCandidateSymmetry::BalancedRotation,
+            checkpoint_capability_contract: RuliadCheckpointCapabilityContract::default(),
             promotion_gate: RuliadPolicyPromotionGateConfig::default(),
         }
     }
@@ -1584,6 +1725,30 @@ impl Default for RuliadPolicyProbeConfig {
 impl RuliadPolicyProbeConfig {
     pub fn effective_closed_loop_every_epochs(&self) -> usize {
         self.closed_loop_every_epochs.unwrap_or(self.every_epochs)
+    }
+}
+
+/// Selects the deployed Ruliad capability that controls checkpoint promotion and recovery.
+///
+/// `FreeRunText` preserves the historical autoregressive contract. `ClosedLoopPolicy` treats
+/// verifier-constrained semantic-action search as the serving contract and keeps free-run text as
+/// diagnostic telemetry. `Joint` requires both contracts to remain healthy and non-regressing.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RuliadCheckpointCapabilityContract {
+    #[default]
+    FreeRunText,
+    ClosedLoopPolicy,
+    Joint,
+}
+
+impl RuliadCheckpointCapabilityContract {
+    pub const fn requires_free_run(self) -> bool {
+        matches!(self, Self::FreeRunText | Self::Joint)
+    }
+
+    pub const fn requires_closed_loop_policy(self) -> bool {
+        matches!(self, Self::ClosedLoopPolicy | Self::Joint)
     }
 }
 
@@ -1615,6 +1780,10 @@ fn default_ruliad_policy_gate_maximum_backtrack_rate() -> f64 {
     0.25
 }
 
+fn default_ruliad_policy_regression_confidence_z() -> f64 {
+    1.959_963_984_540_054
+}
+
 /// Closed-loop acceptance criteria for promoting a proof-action objective.
 ///
 /// These are deliberately separate from token-level capability gates: a model
@@ -1637,6 +1806,11 @@ pub struct RuliadPolicyPromotionGateConfig {
     pub maximum_repeated_state_rate: f64,
     #[serde(default = "default_ruliad_policy_gate_maximum_backtrack_rate")]
     pub maximum_backtrack_rate: f64,
+    /// Normal quantile used by Wilson intervals for continual-regression evidence.
+    /// The default is the conventional two-sided 95% interval. Promotion thresholds remain
+    /// point-estimate gates; this value only prevents noisy finite panels from causing rollback.
+    #[serde(default = "default_ruliad_policy_regression_confidence_z")]
+    pub regression_confidence_z: f64,
 }
 
 impl Default for RuliadPolicyPromotionGateConfig {
@@ -1650,6 +1824,7 @@ impl Default for RuliadPolicyPromotionGateConfig {
             maximum_invalid_action_rate: default_ruliad_policy_gate_maximum_invalid_action_rate(),
             maximum_repeated_state_rate: default_ruliad_policy_gate_maximum_repeated_state_rate(),
             maximum_backtrack_rate: default_ruliad_policy_gate_maximum_backtrack_rate(),
+            regression_confidence_z: default_ruliad_policy_regression_confidence_z(),
         }
     }
 }
@@ -1712,6 +1887,11 @@ pub struct RuliadSupervisionConfig {
     pub answer_contract: RuliadAnswerContractConfig,
     pub verifier_reward: RuliadVerifierRewardConfig,
     pub proof_policy: RuliadProofPolicyTrainingConfig,
+    /// Sparse semantic-energy replacements for primary proof-policy terminals.
+    ///
+    /// A refresh slot replaces, rather than adds to, the primary objective so
+    /// each optimizer update retains one unit-weight training contract.
+    pub proof_policy_semantic_refresh: RuliadProofPolicySemanticRefreshConfig,
 }
 
 impl Default for RuliadSupervisionConfig {
@@ -1730,7 +1910,37 @@ impl Default for RuliadSupervisionConfig {
             answer_contract: RuliadAnswerContractConfig::default(),
             verifier_reward: RuliadVerifierRewardConfig::default(),
             proof_policy: RuliadProofPolicyTrainingConfig::default(),
+            proof_policy_semantic_refresh: RuliadProofPolicySemanticRefreshConfig::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RuliadProofPolicySemanticRefreshConfig {
+    pub enabled: bool,
+    pub every_steps: usize,
+    pub start_after_steps: usize,
+    pub counterfactual_targets_per_state: usize,
+}
+
+impl Default for RuliadProofPolicySemanticRefreshConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            every_steps: 64,
+            start_after_steps: 64,
+            counterfactual_targets_per_state: 1,
+        }
+    }
+}
+
+impl RuliadProofPolicySemanticRefreshConfig {
+    pub fn active_at_step(self, absolute_step: usize) -> bool {
+        self.enabled
+            && self.every_steps > 0
+            && absolute_step >= self.start_after_steps
+            && absolute_step.is_multiple_of(self.every_steps)
     }
 }
 
@@ -1777,6 +1987,21 @@ impl RuliadPolicyBatchCadences {
 }
 
 impl RuliadSupervisionConfig {
+    pub fn proof_policy_for_step(self, absolute_step: usize) -> RuliadProofPolicyTrainingConfig {
+        let mut policy = self.proof_policy;
+        if self
+            .proof_policy_semantic_refresh
+            .active_at_step(absolute_step)
+        {
+            policy.scoring = RuliadProofPolicyScoring::SemanticEnergy;
+            policy.normalization = RuliadProofPolicyNormalization::CandidateConditional;
+            policy.counterfactual_targets_per_state = self
+                .proof_policy_semantic_refresh
+                .counterfactual_targets_per_state;
+        }
+        policy
+    }
+
     pub(crate) fn policy_batch_cadences(self) -> RuliadPolicyBatchCadences {
         let verifier = self.verifier_reward;
         let denoising = self.answer_denoising;
@@ -1920,6 +2145,18 @@ pub enum RuliadProofPolicyScoring {
     /// This keeps proof choice off the vocabulary projection and leaves ordinary language-model
     /// cross entropy responsible for serialization.
     SemanticEnergy,
+    /// Correct the autoregressive candidate prior with a learned semantic residual energy.
+    ///
+    /// Candidate logits are `mean_log_p_lm + residual_energy`. Candidate-conditional cross
+    /// entropy therefore fits the residual as a conditional density-ratio correction without a
+    /// hand-tuned interpolation coefficient. Zero residual recovers ordinary completion scoring.
+    ResidualEnergy,
+}
+
+impl RuliadProofPolicyScoring {
+    pub fn uses_sequence_score_head(self) -> bool {
+        matches!(self, Self::SemanticEnergy | Self::ResidualEnergy)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -1928,10 +2165,11 @@ pub enum RuliadProofPolicyGradientScope {
     /// Allow the proof-policy objective to update both Dragon and its sequence-score head.
     #[default]
     FullModel,
-    /// Stop the proof-policy gradient at Dragon's hidden representations.
+    /// Stop the proof-policy gradient at Dragon's hidden representations and autoregressive
+    /// candidate scores.
     ///
-    /// Language-model cross entropy still updates the complete model in the same optimizer step;
-    /// only the auxiliary semantic-policy objective is restricted to the score head.
+    /// Language-model cross entropy still updates the complete model in ordinary steps; only the
+    /// semantic or residual-energy policy objective is restricted to the score head.
     ScoreHeadOnly,
     /// Stop the completion-policy gradient at Dragon's hidden representations.
     ///
@@ -2359,6 +2597,10 @@ fn default_module_lr_scale_schedule_end_fraction() -> f32 {
 
 fn default_training_seed() -> u64 {
     1337
+}
+
+fn default_tbptt_credit_window_chunks() -> usize {
+    1
 }
 
 fn default_gradient_accumulation_steps() -> usize {

@@ -303,6 +303,33 @@ where
     B: Backend + Clone + 'static,
     B::Device: Clone,
 {
+    select_ruliad_proof_actions_batch_with_contract(
+        model,
+        requests,
+        max_batch_rows,
+        scoring,
+        crate::config::RuliadProofPolicyNormalization::CandidateConditional,
+        device,
+    )
+}
+
+/// Score typed proof actions with the same score and normalization contract used for training.
+///
+/// In particular, semantic-step completion policies trained with `PrefixConditional` are ranked
+/// by their constrained action-trie probability. Deterministic serialization tokens are omitted
+/// from both training and inference, so syntax likelihood cannot dilute a semantic branch.
+pub fn select_ruliad_proof_actions_batch_with_contract<B>(
+    model: &DragonModel<B>,
+    requests: &[EncodedRuliadProofActionRequest],
+    max_batch_rows: usize,
+    scoring: crate::config::RuliadProofPolicyScoring,
+    normalization: crate::config::RuliadProofPolicyNormalization,
+    device: &B::Device,
+) -> Result<Vec<RuliadProofActionDecision>>
+where
+    B: Backend + Clone + 'static,
+    B::Device: Clone,
+{
     if requests.is_empty() {
         return Ok(Vec::new());
     }
@@ -349,12 +376,13 @@ where
             .iter()
             .map(|(_, _, presentation)| presentation.candidate_tokens.clone())
             .collect::<Vec<_>>();
-        let scores = proof_action_scores_batch(
+        let scores = proof_action_scores_batch_with_normalization(
             model,
             &prompts,
             &candidates,
             answer_contract,
             scoring,
+            normalization,
             device,
         )?;
         for ((request_index, _, presentation), scores) in chunk.iter().zip(scores) {
@@ -405,6 +433,14 @@ pub(crate) struct DeferredSequenceCompletionScores<B: Backend> {
     group_sizes: Vec<usize>,
 }
 
+pub(crate) struct DeferredTrieConditionalScores<B: Backend> {
+    logits: Tensor<B, 2>,
+    branches: Vec<SemanticCandidateTrieBranch>,
+    group_branch_counts: Vec<usize>,
+    group_candidate_counts: Vec<usize>,
+    vocab: usize,
+}
+
 pub(crate) struct SequenceCompletionScoreTensor<B: Backend> {
     pub mean_log_scores: Tensor<B, 1>,
     pub sum_log_scores: Tensor<B, 1>,
@@ -418,6 +454,7 @@ pub(crate) struct SemanticCandidateTrieBranch {
     pub prefix: Vec<i64>,
     pub candidate_tokens: Vec<i64>,
     pub equivalent_tokens: Vec<i64>,
+    candidate_indices_by_token: Vec<Vec<usize>>,
 }
 
 /// Enumerate verifier-relevant decision points in a semantic-action token trie.
@@ -498,6 +535,7 @@ fn visit_semantic_candidate_trie(
             prefix: prefix.clone(),
             candidate_tokens: children.keys().copied().collect(),
             equivalent_tokens,
+            candidate_indices_by_token: children.values().cloned().collect(),
         });
     }
     for (token, indices) in children {
@@ -526,7 +564,9 @@ fn visit_semantic_candidate_trie(
 pub(crate) enum DeferredProofActionCompletionScores<B: Backend> {
     PresentationIndex(DeferredConstrainedCompletionScores<B>),
     SemanticStep(DeferredSequenceCompletionScores<B>),
+    TrieConditional(DeferredTrieConditionalScores<B>),
     SemanticEnergy(DeferredSequenceCompletionScores<B>),
+    ResidualEnergy(DeferredSequenceCompletionScores<B>),
 }
 
 /// Run the sequence model once and decode only the requested causal positions.
@@ -632,6 +672,81 @@ where
     }
 }
 
+impl<B> DeferredTrieConditionalScores<B>
+where
+    B: Backend + Clone + 'static,
+    B::Device: Clone,
+{
+    pub(crate) fn resolve(self) -> Result<Vec<Vec<f32>>> {
+        let values = self
+            .logits
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .map_err(|error| anyhow!("proof-action trie logits could not be read: {error:?}"))?;
+        trie_conditional_log_scores(
+            &values,
+            self.vocab,
+            &self.branches,
+            &self.group_branch_counts,
+            &self.group_candidate_counts,
+        )
+    }
+}
+
+fn trie_conditional_log_scores(
+    values: &[f32],
+    vocab: usize,
+    branches: &[SemanticCandidateTrieBranch],
+    group_branch_counts: &[usize],
+    group_candidate_counts: &[usize],
+) -> Result<Vec<Vec<f32>>> {
+    if vocab == 0
+        || group_branch_counts.len() != group_candidate_counts.len()
+        || values.len() != branches.len().saturating_mul(vocab)
+    {
+        return Err(anyhow!(
+            "proof-action trie score dimensions are inconsistent"
+        ));
+    }
+    let mut branch_offset = 0usize;
+    let groups = group_branch_counts
+        .iter()
+        .copied()
+        .zip(group_candidate_counts.iter().copied())
+        .map(|(branch_count, candidate_count)| {
+            let mut candidate_scores = vec![0.0f32; candidate_count];
+            for branch_index in branch_offset..branch_offset.saturating_add(branch_count) {
+                let branch = branches
+                    .get(branch_index)
+                    .ok_or_else(|| anyhow!("proof-action trie branch grouping is inconsistent"))?;
+                let row = &values[branch_index * vocab..(branch_index + 1) * vocab];
+                let branch_log_probs = normalize_candidate_scores(row, &branch.candidate_tokens)?;
+                for (log_probability, candidate_indices) in branch_log_probs
+                    .into_iter()
+                    .zip(&branch.candidate_indices_by_token)
+                {
+                    for candidate_index in candidate_indices {
+                        let score =
+                            candidate_scores.get_mut(*candidate_index).ok_or_else(|| {
+                                anyhow!("proof-action trie references an invalid candidate")
+                            })?;
+                        *score += log_probability;
+                    }
+                }
+            }
+            branch_offset = branch_offset.saturating_add(branch_count);
+            normalize_log_scores(&candidate_scores)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if branch_offset != branches.len() {
+        return Err(anyhow!(
+            "proof-action trie scores contain trailing branches"
+        ));
+    }
+    Ok(groups)
+}
+
 impl<B> DeferredProofActionCompletionScores<B>
 where
     B: Backend + Clone + 'static,
@@ -640,7 +755,10 @@ where
     pub(crate) fn resolve(self) -> Result<Vec<Vec<f32>>> {
         match self {
             Self::PresentationIndex(scores) => scores.resolve(),
-            Self::SemanticStep(scores) | Self::SemanticEnergy(scores) => scores.resolve(),
+            Self::SemanticStep(scores)
+            | Self::SemanticEnergy(scores)
+            | Self::ResidualEnergy(scores) => scores.resolve(),
+            Self::TrieConditional(scores) => scores.resolve(),
         }
     }
 }
@@ -722,12 +840,37 @@ where
     B: Backend + Clone + 'static,
     B::Device: Clone,
 {
-    enqueue_proof_action_scores_batch(
+    proof_action_scores_batch_with_normalization(
         model,
         prompt_tokens,
         candidate_tokens,
         contract,
         scoring,
+        crate::config::RuliadProofPolicyNormalization::CandidateConditional,
+        device,
+    )
+}
+
+pub(crate) fn proof_action_scores_batch_with_normalization<B>(
+    model: &DragonModel<B>,
+    prompt_tokens: &[Vec<i64>],
+    candidate_tokens: &[Vec<Vec<i64>>],
+    contract: burn_dragon_universality::ruliad::RuliadProofActionAnswerContract,
+    scoring: crate::config::RuliadProofPolicyScoring,
+    normalization: crate::config::RuliadProofPolicyNormalization,
+    device: &B::Device,
+) -> Result<Vec<Vec<f32>>>
+where
+    B: Backend + Clone + 'static,
+    B::Device: Clone,
+{
+    enqueue_proof_action_scores_batch_with_normalization(
+        model,
+        prompt_tokens,
+        candidate_tokens,
+        contract,
+        scoring,
+        normalization,
         device,
     )?
     .resolve()
@@ -745,8 +888,45 @@ where
     B: Backend + Clone + 'static,
     B::Device: Clone,
 {
+    enqueue_proof_action_scores_batch_with_normalization(
+        model,
+        prompt_tokens,
+        candidate_tokens,
+        contract,
+        scoring,
+        crate::config::RuliadProofPolicyNormalization::CandidateConditional,
+        device,
+    )
+}
+
+pub(crate) fn enqueue_proof_action_scores_batch_with_normalization<B>(
+    model: &DragonModel<B>,
+    prompt_tokens: &[Vec<i64>],
+    candidate_tokens: &[Vec<Vec<i64>>],
+    contract: burn_dragon_universality::ruliad::RuliadProofActionAnswerContract,
+    scoring: crate::config::RuliadProofPolicyScoring,
+    normalization: crate::config::RuliadProofPolicyNormalization,
+    device: &B::Device,
+) -> Result<DeferredProofActionCompletionScores<B>>
+where
+    B: Backend + Clone + 'static,
+    B::Device: Clone,
+{
     match scoring {
         crate::config::RuliadProofPolicyScoring::CompletionLikelihood => {
+            if contract
+                == burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::SemanticStep
+                && normalization == crate::config::RuliadProofPolicyNormalization::PrefixConditional
+            {
+                return Ok(DeferredProofActionCompletionScores::TrieConditional(
+                    enqueue_trie_conditional_scores_batch(
+                        model,
+                        prompt_tokens,
+                        candidate_tokens,
+                        device,
+                    )?,
+                ));
+            }
             enqueue_proof_action_completion_log_probs_batch(
                 model,
                 prompt_tokens,
@@ -765,7 +945,81 @@ where
                 )?,
             ))
         }
+        crate::config::RuliadProofPolicyScoring::ResidualEnergy => {
+            Ok(DeferredProofActionCompletionScores::ResidualEnergy(
+                enqueue_sequence_residual_energy_scores_batch(
+                    model,
+                    prompt_tokens,
+                    candidate_tokens,
+                    device,
+                )?,
+            ))
+        }
     }
+}
+
+/// Queue every discriminative branch of each semantic-action trie in one model forward.
+///
+/// Candidate probabilities are products of legal-token conditional probabilities along their
+/// paths. Shared deterministic syntax contributes neither score nor compute after the branch
+/// prefixes are assembled, matching the prefix-conditional training terminal exactly.
+fn enqueue_trie_conditional_scores_batch<B>(
+    model: &DragonModel<B>,
+    prompt_tokens: &[Vec<i64>],
+    candidate_tokens: &[Vec<Vec<i64>>],
+    device: &B::Device,
+) -> Result<DeferredTrieConditionalScores<B>>
+where
+    B: Backend + Clone + 'static,
+    B::Device: Clone,
+{
+    let group_candidate_counts =
+        validate_sequence_completion_inputs(prompt_tokens, candidate_tokens)?;
+    let mut sequences = Vec::<Vec<i64>>::new();
+    let mut branches = Vec::<SemanticCandidateTrieBranch>::new();
+    let mut group_branch_counts = Vec::with_capacity(prompt_tokens.len());
+    for (prompt, candidates) in prompt_tokens.iter().zip(candidate_tokens) {
+        let all_candidates = (0..candidates.len()).collect::<Vec<_>>();
+        let group_branches = semantic_candidate_trie_branches(candidates, &all_candidates)?;
+        group_branch_counts.push(group_branches.len());
+        for branch in group_branches {
+            let mut sequence = prompt.clone();
+            sequence.extend_from_slice(&branch.prefix);
+            sequences.push(sequence);
+            branches.push(branch);
+        }
+    }
+    let maximum_len = sequences.iter().map(Vec::len).max().unwrap_or_default();
+    if sequences.is_empty() || maximum_len == 0 {
+        return Err(anyhow!("proof-action trie scorer has no branch inputs"));
+    }
+    let row_count = sequences.len();
+    let mut values = vec![0i64; row_count.saturating_mul(maximum_len)];
+    let mut positions = Vec::with_capacity(row_count);
+    for (row, sequence) in sequences.into_iter().enumerate() {
+        if sequence.is_empty() {
+            return Err(anyhow!("proof-action trie branch has no causal input"));
+        }
+        let length = sequence.len();
+        values[row * maximum_len..row * maximum_len + length].copy_from_slice(&sequence);
+        positions.push(length.saturating_sub(1));
+    }
+    let inputs =
+        Tensor::<B, 2, Int>::from_data(TensorData::new(values, [row_count, maximum_len]), device);
+    let logits = logits_at_sequence_positions(model, inputs, &positions, device)?;
+    let [_, vocab] = logits.shape().dims::<2>();
+    if vocab == 0 {
+        return Err(anyhow!(
+            "proof-action trie scorer produced an empty vocabulary"
+        ));
+    }
+    Ok(DeferredTrieConditionalScores {
+        logits,
+        branches,
+        group_branch_counts,
+        group_candidate_counts,
+        vocab,
+    })
 }
 
 pub(crate) fn enqueue_proof_action_completion_log_probs_batch<B>(
@@ -857,6 +1111,30 @@ where
     })
 }
 
+/// Score candidates with the language model as a normalized prior and the sequence head as a
+/// learned residual energy. Both terms are produced from one prompt-prefix/candidate forward.
+fn enqueue_sequence_residual_energy_scores_batch<B>(
+    model: &DragonModel<B>,
+    prompt_tokens: &[Vec<i64>],
+    candidate_tokens: &[Vec<Vec<i64>>],
+    device: &B::Device,
+) -> Result<DeferredSequenceCompletionScores<B>>
+where
+    B: Backend + Clone + 'static,
+    B::Device: Clone,
+{
+    let (scores, group_sizes) = sequence_residual_energy_score_tensor_with_prefix_reuse(
+        model,
+        prompt_tokens,
+        candidate_tokens,
+        device,
+    )?;
+    Ok(DeferredSequenceCompletionScores {
+        scores,
+        group_sizes,
+    })
+}
+
 fn sequence_energy_score_tensor_with_prefix_reuse<B>(
     model: &DragonModel<B>,
     prompt_tokens: &[Vec<i64>],
@@ -892,6 +1170,47 @@ where
         score_groups
             .into_iter()
             .map(|group| group.expect("validated energy prompt group must be scored"))
+            .collect(),
+        0,
+    );
+    Ok((scores, group_sizes))
+}
+
+fn sequence_residual_energy_score_tensor_with_prefix_reuse<B>(
+    model: &DragonModel<B>,
+    prompt_tokens: &[Vec<i64>],
+    candidate_tokens: &[Vec<Vec<i64>>],
+    device: &B::Device,
+) -> Result<(Tensor<B, 1>, Vec<usize>)>
+where
+    B: Backend + Clone + 'static,
+    B::Device: Clone,
+{
+    let group_sizes = validate_sequence_completion_inputs(prompt_tokens, candidate_tokens)?;
+    if !model.sequence_score_head_enabled() {
+        return Err(anyhow!(
+            "residual-energy proof-action scoring requires an enabled sequence score head"
+        ));
+    }
+    let score_groups = score_ragged_prompt_prefixes(
+        model,
+        prompt_tokens,
+        device,
+        |prompt_groups, prompt_last_hidden, prefix_state| {
+            score_candidate_residual_energies_from_prefix(
+                model,
+                prompt_groups,
+                candidate_tokens,
+                prompt_last_hidden,
+                prefix_state,
+                device,
+            )
+        },
+    )?;
+    let scores = Tensor::cat(
+        score_groups
+            .into_iter()
+            .map(|group| group.expect("validated residual-energy prompt group must be scored"))
             .collect(),
         0,
     );
@@ -960,6 +1279,176 @@ where
         }
     };
     Ok((scores, group_sizes))
+}
+
+/// Differentiable residual-EBM candidate scores.
+///
+/// The autoregressive term is a fixed prior under `ScoreHeadOnly`; only the residual sequence head
+/// receives policy gradients. `FullModel` keeps both paths differentiable for a controlled global
+/// backpropagation ablation.
+pub(crate) fn sequence_residual_energy_score_tensor_with_gradient_scope<B>(
+    model: &DragonModel<B>,
+    prompt_tokens: &[Vec<i64>],
+    candidate_tokens: &[Vec<Vec<i64>>],
+    gradient_scope: crate::config::RuliadProofPolicyGradientScope,
+    device: &B::Device,
+) -> Result<(Tensor<B, 1>, Vec<usize>)>
+where
+    B: AutodiffBackend + Clone + 'static,
+    B::Device: Clone,
+{
+    let group_sizes = validate_sequence_completion_inputs(prompt_tokens, candidate_tokens)?;
+    if !model.sequence_score_head_enabled() {
+        return Err(anyhow!(
+            "residual-energy proof-action scoring requires an enabled sequence score head"
+        ));
+    }
+    let scores = match gradient_scope {
+        crate::config::RuliadProofPolicyGradientScope::FullModel => {
+            sequence_residual_energy_score_tensor_dense(
+                model,
+                prompt_tokens,
+                candidate_tokens,
+                false,
+                device,
+                |inputs| model.forward_hidden(inputs),
+            )?
+        }
+        crate::config::RuliadProofPolicyGradientScope::ScoreHeadOnly => {
+            sequence_residual_energy_score_tensor_dense(
+                model,
+                prompt_tokens,
+                candidate_tokens,
+                true,
+                device,
+                |inputs| model.forward_hidden_deterministic_auxiliary(inputs),
+            )?
+        }
+        crate::config::RuliadProofPolicyGradientScope::LanguageHeadOnly => {
+            return Err(anyhow!(
+                "language_head_only gradient scope is unavailable for residual-energy scoring"
+            ));
+        }
+    };
+    Ok((scores, group_sizes))
+}
+
+fn sequence_residual_energy_score_tensor_dense<B, F>(
+    score_model: &DragonModel<B>,
+    prompt_tokens: &[Vec<i64>],
+    candidate_tokens: &[Vec<Vec<i64>>],
+    detach_base: bool,
+    device: &B::Device,
+    forward_hidden: F,
+) -> Result<Tensor<B, 1>>
+where
+    B: Backend + Clone + 'static,
+    B::Device: Clone,
+    F: FnOnce(Tensor<B, 2, Int>) -> Tensor<B, 3>,
+{
+    let group_sizes = validate_sequence_completion_inputs(prompt_tokens, candidate_tokens)?;
+    let row_count = group_sizes.iter().sum::<usize>();
+    let maximum_len = prompt_tokens
+        .iter()
+        .zip(candidate_tokens)
+        .flat_map(|(prompt, candidates)| {
+            candidates
+                .iter()
+                .map(move |candidate| prompt.len().saturating_add(candidate.len()))
+        })
+        .max()
+        .unwrap_or_default();
+    if maximum_len == 0 {
+        return Err(anyhow!(
+            "residual-energy sequence scorer has no causal input"
+        ));
+    }
+
+    let mut input_values = vec![0i64; row_count.saturating_mul(maximum_len)];
+    let mut target_values = vec![0i64; row_count.saturating_mul(maximum_len)];
+    let mut mask_values = vec![0.0f32; row_count.saturating_mul(maximum_len)];
+    let mut prompt_positions = Vec::with_capacity(row_count);
+    let mut terminal_positions = Vec::with_capacity(row_count);
+    let mut lengths = Vec::with_capacity(row_count);
+    let mut row = 0usize;
+    for (prompt, candidates) in prompt_tokens.iter().zip(candidate_tokens) {
+        for candidate in candidates {
+            let row_offset = row.saturating_mul(maximum_len);
+            let sequence_len = prompt.len().saturating_add(candidate.len());
+            input_values[row_offset..row_offset + prompt.len()].copy_from_slice(prompt);
+            input_values[row_offset + prompt.len()..row_offset + sequence_len]
+                .copy_from_slice(candidate);
+            for (candidate_index, target) in candidate.iter().copied().enumerate() {
+                let position = prompt
+                    .len()
+                    .saturating_sub(1)
+                    .saturating_add(candidate_index);
+                target_values[row_offset + position] = target;
+                mask_values[row_offset + position] = 1.0;
+            }
+            prompt_positions.push(prompt.len().saturating_sub(1));
+            terminal_positions.push(sequence_len.saturating_sub(1));
+            lengths.push(candidate.len() as f32);
+            row = row.saturating_add(1);
+        }
+    }
+
+    let inputs = Tensor::<B, 2, Int>::from_data(
+        TensorData::new(input_values, [row_count, maximum_len]),
+        device,
+    );
+    let targets = Tensor::<B, 2, Int>::from_data(
+        TensorData::new(target_values, [row_count, maximum_len]),
+        device,
+    );
+    let mask = Tensor::<B, 2>::from_data(
+        TensorData::new(mask_values, [row_count, maximum_len]),
+        device,
+    );
+    let hidden = forward_hidden(inputs);
+    let hidden_base = if detach_base {
+        hidden.clone().detach()
+    } else {
+        hidden.clone()
+    };
+    let logits = score_model.logits_from_hidden(hidden_base);
+    let logits = if detach_base { logits.detach() } else { logits };
+    let selected = burn_dragon_core::objective::selected_token_log_probs(
+        burn_dragon_core::objective::log_probs_from_logits(logits),
+        targets,
+    );
+    let lengths = Tensor::<B, 1>::from_data(TensorData::new(lengths, [row_count]), device);
+    let mean_log_scores = (selected * mask).sum_dim(1).reshape([row_count]) / lengths;
+
+    let hidden = if detach_base { hidden.detach() } else { hidden };
+    let [_, _, hidden_size] = hidden.shape().dims::<3>();
+    let prompt_gather = Tensor::<B, 3, Int>::from_data(
+        TensorData::new(
+            prompt_positions
+                .into_iter()
+                .flat_map(|position| std::iter::repeat_n(position as i64, hidden_size))
+                .collect::<Vec<_>>(),
+            [row_count, 1, hidden_size],
+        ),
+        device,
+    );
+    let terminal_gather = Tensor::<B, 3, Int>::from_data(
+        TensorData::new(
+            terminal_positions
+                .into_iter()
+                .flat_map(|position| std::iter::repeat_n(position as i64, hidden_size))
+                .collect::<Vec<_>>(),
+            [row_count, 1, hidden_size],
+        ),
+        device,
+    );
+    let prompt_hidden = hidden.clone().gather(1, prompt_gather);
+    let terminal_hidden = hidden.gather(1, terminal_gather);
+    let residual = score_model
+        .sequence_scores_from_hidden_pair(prompt_hidden, terminal_hidden)
+        .map(|scores| scores.reshape([row_count]))
+        .ok_or_else(|| anyhow!("residual-energy sequence score head is unavailable"))?;
+    Ok(mean_log_scores + residual)
 }
 
 /// Keep every candidate row in one dense differentiable training launch.
@@ -1270,6 +1759,140 @@ where
         .sequence_scores_from_hidden_pair(repeated_prompt_hidden, terminal_hidden)
         .ok_or_else(|| anyhow!("semantic-energy sequence score head is unavailable"))?
         .reshape([row_count]);
+    let mut row_offset = 0usize;
+    Ok(prompt_groups
+        .iter()
+        .map(|group_index| {
+            let group_size = candidate_tokens[*group_index].len();
+            let end = row_offset.saturating_add(group_size);
+            let group = (*group_index, scores.clone().slice([row_offset..end]));
+            row_offset = end;
+            group
+        })
+        .collect())
+}
+
+/// Evaluate the autoregressive prior and semantic residual from one continuation pass.
+#[allow(clippy::single_range_in_vec_init)] // Burn's 1-D slice API requires one range per dimension.
+fn score_candidate_residual_energies_from_prefix<B>(
+    model: &DragonModel<B>,
+    prompt_groups: &[usize],
+    candidate_tokens: &[Vec<Vec<i64>>],
+    prompt_last_hidden: Tensor<B, 3>,
+    prefix_state: burn_dragon_core::ModelState<B>,
+    device: &B::Device,
+) -> Result<Vec<PromptPrefixScoreGroup<Tensor<B, 1>>>>
+where
+    B: Backend + Clone + 'static,
+    B::Device: Clone,
+{
+    let row_count = prompt_groups
+        .iter()
+        .map(|group_index| candidate_tokens[*group_index].len())
+        .sum::<usize>();
+    let maximum_len = prompt_groups
+        .iter()
+        .flat_map(|group_index| candidate_tokens[*group_index].iter())
+        .map(Vec::len)
+        .max()
+        .unwrap_or_default();
+    if row_count == 0 || maximum_len == 0 {
+        return Err(anyhow!(
+            "residual-energy sequence scorer has no continuation"
+        ));
+    }
+
+    let parent_rows = prompt_groups
+        .iter()
+        .enumerate()
+        .flat_map(|(prompt_row, group_index)| {
+            std::iter::repeat_n(prompt_row as i64, candidate_tokens[*group_index].len())
+        })
+        .collect::<Vec<_>>();
+    let parent_rows =
+        Tensor::<B, 1, Int>::from_data(TensorData::new(parent_rows, [row_count]), device);
+    let repeated_prompt_hidden = prompt_last_hidden.select(0, parent_rows.clone());
+    let first_targets = Tensor::<B, 2, Int>::from_data(
+        TensorData::new(
+            prompt_groups
+                .iter()
+                .flat_map(|group_index| {
+                    candidate_tokens[*group_index]
+                        .iter()
+                        .map(|candidate| candidate[0])
+                })
+                .collect::<Vec<_>>(),
+            [row_count, 1],
+        ),
+        device,
+    );
+    let first_log_probs = burn_dragon_core::objective::log_probs_from_logits(
+        model.logits_from_hidden(repeated_prompt_hidden.clone()),
+    );
+    let mut sum_log_scores =
+        burn_dragon_core::objective::selected_token_log_probs(first_log_probs, first_targets)
+            .reshape([row_count]);
+
+    let mut input_values = vec![0i64; row_count.saturating_mul(maximum_len)];
+    let mut tail_targets = vec![0i64; row_count.saturating_mul(maximum_len)];
+    let mut tail_masks = vec![0.0f32; row_count.saturating_mul(maximum_len)];
+    let mut terminal_positions = Vec::with_capacity(row_count);
+    let mut lengths = Vec::with_capacity(row_count);
+    for (row, candidate) in prompt_groups
+        .iter()
+        .flat_map(|group_index| candidate_tokens[*group_index].iter())
+        .enumerate()
+    {
+        let row_offset = row.saturating_mul(maximum_len);
+        input_values[row_offset..row_offset + candidate.len()].copy_from_slice(candidate);
+        for (position, target) in candidate.iter().copied().enumerate().skip(1) {
+            tail_targets[row_offset + position - 1] = target;
+            tail_masks[row_offset + position - 1] = 1.0;
+        }
+        terminal_positions.push(candidate.len().saturating_sub(1));
+        lengths.push(candidate.len() as f32);
+    }
+    let inputs = Tensor::<B, 2, Int>::from_data(
+        TensorData::new(input_values, [row_count, maximum_len]),
+        device,
+    );
+    let targets = Tensor::<B, 2, Int>::from_data(
+        TensorData::new(tail_targets, [row_count, maximum_len]),
+        device,
+    );
+    let mask = Tensor::<B, 2>::from_data(
+        TensorData::new(tail_masks, [row_count, maximum_len]),
+        device,
+    );
+    let mut candidate_state = prefix_state.select_batch(parent_rows);
+    let hidden = model.forward_hidden_with_state(inputs, &mut candidate_state);
+    let tail_log_probs = burn_dragon_core::objective::log_probs_from_logits(
+        model.logits_from_hidden(hidden.clone()),
+    );
+    let tail_selected =
+        burn_dragon_core::objective::selected_token_log_probs(tail_log_probs, targets);
+    sum_log_scores = sum_log_scores + (tail_selected * mask).sum_dim(1).reshape([row_count]);
+    let lengths = Tensor::<B, 1>::from_data(TensorData::new(lengths, [row_count]), device);
+    let mean_log_scores = sum_log_scores / lengths;
+
+    let [_, _, hidden_size] = hidden.shape().dims::<3>();
+    let gather_indices = Tensor::<B, 3, Int>::from_data(
+        TensorData::new(
+            terminal_positions
+                .into_iter()
+                .flat_map(|position| std::iter::repeat_n(position as i64, hidden_size))
+                .collect::<Vec<_>>(),
+            [row_count, 1, hidden_size],
+        ),
+        device,
+    );
+    let terminal_hidden = hidden.gather(1, gather_indices);
+    let residual = model
+        .sequence_scores_from_hidden_pair(repeated_prompt_hidden, terminal_hidden)
+        .map(|scores| scores.reshape([row_count]))
+        .ok_or_else(|| anyhow!("residual-energy sequence score head is unavailable"))?;
+    let scores = mean_log_scores + residual;
+
     let mut row_offset = 0usize;
     Ok(prompt_groups
         .iter()
@@ -2104,6 +2727,53 @@ mod tests {
     }
 
     #[test]
+    fn residual_energy_scorer_matches_lm_prior_plus_semantic_energy() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 711);
+        let mut config = burn_dragon_core::DragonConfig {
+            n_layer: 1,
+            n_embd: 16,
+            n_head: 2,
+            mlp_internal_dim_multiplier: 2,
+            vocab_size: 32,
+            dropout: 0.0,
+            ..Default::default()
+        };
+        config.sequence_score_head.enabled = true;
+        let model = DragonModel::<TestBackend>::new(config, &device);
+        let prompts = vec![vec![1, 2, 3]];
+        let candidates = vec![vec![vec![10, 11], vec![12], vec![13, 14, 15]]];
+
+        let completion = sequence_completion_score_tensor(&model, &prompts, &candidates, &device)
+            .expect("completion prior");
+        let (energy, group_sizes) =
+            sequence_energy_score_tensor(&model, &prompts, &candidates, &device)
+                .expect("semantic residual");
+        assert_eq!(completion.group_sizes, group_sizes);
+        let expected = normalize_log_scores(&tensor_values(completion.mean_log_scores + energy))
+            .expect("normalized residual posterior");
+        let actual = proof_action_scores_batch(
+            &model,
+            &prompts,
+            &candidates,
+            burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::SemanticStep,
+            crate::config::RuliadProofPolicyScoring::ResidualEnergy,
+            &device,
+        )
+        .expect("residual-energy scores")
+        .remove(0);
+
+        assert_eq!(actual.len(), expected.len());
+        assert!(
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| (*actual - expected).abs() < 2.0e-4),
+            "fused residual scorer must equal the explicit LM-plus-energy contract: {actual:?}"
+        );
+    }
+
+    #[test]
     fn semantic_energy_pair_head_changes_candidate_margin_with_prompt() {
         let device = burn::tensor::Device::<TestBackend>::default();
         TestBackend::seed(&device, 72);
@@ -2354,6 +3024,93 @@ mod tests {
         assert!(
             maximum_abs_difference(&before_scores, &after_scores) > 1.0e-5,
             "head-only policy update did not change semantic scores"
+        );
+    }
+
+    #[test]
+    fn residual_energy_score_head_only_update_preserves_language_logits() {
+        let device = burn::tensor::Device::<TrainBackend>::default();
+        TrainBackend::seed(&device, 752);
+        let mut config = burn_dragon_core::DragonConfig {
+            n_layer: 1,
+            n_embd: 16,
+            n_head: 2,
+            mlp_internal_dim_multiplier: 2,
+            vocab_size: 32,
+            dropout: 0.0,
+            ..Default::default()
+        };
+        config.sequence_score_head.enabled = true;
+        let mut model = DragonModel::<TrainBackend>::new(config, &device);
+        let mut optimizer = AdamWConfig::new()
+            .with_weight_decay(0.0)
+            .init::<TrainBackend, DragonModel<TrainBackend>>();
+        let prompts = vec![vec![1, 2, 3, 4], vec![1, 2, 9, 4]];
+        let menu = vec![vec![10, 11], vec![12, 13], vec![14, 15]];
+        let candidates = vec![menu.clone(), menu];
+        let targets = Tensor::<TrainBackend, 2, Int>::from_data(
+            TensorData::new(vec![0_i64, 1], [2, 1]),
+            &device,
+        );
+        let probe = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3, 4, 5, 6], [2, 3]),
+            &burn::tensor::Device::<TestBackend>::default(),
+        );
+        let before_valid = model.valid();
+        let before_logits = tensor_values(before_valid.forward(probe.clone()));
+        let before_scores = proof_action_scores_batch(
+            &before_valid,
+            &prompts,
+            &candidates,
+            burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::SemanticStep,
+            crate::config::RuliadProofPolicyScoring::ResidualEnergy,
+            &burn::tensor::Device::<TestBackend>::default(),
+        )
+        .expect("initial residual scores")
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+
+        let (scores, group_sizes) = sequence_residual_energy_score_tensor_with_gradient_scope(
+            &model,
+            &prompts,
+            &candidates,
+            crate::config::RuliadProofPolicyGradientScope::ScoreHeadOnly,
+            &device,
+        )
+        .expect("head-only residual scores");
+        assert_eq!(group_sizes, vec![3, 3]);
+        let loss = activation::log_softmax(scores.reshape([2, 3]), 1)
+            .gather(1, targets)
+            .mean()
+            .neg()
+            .reshape([1]);
+        let grads = GradientsParams::from_grads(loss.backward(), &model);
+        model = optimizer.step(0.1, model, grads);
+
+        let after_valid = model.valid();
+        let after_logits = tensor_values(after_valid.forward(probe));
+        let after_scores = proof_action_scores_batch(
+            &after_valid,
+            &prompts,
+            &candidates,
+            burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::SemanticStep,
+            crate::config::RuliadProofPolicyScoring::ResidualEnergy,
+            &burn::tensor::Device::<TestBackend>::default(),
+        )
+        .expect("updated residual scores")
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            maximum_abs_difference(&before_logits, &after_logits),
+            0.0,
+            "head-only residual policy update changed Dragon language logits"
+        );
+        assert!(
+            maximum_abs_difference(&before_scores, &after_scores) > 1.0e-5,
+            "head-only policy update did not change residual scores"
         );
     }
 
@@ -2830,6 +3587,131 @@ mod tests {
             equivalent[2].equivalent_tokens,
             vec![i64::from(b'f'), i64::from(b'r')]
         );
+    }
+
+    #[test]
+    fn trie_conditional_scores_form_the_exact_leaf_distribution() {
+        let candidates = vec![
+            b"g0|a:r1|f|1"
+                .iter()
+                .map(|token| i64::from(*token))
+                .collect(),
+            b"g1|a:r1|f|1"
+                .iter()
+                .map(|token| i64::from(*token))
+                .collect(),
+            b"g1|a:r2|f|1"
+                .iter()
+                .map(|token| i64::from(*token))
+                .collect(),
+            b"g1|a:r2|r|1"
+                .iter()
+                .map(|token| i64::from(*token))
+                .collect(),
+        ];
+        let branches = semantic_candidate_trie_branches(&candidates, &[0, 1, 2, 3])
+            .expect("complete scoring trie");
+        assert_eq!(branches.len(), 3, "{branches:?}");
+        let vocab = 128;
+        let mut logits = vec![-12.0f32; branches.len() * vocab];
+        let branch_probabilities = [[0.2f32, 0.8], [0.25, 0.75], [0.6, 0.4]];
+        for (branch_index, (branch, probabilities)) in
+            branches.iter().zip(branch_probabilities).enumerate()
+        {
+            for (token, probability) in branch.candidate_tokens.iter().zip(probabilities) {
+                logits[branch_index * vocab + *token as usize] = probability.ln();
+            }
+            // A huge score on an illegal syntax token must not affect the constrained policy.
+            logits[branch_index * vocab + 127] = 1_000.0;
+        }
+        let scores = trie_conditional_log_scores(
+            &logits,
+            vocab,
+            &branches,
+            &[branches.len()],
+            &[candidates.len()],
+        )
+        .expect("trie scores")
+        .pop()
+        .expect("score group");
+        let expected = [0.2f32, 0.2, 0.36, 0.24];
+        for (score, expected) in scores.iter().zip(expected) {
+            assert!((score.exp() - expected).abs() < 1.0e-6, "{scores:?}");
+        }
+        assert!((scores.iter().map(|score| score.exp()).sum::<f32>() - 1.0).abs() < 1.0e-6);
+        assert_eq!(best_candidate_index(&scores), Some(2));
+    }
+
+    #[test]
+    fn trie_conditional_scores_are_candidate_permutation_equivariant() {
+        let canonical = vec![
+            b"g0|a:r1|f|1"
+                .iter()
+                .map(|token| i64::from(*token))
+                .collect(),
+            b"g1|a:r1|f|1"
+                .iter()
+                .map(|token| i64::from(*token))
+                .collect(),
+            b"g1|a:r2|f|1"
+                .iter()
+                .map(|token| i64::from(*token))
+                .collect(),
+            b"g1|a:r2|r|1"
+                .iter()
+                .map(|token| i64::from(*token))
+                .collect(),
+        ];
+        let score = |candidates: &[Vec<i64>]| {
+            let branches = semantic_candidate_trie_branches(
+                candidates,
+                &(0..candidates.len()).collect::<Vec<_>>(),
+            )
+            .expect("complete scoring trie");
+            let vocab = 128;
+            let mut logits = vec![-12.0f32; branches.len() * vocab];
+            for (branch_index, branch) in branches.iter().enumerate() {
+                let probabilities = match branch.prefix.as_slice() {
+                    prefix if prefix == b"g".iter().map(|v| i64::from(*v)).collect::<Vec<_>>() => {
+                        [0.2f32, 0.8]
+                    }
+                    prefix
+                        if prefix
+                            == b"g1|a:r".iter().map(|v| i64::from(*v)).collect::<Vec<_>>() =>
+                    {
+                        [0.25, 0.75]
+                    }
+                    _ => [0.6, 0.4],
+                };
+                for (token, probability) in branch.candidate_tokens.iter().zip(probabilities) {
+                    logits[branch_index * vocab + *token as usize] = probability.ln();
+                }
+            }
+            trie_conditional_log_scores(
+                &logits,
+                vocab,
+                &branches,
+                &[branches.len()],
+                &[candidates.len()],
+            )
+            .expect("trie scores")
+            .pop()
+            .expect("score group")
+        };
+        let canonical_scores = score(&canonical);
+        let permutation = [2usize, 0, 3, 1];
+        let permuted = permutation
+            .iter()
+            .map(|index| canonical[*index].clone())
+            .collect::<Vec<_>>();
+        let permuted_scores = score(&permuted);
+        for (permuted_index, canonical_index) in permutation.into_iter().enumerate() {
+            assert!(
+                (permuted_scores[permuted_index] - canonical_scores[canonical_index]).abs()
+                    < 1.0e-6,
+                "canonical={canonical_scores:?} permuted={permuted_scores:?}"
+            );
+        }
     }
 
     #[test]

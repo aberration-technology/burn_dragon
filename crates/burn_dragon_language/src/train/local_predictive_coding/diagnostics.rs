@@ -6,8 +6,8 @@ use burn_dragon_core::{DragonModel, ModelState};
 use serde::Serialize;
 
 use super::{
-    LocalPredictiveCodingProfile, LocalPredictiveCodingStepReport,
-    local_predictive_coding_train_step,
+    LocalPredictiveCodingDerivatives, LocalPredictiveCodingProfile,
+    LocalPredictiveCodingStepReport, local_predictive_coding_train_step,
 };
 use crate::config::LocalPredictiveCodingConfig;
 
@@ -298,6 +298,35 @@ where
     )
 }
 
+/// Compare the exact sparse verifier terminal used by training with one
+/// global-autodiff evaluation of the same rows and categorical-set objective.
+///
+/// This diagnostic deliberately performs a global backward pass. Keep it out
+/// of the training hot path and use it only for numerical validation.
+pub(crate) fn local_predictive_coding_verifier_gradient_fidelity<B: AutodiffBackend>(
+    model: &DragonModel<B>,
+    prepared: super::verifier::PreparedRuliadVerifierTerminal<B::InnerBackend>,
+    config: &LocalPredictiveCodingConfig,
+) -> Result<LocalPredictiveCodingGradientFidelityReport, String>
+where
+    B::Device: 'static,
+    B::FloatTensorPrimitive: 'static,
+{
+    model.predictive_coding_support()?;
+    let reference = super::verifier::lift_ruliad_verifier_terminal::<B>(prepared.clone());
+    let pc_step = super::local_predictive_coding_verifier_train_step(
+        model,
+        prepared,
+        config,
+        &LocalPredictiveCodingProfile::default(),
+    );
+    let reference_loss = reference
+        .criterion
+        .verifier_autodiff_loss_from_hidden(model, model.forward_hidden(reference.inputs))
+        .ok_or_else(|| "Ruliad verifier terminal did not produce an autodiff loss".to_string())?;
+    gradient_fidelity_report(model, pc_step, reference_loss)
+}
+
 fn local_predictive_coding_gradient_fidelity_impl<B: AutodiffBackend>(
     model: &DragonModel<B>,
     inputs: Tensor<B, 2, Int>,
@@ -322,6 +351,10 @@ where
     config
         .inference
         .validate("local_predictive_coding_gradient_fidelity.inference")
+        .map_err(|error| error.to_string())?;
+    config
+        .augmented_lagrangian
+        .validate("local_predictive_coding_gradient_fidelity.augmented_lagrangian")
         .map_err(|error| error.to_string())?;
     let input_shape = inputs.shape();
     if targets.shape() != input_shape {
@@ -391,8 +424,6 @@ where
         }
         (Some(_), _, _) => unreachable!("stateful masks rejected above"),
     };
-    let pc_loss = f64::from(burn_pc::diagnostic_scalar_f32(pc_step.loss.inner()));
-
     let reference_logits = match (initial_state, neuron_mask, activity_mask) {
         (Some(mut state), None, None) => {
             state.detach_in_place();
@@ -412,6 +443,15 @@ where
         model.language_token_losses_from_logits(reference_logits, targets),
         loss_mask,
     );
+    gradient_fidelity_report(model, pc_step, reference_loss)
+}
+
+fn gradient_fidelity_report<B: AutodiffBackend>(
+    model: &DragonModel<B>,
+    pc_step: LocalPredictiveCodingDerivatives<B>,
+    reference_loss: Tensor<B, 1>,
+) -> Result<LocalPredictiveCodingGradientFidelityReport, String> {
+    let pc_loss = f64::from(burn_pc::diagnostic_scalar_f32(pc_step.loss.inner()));
     let reference_loss_value = f64::from(burn_pc::diagnostic_scalar_f32(
         reference_loss.clone().inner(),
     ));
@@ -424,7 +464,7 @@ where
     let parameter_ids = model.predictive_coding_parameter_ids()?;
 
     let mut global = RawGradientStatistics::default();
-    let mut parameter_families = Vec::with_capacity(9);
+    let mut parameter_families = Vec::with_capacity(15);
     macro_rules! compare_family {
         ($name:literal, $id:expr, $rank:literal) => {{
             let raw = gradient_statistics::<B::InnerBackend, $rank>(
@@ -447,6 +487,14 @@ where
     compare_family!("norm_alpha", parameter_ids.norm_alpha, 1);
     compare_family!("norm_shift", parameter_ids.norm_shift, 1);
     compare_family!("language_head", parameter_ids.lm_head, 2);
+    if let Some(score) = parameter_ids.sequence_score_head {
+        compare_family!("sequence_query_weight", score.query_weight, 2);
+        compare_family!("sequence_query_bias", score.query_bias, 1);
+        compare_family!("sequence_candidate_weight", score.candidate_weight, 2);
+        compare_family!("sequence_candidate_bias", score.candidate_bias, 1);
+        compare_family!("sequence_score_weight", score.score_weight, 2);
+        compare_family!("sequence_score_bias", score.score_bias, 1);
+    }
 
     Ok(LocalPredictiveCodingGradientFidelityReport {
         pc_loss,
@@ -646,7 +694,7 @@ mod tests {
         };
         config.sequence_kernel.executor = SequenceTrainingExecutor::DenseScoreShortContext;
         config.fused_kernels.rotary_embedding = RotaryEmbedding::Alibi;
-        let model = DragonModel::new(config, &device);
+        let model = DragonModel::<TestBackend>::new(config, &device);
         let prefix = Tensor::from_data(
             TensorData::new(vec![4_i64, 5, 6, 7, 7, 6, 5, 4], [2, 4]),
             &device,
@@ -731,6 +779,163 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn two_chunk_state_adjoint_composition_matches_full_recurrent_backpropagation() {
+        let device = Default::default();
+        TestBackend::seed(&device, 20260811);
+        let mut config = DragonConfig {
+            n_layer: 3,
+            n_embd: 8,
+            n_head: 2,
+            mlp_internal_dim_multiplier: 2,
+            vocab_size: 16,
+            dropout: 0.0,
+            ..DragonConfig::default()
+        };
+        config.sequence_kernel.executor = SequenceTrainingExecutor::DenseScoreShortContext;
+        config.fused_kernels.rotary_embedding = RotaryEmbedding::Alibi;
+        let model = DragonModel::<TestBackend>::new(config, &device);
+        let inputs = Tensor::from_data(
+            TensorData::new(
+                vec![1_i64, 2, 3, 4, 5, 6, 7, 8, 8, 7, 6, 5, 4, 3, 2, 1],
+                [2, 8],
+            ),
+            &device,
+        );
+        let targets = Tensor::from_data(
+            TensorData::new(
+                vec![2_i64, 3, 4, 5, 6, 7, 8, 9, 7, 6, 5, 4, 3, 2, 1, 0],
+                [2, 8],
+            ),
+            &device,
+        );
+        let mask = Tensor::from_data(
+            TensorData::new(
+                vec![1_i64, 1, 0, 1, 1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 0, 1],
+                [2, 8],
+            ),
+            &device,
+        );
+        let input_chunks = [
+            inputs.clone().slice([0..2, 0..4]),
+            inputs.slice([0..2, 4..8]),
+        ];
+        let target_chunks = [
+            targets.clone().slice([0..2, 0..4]),
+            targets.slice([0..2, 4..8]),
+        ];
+        let mask_chunks = [mask.clone().slice([0..2, 0..4]), mask.slice([0..2, 4..8])];
+        let initial_state = model.init_state();
+        let pc_config = LocalPredictiveCodingConfig {
+            solver: crate::config::LocalPredictiveCodingSolver::FixedPrediction,
+            ..LocalPredictiveCodingConfig::default()
+        };
+
+        let first_observation = super::super::local_predictive_coding_derivatives_with_state(
+            &model,
+            input_chunks[0].clone(),
+            target_chunks[0].clone(),
+            Some(mask_chunks[0].clone()),
+            initial_state.clone(),
+            &pc_config,
+        )
+        .expect("first recurrent local factor");
+        let second = super::super::local_predictive_coding_derivatives_with_state(
+            &model,
+            input_chunks[1].clone(),
+            target_chunks[1].clone(),
+            Some(mask_chunks[1].clone()),
+            first_observation.terminal_state,
+            &pc_config,
+        )
+        .expect("second recurrent local factor");
+        assert_eq!(second.initial_rho_adjoints.len(), 3);
+        assert!(second.initial_rho_adjoints.iter().all(Option::is_some));
+        let first = super::super::local_predictive_coding_derivatives_with_state_adjoint(
+            &model,
+            input_chunks[0].clone(),
+            target_chunks[0].clone(),
+            Some(mask_chunks[0].clone()),
+            initial_state,
+            second.initial_rho_adjoints.clone(),
+            &pc_config,
+        )
+        .expect("first factor with future rho adjoint");
+        assert_eq!(first.report.temporal_state_vjp_calls, 3);
+        assert_eq!(first.report.global_backward_calls, 0);
+        assert_eq!(second.report.global_backward_calls, 0);
+
+        let mut combined = GradientsParams::new();
+        let ids = model.predictive_coding_parameter_ids().expect("PC ids");
+        macro_rules! combine_family {
+            ($id:expr, $rank:literal) => {{
+                let id = $id;
+                combined.register(
+                    id,
+                    first
+                        .grads
+                        .get::<NdArray<f32>, $rank>(id)
+                        .expect("first local gradient")
+                        + second
+                            .grads
+                            .get::<NdArray<f32>, $rank>(id)
+                            .expect("second local gradient"),
+                );
+            }};
+        }
+        combine_family!(ids.embedding, 2);
+        combine_family!(ids.encoder, 3);
+        combine_family!(ids.encoder_v, 3);
+        combine_family!(ids.decoder, 2);
+        combine_family!(ids.norm_gamma, 1);
+        combine_family!(ids.norm_beta, 1);
+        combine_family!(ids.norm_alpha, 1);
+        combine_family!(ids.norm_shift, 1);
+        combine_family!(ids.lm_head, 2);
+
+        let mut reference_state = model.init_state();
+        let logits_first = model.forward_with_state(input_chunks[0].clone(), &mut reference_state);
+        let logits_second = model.forward_with_state(input_chunks[1].clone(), &mut reference_state);
+        let first_loss = burn_dragon_core::objective::masked_token_mean(
+            model.language_token_losses_from_logits(logits_first, target_chunks[0].clone()),
+            Some(mask_chunks[0].clone()),
+        );
+        let second_loss = burn_dragon_core::objective::masked_token_mean(
+            model.language_token_losses_from_logits(logits_second, target_chunks[1].clone()),
+            Some(mask_chunks[1].clone()),
+        );
+        let reference = GradientsParams::from_grads((first_loss + second_loss).backward(), &model);
+        let mut aggregate = RawGradientStatistics::default();
+        macro_rules! compare_family {
+            ($name:literal, $id:expr, $rank:literal) => {{
+                aggregate.merge(
+                    gradient_statistics::<NdArray<f32>, $rank>(&combined, &reference, $id, $name)
+                        .expect("two-chunk family statistics"),
+                );
+            }};
+        }
+        compare_family!("embedding", ids.embedding, 2);
+        compare_family!("shared_encoder", ids.encoder, 3);
+        compare_family!("shared_value_encoder", ids.encoder_v, 3);
+        compare_family!("shared_decoder", ids.decoder, 2);
+        compare_family!("norm_gamma", ids.norm_gamma, 1);
+        compare_family!("norm_beta", ids.norm_beta, 1);
+        compare_family!("norm_alpha", ids.norm_alpha, 1);
+        compare_family!("norm_shift", ids.norm_shift, 1);
+        compare_family!("language_head", ids.lm_head, 2);
+        let fidelity = aggregate.into_fidelity("two_chunk_parameters", None);
+        assert!(
+            fidelity.cosine.is_some_and(|cosine| cosine > 0.999_9),
+            "two-chunk temporal fidelity: {fidelity:?}"
+        );
+        assert!(
+            fidelity
+                .relative_l2_error
+                .is_some_and(|error| error < 1.0e-3),
+            "two-chunk temporal fidelity: {fidelity:?}"
+        );
     }
 
     #[test]

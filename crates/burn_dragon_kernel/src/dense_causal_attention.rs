@@ -26,7 +26,9 @@ mod backward_runtime;
 mod forward_runtime;
 
 pub use backward_runtime::{
-    DenseCausalAttentionVjp, dense_causal_attention_vjp,
+    DenseCausalAttentionFinalRhoVjp, DenseCausalAttentionInputVjp, DenseCausalAttentionVjp,
+    dense_causal_attention_final_rho_input_vjp, dense_causal_attention_final_rho_vjp,
+    dense_causal_attention_input_vjp_with_initial_rho, dense_causal_attention_vjp,
     dense_causal_attention_vjp_with_initial_rho,
 };
 

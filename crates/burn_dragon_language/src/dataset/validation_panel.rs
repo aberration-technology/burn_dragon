@@ -12,13 +12,14 @@ use crate::config::{RuliadValidationPanelMode, TrainingHyperparameters};
 
 use super::{Dataset, RuliadValidationProbeItem, RuliadValidationPromptMode};
 
-const PANEL_SCHEMA_VERSION: u32 = 1;
+const PANEL_SCHEMA_VERSION: u32 = 2;
 const PANEL_LOCK_WAIT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct RuliadValidationPanelRequest {
     seed: u64,
     base_items: usize,
+    base_difficulty_levels: usize,
     include_training_serialization: bool,
     policy_enabled: bool,
     policy_items: usize,
@@ -57,6 +58,7 @@ fn panel_request(
     RuliadValidationPanelRequest {
         seed: training.validation.seed,
         base_items: training.events.ruliad_correctness_probe_items,
+        base_difficulty_levels: training.validation.ruliad_panel.base_difficulty_levels,
         include_training_serialization: training.sequence_state_probe.enabled,
         policy_enabled: training.ruliad_policy_probe.enabled,
         policy_items: training.ruliad_policy_probe.items,
@@ -74,17 +76,35 @@ fn dynamic_panel(
     epoch: usize,
     absolute_step: usize,
 ) -> ResolvedRuliadValidationPanel {
-    let base_items = dataset.sample_ruliad_validation_probe_items(
-        epoch,
-        absolute_step,
-        training.events.ruliad_correctness_probe_items,
-    );
-    let training_serialization_items = if training.sequence_state_probe.enabled {
-        dataset.sample_ruliad_training_serialization_probe_items(
+    let base_items = if training.validation.ruliad_panel.base_difficulty_levels == 0 {
+        dataset.sample_ruliad_validation_probe_items(
             epoch,
             absolute_step,
             training.events.ruliad_correctness_probe_items,
         )
+    } else {
+        dataset.sample_ruliad_validation_probe_items_stratified_fixed(
+            training.validation.seed,
+            training.events.ruliad_correctness_probe_items,
+            training.validation.ruliad_panel.base_difficulty_levels,
+            RuliadValidationPromptMode::CanonicalTransfer,
+        )
+    };
+    let training_serialization_items = if training.sequence_state_probe.enabled {
+        if training.validation.ruliad_panel.base_difficulty_levels == 0 {
+            dataset.sample_ruliad_training_serialization_probe_items(
+                epoch,
+                absolute_step,
+                training.events.ruliad_correctness_probe_items,
+            )
+        } else {
+            dataset.sample_ruliad_validation_probe_items_stratified_fixed(
+                training.validation.seed,
+                training.events.ruliad_correctness_probe_items,
+                training.validation.ruliad_panel.base_difficulty_levels,
+                RuliadValidationPromptMode::TrainingSerialization,
+            )
+        }
     } else {
         Vec::new()
     };
@@ -117,17 +137,35 @@ fn materialize_payload(
     dataset: &Dataset,
     request: RuliadValidationPanelRequest,
 ) -> Result<RuliadValidationPanelPayload> {
-    let base_items = dataset.sample_ruliad_validation_probe_items_fixed(
-        request.seed,
-        request.base_items,
-        RuliadValidationPromptMode::CanonicalTransfer,
-    );
-    let training_serialization_items = if request.include_training_serialization {
+    let base_items = if request.base_difficulty_levels == 0 {
         dataset.sample_ruliad_validation_probe_items_fixed(
             request.seed,
             request.base_items,
-            RuliadValidationPromptMode::TrainingSerialization,
+            RuliadValidationPromptMode::CanonicalTransfer,
         )
+    } else {
+        dataset.sample_ruliad_validation_probe_items_stratified_fixed(
+            request.seed,
+            request.base_items,
+            request.base_difficulty_levels,
+            RuliadValidationPromptMode::CanonicalTransfer,
+        )
+    };
+    let training_serialization_items = if request.include_training_serialization {
+        if request.base_difficulty_levels == 0 {
+            dataset.sample_ruliad_validation_probe_items_fixed(
+                request.seed,
+                request.base_items,
+                RuliadValidationPromptMode::TrainingSerialization,
+            )
+        } else {
+            dataset.sample_ruliad_validation_probe_items_stratified_fixed(
+                request.seed,
+                request.base_items,
+                request.base_difficulty_levels,
+                RuliadValidationPromptMode::TrainingSerialization,
+            )
+        }
     } else {
         Vec::new()
     };
@@ -344,6 +382,7 @@ mod tests {
         let request = RuliadValidationPanelRequest {
             seed: 7,
             base_items: 0,
+            base_difficulty_levels: 4,
             include_training_serialization: false,
             policy_enabled: false,
             policy_items: 0,

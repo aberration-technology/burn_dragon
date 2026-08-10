@@ -9,6 +9,8 @@ config = "crates/burn_dragon_p2p/deploy/profiles/ruliad-r3.semantic-action.corpu
 
 [training.ruliad_policy_probe]
 enabled = true
+normalization = "prefix_conditional"
+candidate_symmetry = "cyclic_orbit_average"
 every_epochs = 1
 # The matrix measures one-step constrained action quality. Closed-loop proof
 # search is a separate, substantially more expensive promotion gate.
@@ -21,4 +23,3 @@ scoring_batch_rows = 32
 scoring_token_budget = 32768
 scoring_pipeline_depth = 2
 stratified_difficulty_levels = 4
-candidate_symmetry = "balanced_rotation"

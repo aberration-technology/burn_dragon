@@ -6,8 +6,12 @@ use crate::config::{LocalPredictiveCodingConfig, LocalPredictiveCodingSolver};
 pub struct LocalPredictiveCodingStepReport {
     pub solver: LocalPredictiveCodingSolver,
     pub inference_steps: usize,
+    pub dual_steps: usize,
     pub factors: usize,
     pub local_vjp_calls: usize,
+    /// VJPs induced by a later chunk's terminal-rho adjoint.
+    pub temporal_state_vjp_calls: usize,
+    pub fused_temporal_vjp_calls: usize,
     pub global_backward_calls: usize,
     pub gradient_tensors: usize,
     /// Logical direct-feedback forward-factor updates. These may be executed
@@ -17,11 +21,20 @@ pub struct LocalPredictiveCodingStepReport {
     pub feedback_parameter_updates: usize,
     /// Exact local adjoint teacher waves used to calibrate feedback.
     pub adjoint_teacher_updates: usize,
-    /// Feedback updates that used only the local Kolen-Pollack rule.
+    /// Adjoint updates computed without an exact reverse-depth teacher. This
+    /// includes local feedback rules and analytic first-order residual probes.
     pub adjoint_local_updates: usize,
     pub parameter_updates: usize,
     pub energy_before: Option<f64>,
     pub energy_after: Option<f64>,
+    pub grad_norm_mean: Option<f64>,
+    pub grad_norm_max: Option<f64>,
+    pub delta_rms_mean: Option<f64>,
+    /// Fraction of primal activity rows clipped on the final inference step.
+    pub clip_fraction_mean: Option<f64>,
+    pub constraint_rms: Option<f64>,
+    pub dual_rms: Option<f64>,
+    pub composite_signal_rms: Option<f64>,
     pub elapsed_ns: u128,
 }
 
@@ -29,8 +42,11 @@ pub struct LocalPredictiveCodingStepReport {
 pub struct LocalPredictiveCodingProfileSnapshot {
     pub steps: u64,
     pub inference_steps: u64,
+    pub dual_steps: u64,
     pub factors: u64,
     pub local_vjp_calls: u64,
+    pub temporal_state_vjp_calls: u64,
+    pub fused_temporal_vjp_calls: u64,
     pub global_backward_calls: u64,
     pub gradient_tensors: u64,
     pub direct_forward_updates: u64,
@@ -38,7 +54,12 @@ pub struct LocalPredictiveCodingProfileSnapshot {
     pub adjoint_teacher_updates: u64,
     pub adjoint_local_updates: u64,
     pub adjoint_calibration_samples: u64,
+    /// Logical local derivative/update intents. These are not necessarily
+    /// outer optimizer applications when gradients are accumulated over
+    /// recurrent chunks.
     pub parameter_updates: u64,
+    /// Actual calls to the optimizer update transform.
+    pub optimizer_updates: u64,
     pub structured_terminal_steps: u64,
     pub structured_terminal_skipped_steps: u64,
     pub structured_terminal_groups: u64,
@@ -46,6 +67,13 @@ pub struct LocalPredictiveCodingProfileSnapshot {
     pub elapsed_ns: u128,
     pub last_energy_before: Option<f64>,
     pub last_energy_after: Option<f64>,
+    pub last_grad_norm_mean: Option<f64>,
+    pub last_grad_norm_max: Option<f64>,
+    pub last_delta_rms_mean: Option<f64>,
+    pub last_clip_fraction_mean: Option<f64>,
+    pub last_constraint_rms: Option<f64>,
+    pub last_dual_rms: Option<f64>,
+    pub last_composite_signal_rms: Option<f64>,
     pub last_adjoint_calibration_loss: Option<f64>,
     pub last_adjoint_cosine_alignment: Option<f64>,
     pub last_adjoint_prediction_teacher_norm_ratio: Option<f64>,
@@ -102,10 +130,17 @@ impl LocalPredictiveCodingProfile {
             profile.inference_steps = profile
                 .inference_steps
                 .saturating_add(report.inference_steps as u64);
+            profile.dual_steps = profile.dual_steps.saturating_add(report.dual_steps as u64);
             profile.factors = profile.factors.saturating_add(report.factors as u64);
             profile.local_vjp_calls = profile
                 .local_vjp_calls
                 .saturating_add(report.local_vjp_calls as u64);
+            profile.temporal_state_vjp_calls = profile
+                .temporal_state_vjp_calls
+                .saturating_add(report.temporal_state_vjp_calls as u64);
+            profile.fused_temporal_vjp_calls = profile
+                .fused_temporal_vjp_calls
+                .saturating_add(report.fused_temporal_vjp_calls as u64);
             profile.global_backward_calls = profile
                 .global_backward_calls
                 .saturating_add(report.global_backward_calls as u64);
@@ -130,6 +165,19 @@ impl LocalPredictiveCodingProfile {
             profile.elapsed_ns = profile.elapsed_ns.saturating_add(report.elapsed_ns);
             profile.last_energy_before = report.energy_before;
             profile.last_energy_after = report.energy_after;
+            profile.last_grad_norm_mean = report.grad_norm_mean;
+            profile.last_grad_norm_max = report.grad_norm_max;
+            profile.last_delta_rms_mean = report.delta_rms_mean;
+            profile.last_clip_fraction_mean = report.clip_fraction_mean;
+            profile.last_constraint_rms = report.constraint_rms;
+            profile.last_dual_rms = report.dual_rms;
+            profile.last_composite_signal_rms = report.composite_signal_rms;
+        }
+    }
+
+    pub(crate) fn record_optimizer_updates(&self, count: usize) {
+        if let Ok(mut profile) = self.inner.lock() {
+            profile.optimizer_updates = profile.optimizer_updates.saturating_add(count as u64);
         }
     }
 
@@ -219,5 +267,17 @@ mod tests {
             second.snapshot(),
             LocalPredictiveCodingProfileSnapshot::default()
         );
+    }
+
+    #[test]
+    fn derivative_intents_are_distinct_from_optimizer_applications() {
+        let profile = LocalPredictiveCodingProfile::default();
+        profile.record_global_structured_terminal(2, 8, 10);
+        profile.record_global_structured_terminal(2, 8, 10);
+        profile.record_optimizer_updates(1);
+
+        let snapshot = profile.snapshot();
+        assert_eq!(snapshot.parameter_updates, 2);
+        assert_eq!(snapshot.optimizer_updates, 1);
     }
 }

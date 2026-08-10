@@ -52,7 +52,7 @@ pub mod api {
             SdpoObjectiveConfig, SelfDistillationKlKind, TeacherRegularization, TrainingAlgorithm,
             TrainingConfig, TrainingHyperparameters, TrainingObjectiveConfig,
             TrainingObjectiveKind, TrainingValidationConfig, TrainingValidationExecution,
-            load_training_config,
+            TrainingValidationObjective, load_training_config,
         };
     }
 
@@ -134,7 +134,7 @@ pub use config::{
     RuliadValidationPanelMode, SdftObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind,
     TeacherRegularization, TrainingAlgorithm, TrainingConfig, TrainingHyperparameters,
     TrainingObjectiveConfig, TrainingObjectiveKind, TrainingValidationConfig,
-    TrainingValidationExecution, load_training_config,
+    TrainingValidationExecution, TrainingValidationObjective, load_training_config,
 };
 pub use generation::{
     ContextStrategy, GenerationProfileSnapshot, GenerationSettings,

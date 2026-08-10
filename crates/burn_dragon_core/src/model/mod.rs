@@ -37,10 +37,13 @@ pub use dragon::{
     DragonModel, DragonPredictiveCodingHeadActivityVjp, DragonPredictiveCodingHeadVjp,
     DragonPredictiveCodingInitialVjp, DragonPredictiveCodingLayerTrace,
     DragonPredictiveCodingLayerVjp, DragonPredictiveCodingParameterIds,
-    DragonPredictiveCodingSupport, LanguageModuleLrScaleTarget, LatentReasoningOutput,
-    SharedLowrankActivationBatchStats, SharedLowrankContinualBackpropRuntime,
-    SharedLowrankFeatureMetrics, SharedLowrankParamIds, SharedLowrankPopulationFactors,
-    SharedLowrankPopulationWeights, SharedLowrankWeights,
+    DragonPredictiveCodingSequenceScoreHeadParameterIds,
+    DragonPredictiveCodingSequenceScoreHeadVjp, DragonPredictiveCodingStateVjp,
+    DragonPredictiveCodingSupport, DragonPredictiveCodingVjpProfileSnapshot,
+    LanguageModuleLrScaleTarget, LatentReasoningOutput, SharedLowrankActivationBatchStats,
+    SharedLowrankContinualBackpropRuntime, SharedLowrankFeatureMetrics, SharedLowrankParamIds,
+    SharedLowrankPopulationFactors, SharedLowrankPopulationWeights, SharedLowrankWeights,
+    dragon_predictive_coding_vjp_profile_reset, dragon_predictive_coding_vjp_profile_snapshot,
 };
 #[cfg(any(feature = "probe", test))]
 pub use dragon::{

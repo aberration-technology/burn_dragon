@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use burn::tensor::{Int, Tensor};
 use burn_dragon_p2p::auth::{
     begin_native_github_login, complete_native_github_login, fetch_edge_snapshot,
     load_cached_native_auth_bundle, native_auth_bundle_is_fresh, native_cli_bridge_url,
@@ -160,6 +161,7 @@ const P2P_PARITY_REQUIRE_CONVERGENCE_ENV: &str = "BURN_DRAGON_P2P_PARITY_REQUIRE
 const P2P_PARITY_RANDOM_SCAFFOLD_ENV: &str = "BURN_DRAGON_P2P_PARITY_RANDOM_SCAFFOLD";
 const P2P_PARITY_RANDOM_SCAFFOLD_ENCODING_ENV: &str =
     "BURN_DRAGON_P2P_PARITY_RANDOM_SCAFFOLD_ENCODING";
+const P2P_PARITY_TRAINING_ALGORITHM_ENV: &str = "BURN_DRAGON_P2P_PARITY_TRAINING_ALGORITHM";
 const P2P_DILOCO_CODEC_ENV: &str = "BURN_DRAGON_P2P_DILOCO_CODEC";
 const P2P_DILOCO_OUTER_LR_MICROS_ENV: &str = "BURN_DRAGON_P2P_DILOCO_OUTER_LR_MICROS";
 const P2P_DILOCO_MOMENTUM_MICROS_ENV: &str = "BURN_DRAGON_P2P_DILOCO_MOMENTUM_MICROS";
@@ -169,6 +171,47 @@ const P2P_DILOCO_MAX_PSEUDO_GRADIENT_RMS_RATIO_MICROS_ENV: &str =
     "BURN_DRAGON_P2P_DILOCO_MAX_PSEUDO_GRADIENT_RMS_RATIO_MICROS";
 const P2P_DILOCO_REPORT_ROOT_ENV: &str = "BURN_DRAGON_P2P_DILOCO_REPORT_ROOT";
 const P2P_DILOCO_MATCHMAKING_TIMEOUT_MS_ENV: &str = "BURN_DRAGON_P2P_DILOCO_MATCHMAKING_TIMEOUT_MS";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuliadParityTrainingAlgorithm {
+    Backpropagation,
+    PredictiveCoding,
+}
+
+impl RuliadParityTrainingAlgorithm {
+    fn from_env() -> Self {
+        match std::env::var(P2P_PARITY_TRAINING_ALGORITHM_ENV)
+            .unwrap_or_else(|_| "backpropagation".into())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "backpropagation" | "backprop" | "adamw" => Self::Backpropagation,
+            "predictive_coding" | "pc" | "local_pc" => Self::PredictiveCoding,
+            other => panic!(
+                "{P2P_PARITY_TRAINING_ALGORITHM_ENV} must be backpropagation or predictive_coding; got {other}"
+            ),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Backpropagation => "backpropagation",
+            Self::PredictiveCoding => "predictive_coding",
+        }
+    }
+
+    const fn synchronized_reference_kind(self) -> &'static str {
+        match self {
+            Self::Backpropagation => {
+                "centralized_same_examples_same_optimizer_update_count_gradient_accumulation_3"
+            }
+            Self::PredictiveCoding => {
+                "centralized_same_examples_same_optimizer_update_count_batch_3x_no_accumulation"
+            }
+        }
+    }
+}
 
 fn run_with_large_stack(name: &'static str, test: impl FnOnce() + Send + 'static) {
     let handle = thread::Builder::new()
@@ -727,8 +770,10 @@ fn ruliad_parity_training_config_toml(
     ruliad_config_path: &Path,
     seed: u64,
     max_iters: usize,
+    batch_size: usize,
     gradient_accumulation_steps: usize,
     random_scaffold: bool,
+    training_algorithm: RuliadParityTrainingAlgorithm,
 ) -> String {
     let spec = RULIAD_PARITY_1M_SPEC;
     let random_scaffold_config = if random_scaffold {
@@ -746,6 +791,26 @@ trainable_gain = true
         )
     } else {
         String::new()
+    };
+    let local_predictive_coding_config = match training_algorithm {
+        RuliadParityTrainingAlgorithm::Backpropagation => String::new(),
+        RuliadParityTrainingAlgorithm::PredictiveCoding => r#"
+[training.local_predictive_coding]
+solver = "fixed_prediction"
+learning_schedule = "equilibrium"
+prediction_precision = 1.0
+factor_reduction = "sum"
+sync_diagnostics = false
+
+[training.local_predictive_coding.inference]
+steps = 1
+step_size = 0.05
+latent_decay = 0.0
+max_grad_norm = 1.0
+gradient_norm_scope = "per_row"
+eps = 1.0e-8
+"#
+        .to_string(),
     };
     format!(
         r#"
@@ -766,12 +831,17 @@ n_embd = {}
 n_head = {}
 latent_total = {}
 dropout = 0.0
+tie_input_output_embeddings = false
+residual_connector = "vanilla"
+rotary_embedding = "alibi"
+sequence_kernel = {{ memory_system = "linear_attention", executor = "dense_score_short_context" }}
 
 {}
 [model.language_head]
 type = "standard_token_classification"
 
 [training]
+algorithm = "{}"
 block_size = {}
 batch_size = {}
 max_iters = {}
@@ -780,6 +850,8 @@ checkpoint_interval_iters = 144
 log_frequency = 1
 seed = {}
 tbptt_persist_across_steps = false
+
+{}
 
 [training.ruliad_supervision]
 mode = "full_document"
@@ -805,11 +877,13 @@ prompt = ""
         spec.n_head,
         spec.latent_total,
         random_scaffold_config,
+        training_algorithm.as_str(),
         spec.block_size,
-        spec.batch_size,
+        batch_size,
         max_iters,
         gradient_accumulation_steps,
         seed,
+        local_predictive_coding_config,
     )
 }
 
@@ -819,6 +893,7 @@ fn write_ruliad_parity_training_config(
     max_iters: usize,
     minimum_train_samples: usize,
     random_scaffold: bool,
+    training_algorithm: RuliadParityTrainingAlgorithm,
 ) -> PathBuf {
     let ruliad_config_path = root.join("ruliad-parity.toml");
     let training_config_path = root.join("ruliad-parity-training.toml");
@@ -833,8 +908,10 @@ fn write_ruliad_parity_training_config(
             &ruliad_config_path,
             seed,
             max_iters,
+            RULIAD_PARITY_1M_SPEC.batch_size,
             1,
             random_scaffold,
+            training_algorithm,
         ),
     );
     training_config_path
@@ -843,9 +920,9 @@ fn write_ruliad_parity_training_config(
 fn write_ruliad_synchronized_reference_config(
     root: &Path,
     seed: u64,
-    max_iters: usize,
-    gradient_accumulation_steps: usize,
+    peer_local_steps: usize,
     random_scaffold: bool,
+    training_algorithm: RuliadParityTrainingAlgorithm,
 ) -> PathBuf {
     let ruliad_config_path = root.join("ruliad-parity.toml");
     let training_config_path = root.join("ruliad-synchronized-reference-training.toml");
@@ -855,12 +932,68 @@ fn write_ruliad_synchronized_reference_config(
             &root.join("ruliad-synchronized-reference-cache"),
             &ruliad_config_path,
             seed,
-            max_iters,
-            gradient_accumulation_steps,
+            match training_algorithm {
+                RuliadParityTrainingAlgorithm::Backpropagation => peer_local_steps
+                    .checked_mul(3)
+                    .expect("synchronized backprop batch count"),
+                RuliadParityTrainingAlgorithm::PredictiveCoding => peer_local_steps,
+            },
+            match training_algorithm {
+                RuliadParityTrainingAlgorithm::Backpropagation => RULIAD_PARITY_1M_SPEC.batch_size,
+                RuliadParityTrainingAlgorithm::PredictiveCoding => RULIAD_PARITY_1M_SPEC
+                    .batch_size
+                    .checked_mul(3)
+                    .expect("synchronized predictive-coding batch size"),
+            },
+            match training_algorithm {
+                RuliadParityTrainingAlgorithm::Backpropagation => 3,
+                RuliadParityTrainingAlgorithm::PredictiveCoding => 1,
+            },
             random_scaffold,
+            training_algorithm,
         ),
     );
     training_config_path
+}
+
+#[test]
+fn predictive_coding_parity_configs_use_local_pc_without_gradient_accumulation() {
+    let root = tempdir().expect("parity config root");
+    let peer = write_ruliad_parity_training_config(
+        root.path(),
+        7,
+        2,
+        48,
+        false,
+        RuliadParityTrainingAlgorithm::PredictiveCoding,
+    );
+    let synchronized = write_ruliad_synchronized_reference_config(
+        root.path(),
+        7,
+        2,
+        false,
+        RuliadParityTrainingAlgorithm::PredictiveCoding,
+    );
+
+    let peer = burn_dragon_language::config::load_training_config(&[peer])
+        .expect("load peer PC parity config");
+    let synchronized = burn_dragon_language::config::load_training_config(&[synchronized])
+        .expect("load synchronized PC parity config");
+    assert_eq!(
+        peer.training.algorithm,
+        burn_dragon_language::config::TrainingAlgorithm::PredictiveCoding
+    );
+    assert_eq!(peer.training.gradient_accumulation_steps, 1);
+    assert_eq!(synchronized.training.gradient_accumulation_steps, 1);
+    assert_eq!(
+        synchronized.training.batch_size,
+        RULIAD_PARITY_1M_SPEC.batch_size * 3
+    );
+    assert_eq!(synchronized.training.max_iters, 2);
+    assert_eq!(
+        synchronized.training.local_predictive_coding.solver,
+        burn_dragon_language::config::LocalPredictiveCodingSolver::FixedPrediction
+    );
 }
 
 fn write_nca_smoke_training_config(root: &Path, spec: SmokeModelSpec) -> PathBuf {
@@ -1773,6 +1906,74 @@ fn load_reference_lease_batches(
         .expect("load reference lease batches")
 }
 
+fn concatenate_optional_cpu_parity_tensors(
+    batches: &[CpuParityBatch],
+    select: impl Fn(&CpuParityBatch) -> Option<Tensor<NativeCpuBackend, 2, Int>>,
+    field: &str,
+) -> Option<Tensor<NativeCpuBackend, 2, Int>> {
+    let tensors = batches.iter().map(select).collect::<Vec<_>>();
+    let present = tensors.iter().filter(|tensor| tensor.is_some()).count();
+    assert!(
+        present == 0 || present == tensors.len(),
+        "synchronized PC reference cannot concatenate mixed optional {field} tensors"
+    );
+    (present != 0).then(|| {
+        Tensor::cat(
+            tensors
+                .into_iter()
+                .map(|tensor| tensor.expect("all optional tensors are present"))
+                .collect(),
+            0,
+        )
+    })
+}
+
+fn concatenate_cpu_parity_batches(batches: &[CpuParityBatch]) -> CpuParityBatch {
+    assert!(
+        !batches.is_empty(),
+        "synchronized PC reference requires at least one peer batch"
+    );
+    assert!(
+        batches
+            .iter()
+            .all(|batch| batch.ruliad_policy_batch.is_none()),
+        "synchronized PC reference does not support host-side ruliad policy payloads"
+    );
+
+    let loss_mask = concatenate_optional_cpu_parity_tensors(
+        batches,
+        |batch| batch.loss_mask.clone(),
+        "loss-mask",
+    );
+    let summary_event_mask = concatenate_optional_cpu_parity_tensors(
+        batches,
+        |batch| batch.summary_event_mask.clone(),
+        "summary-event-mask",
+    );
+    let absolute_step = batches[0].absolute_step;
+    assert!(
+        batches
+            .iter()
+            .all(|batch| batch.absolute_step == absolute_step),
+        "synchronized PC reference cannot concatenate different absolute-step clocks"
+    );
+    CpuParityBatch {
+        inputs: Tensor::cat(
+            batches.iter().map(|batch| batch.inputs.clone()).collect(),
+            0,
+        ),
+        targets: Tensor::cat(
+            batches.iter().map(|batch| batch.targets.clone()).collect(),
+            0,
+        ),
+        loss_mask,
+        summary_event_mask,
+        ruliad_policy_batch: None,
+        absolute_step,
+        reset_stream_state: batches.iter().any(|batch| batch.reset_stream_state),
+    }
+}
+
 fn train_reference_lease(
     project: &CpuParityProject,
     model: CpuParityModel,
@@ -1815,6 +2016,7 @@ fn train_synchronized_reference_round(
     shard_cache: &ShardCache,
     expected_batches_per_peer: usize,
     inner_optimizer_state: Option<&StateBlob>,
+    training_algorithm: RuliadParityTrainingAlgorithm,
 ) -> ReferenceWindow {
     let peer_batches = leases
         .iter()
@@ -1835,12 +2037,26 @@ fn train_synchronized_reference_round(
         "synchronized reference requires the exact bounded batch count from every peer"
     );
 
-    let mut batches = Vec::with_capacity(expected_batches_per_peer * leases.len());
-    for step in 0..expected_batches_per_peer {
-        for peer in &peer_batches {
-            batches.push(peer[step].clone());
+    let batches = match training_algorithm {
+        RuliadParityTrainingAlgorithm::Backpropagation => {
+            let mut batches = Vec::with_capacity(expected_batches_per_peer * leases.len());
+            for step in 0..expected_batches_per_peer {
+                for peer in &peer_batches {
+                    batches.push(peer[step].clone());
+                }
+            }
+            batches
         }
-    }
+        RuliadParityTrainingAlgorithm::PredictiveCoding => (0..expected_batches_per_peer)
+            .map(|step| {
+                let step_batches = peer_batches
+                    .iter()
+                    .map(|peer| peer[step].clone())
+                    .collect::<Vec<_>>();
+                concatenate_cpu_parity_batches(&step_batches)
+            })
+            .collect(),
+    };
 
     let report = synchronized_project
         .run_inner_steps(
@@ -4975,6 +5191,7 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
     run_with_large_stack("ruliad-p2p-1m-parity", || {
         let _guard = native_swarm_test_guard();
         let seed_value = env_u64(P2P_PARITY_SEED_ENV, 1337);
+        let training_algorithm = RuliadParityTrainingAlgorithm::from_env();
         let rounds = positive_env_usize(P2P_PARITY_ROUNDS_ENV, 2);
         let replay_candidates = env_bool(P2P_PARITY_REPLAY_ENV, true);
         let run_sequential_reference = env_bool(P2P_PARITY_SEQUENTIAL_ENV, true);
@@ -5029,16 +5246,15 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
             peer_local_steps,
             exported_records,
             random_scaffold,
+            training_algorithm,
         );
         let synchronized_training_config_path = run_synchronized_reference.then(|| {
             write_ruliad_synchronized_reference_config(
                 root.path(),
                 seed_value,
-                peer_local_steps
-                    .checked_mul(3)
-                    .expect("synchronized reference batch count"),
-                3,
+                peer_local_steps,
                 random_scaffold,
+                training_algorithm,
             )
         });
         let shared_shard_root = root.path().join("shared-ruliad-shards");
@@ -5225,11 +5441,26 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
         }
         let training_contract_id = seed_prepared.manifests.training_contract_id.clone();
         let training_contract = seed_prepared.manifests.training_contract.clone();
+        if matches!(
+            training_algorithm,
+            RuliadParityTrainingAlgorithm::PredictiveCoding
+        ) {
+            assert!(
+                training_contract.extensions.contains_key(
+                    burn_dragon_p2p::config::DRAGON_LOCAL_PC_PROGRAM_CONTRACT_EXTENSION
+                ),
+                "predictive-coding parity must bind the local PC program into the signed training contract"
+            );
+        }
         let optimizer_state_policy = seed_prepared
             .manifests
             .training_contract
             .optimizer_state_policy
             .clone();
+        let synchronized_reference_persists_optimizer_state = matches!(
+            &optimizer_state_policy,
+            LocalOptimizerStatePolicy::PeerLocalPersistent
+        );
         let scheduler_state_policy = seed_prepared
             .manifests
             .training_contract
@@ -5365,8 +5596,9 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
             &provider_peer_ids,
         );
 
-        let oracle_genesis_digest = model_digest(&reference_project, &oracle_model);
-        let prepared_genesis_digest = model_digest(&reference_project, &initial_reference_model);
+        let independent_roundtrip_digest = model_digest(&reference_project, &oracle_model);
+        let independent_initialization_digest =
+            model_digest(&reference_project, &initial_reference_model);
         let genesis_digests = [
             seed.materialized_head_tensor_digest(&genesis_head)
                 .expect("seed genesis digest"),
@@ -5378,9 +5610,9 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
                 .expect("trainer c genesis digest"),
         ];
         eprintln!(
-            "p2p_1m_genesis_digests: prepared={} prepared_roundtrip={} seed={} trainer_b={} trainer_c={}",
-            prepared_genesis_digest.as_str(),
-            oracle_genesis_digest.as_str(),
+            "p2p_1m_genesis_digests: independent_init={} independent_roundtrip={} seed={} trainer_b={} trainer_c={}",
+            independent_initialization_digest.as_str(),
+            independent_roundtrip_digest.as_str(),
             genesis_digests[0].as_str(),
             genesis_digests[1].as_str(),
             genesis_digests[2].as_str(),
@@ -5429,8 +5661,23 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
                 bundle.genesis.payload.payload.tensor_digest
             );
         }
-        let prepared_genesis_matches_canonical = oracle_genesis_digest == canonical_genesis_digest;
+        // A process-local initialization is not a network synchronization boundary. The
+        // signed artifact is: every learner and every independent reference must load it
+        // before optimization. Keep the local comparison as a diagnostic so reports do not
+        // conflate a fresh RNG draw with a failed genesis synchronization.
+        let independent_runtime_initialization_matches_canonical =
+            independent_roundtrip_digest == canonical_genesis_digest;
         oracle_model = canonical_genesis_model;
+        let reference_genesis_digest = model_digest(&reference_project, &oracle_model);
+        let reference_initialized_from_canonical =
+            reference_genesis_digest == canonical_genesis_digest;
+        assert!(
+            reference_initialized_from_canonical,
+            "the independent convergence reference must start from the canonical network genesis"
+        );
+        let peer_genesis_tensors_match_canonical = genesis_digests
+            .iter()
+            .all(|digest| digest == &canonical_genesis_digest);
         let mut sequential_model = oracle_model.clone();
         let mut synchronized_model = synchronized_project.as_ref().map(|_| oracle_model.clone());
         let mut synchronized_inner_optimizer_state = None;
@@ -5933,13 +6180,27 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
                         &reference_microshard_plan,
                         &reference_shard_cache,
                         peer_local_steps,
-                        synchronized_inner_optimizer_state.as_ref(),
+                        synchronized_reference_persists_optimizer_state
+                            .then_some(synchronized_inner_optimizer_state.as_ref())
+                            .flatten(),
+                        training_algorithm,
                     );
                     let train_steps = metric_integer(&reference.stats, "train_steps");
+                    let expected_train_steps = match training_algorithm {
+                        RuliadParityTrainingAlgorithm::Backpropagation => {
+                            peer_local_steps.saturating_mul(3)
+                        }
+                        RuliadParityTrainingAlgorithm::PredictiveCoding => peer_local_steps,
+                    };
                     assert_eq!(
                         train_steps,
-                        peer_local_steps.saturating_mul(3) as i64,
-                        "synchronized reference must consume every peer batch exactly once"
+                        expected_train_steps as i64,
+                        "synchronized reference train-step accounting must match its optimizer semantics"
+                    );
+                    let optimizer_steps = metric_integer(&reference.stats, "optimizer_steps");
+                    assert_eq!(
+                        optimizer_steps, peer_local_steps as i64,
+                        "synchronized reference must perform one optimizer update per local-step index"
                     );
                     let model = round_trip_reference_model(
                         synchronized_project,
@@ -5950,11 +6211,14 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
                     );
                     let loss = validation_loss(synchronized_project, &model);
                     synchronized_model = Some(model);
-                    synchronized_inner_optimizer_state = reference.inner_optimizer_state;
-                    (loss, train_steps)
+                    synchronized_inner_optimizer_state =
+                        synchronized_reference_persists_optimizer_state
+                            .then_some(reference.inner_optimizer_state)
+                            .flatten();
+                    (loss, train_steps, optimizer_steps)
                 });
             let synchronized_loss =
-                synchronized_reference.map(|(validation_loss, _)| validation_loss);
+                synchronized_reference.map(|(validation_loss, _, _)| validation_loss);
 
             let promotion_started = Instant::now();
             let promoted_head = converge_three_peer_diffusion_round(
@@ -6122,9 +6386,9 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
                 "oracle_validation_loss": oracle_loss,
                 "sequential_validation_loss": sequential_loss,
                 "synchronized_validation_loss": synchronized_loss,
-                "synchronized_train_batches": synchronized_reference.map(|(_, train_steps)| train_steps),
-                "synchronized_optimizer_updates": synchronized_reference
-                    .map(|(_, train_steps)| train_steps / 3),
+                "synchronized_source_microbatches": synchronized_reference.map(|_| peer_local_steps.saturating_mul(3)),
+                "synchronized_train_batches": synchronized_reference.map(|(_, train_steps, _)| train_steps),
+                "synchronized_optimizer_updates": synchronized_reference.map(|(_, _, optimizer_steps)| optimizer_steps),
                 "canonical_tensor_digest": oracle_digest.as_str(),
                 "connected_peers": [
                     seed_telemetry.snapshot().connected_peers,
@@ -6241,9 +6505,10 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
             minimum_synchronized_progress_ratio,
         );
         let report = serde_json::json!({
-            "schema_version": 6,
+            "schema_version": 7,
             "seed": seed_value,
             "backend": "ndarray-cpu-release",
+            "training_algorithm": training_algorithm.as_str(),
             "peer_count": 3,
             "round_count": rounds,
             "candidate_replay_enabled": replay_candidates,
@@ -6294,6 +6559,15 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
             },
             "work": {
                 "peer_local_steps_per_round": peer_local_steps,
+                "peer_batch_size": RULIAD_PARITY_1M_SPEC.batch_size,
+                "synchronized_batch_size": match training_algorithm {
+                    RuliadParityTrainingAlgorithm::Backpropagation => RULIAD_PARITY_1M_SPEC.batch_size,
+                    RuliadParityTrainingAlgorithm::PredictiveCoding => RULIAD_PARITY_1M_SPEC.batch_size * 3,
+                },
+                "synchronized_gradient_accumulation_steps": match training_algorithm {
+                    RuliadParityTrainingAlgorithm::Backpropagation => 3,
+                    RuliadParityTrainingAlgorithm::PredictiveCoding => 1,
+                },
                 "records_per_round": records_per_round,
                 "exported_records": exported_records,
                 "micro_epoch_selection": reference_partitioning,
@@ -6319,9 +6593,27 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
                     (peer_local_steps * 3 * rounds) as f64 / total_training_secs,
             },
             "training_contract_id": training_contract_id.as_str(),
+            "training_contract": {
+                "objective_hash": training_contract.objective_hash.as_str(),
+                "preprocessing_hash": training_contract.preprocessing_hash.as_str(),
+                "optimizer_hash": training_contract.optimizer_hash.as_str(),
+                "recurrent_state_policy": &training_contract.recurrent_state_policy,
+                "extensions": &training_contract.extensions,
+            },
             "dataset_view_id": experiment_entry.dataset_view_id.as_str(),
             "genesis_validation_loss": genesis_loss,
-            "prepared_genesis_matches_canonical": prepared_genesis_matches_canonical,
+            // Retained for report-reader compatibility; this now describes the prepared
+            // convergence reference after the mandatory canonical-artifact load.
+            "prepared_genesis_matches_canonical": reference_initialized_from_canonical,
+            "genesis_consensus": {
+                "reference_initialized_from_canonical": reference_initialized_from_canonical,
+                "peer_tensors_match_canonical": peer_genesis_tensors_match_canonical,
+                "independent_runtime_initialization_matches_canonical":
+                    independent_runtime_initialization_matches_canonical,
+                "independent_initialization_digest": independent_initialization_digest.as_str(),
+                "independent_roundtrip_digest": independent_roundtrip_digest.as_str(),
+                "canonical_tensor_digest": canonical_genesis_digest.as_str(),
+            },
             "p2p_validation_losses": p2p_validation_losses,
             "oracle_validation_losses": oracle_validation_losses,
             "sequential_validation_losses": sequential_validation_losses,
@@ -6337,7 +6629,9 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
                         .then_some(synchronized_convergence_parity),
                 },
                 "synchronized_reference": {
-                    "kind": "centralized_same_examples_same_optimizer_update_count_gradient_accumulation_3",
+                    "kind": training_algorithm.synchronized_reference_kind(),
+                    "optimizer_state_persistent":
+                        synchronized_reference_persists_optimizer_state,
                     "final_loss": synchronized_final_loss,
                     "loss_reduction": synchronized_loss_reduction,
                     "p2p_to_reference_progress_ratio": p2p_to_synchronized_progress_ratio,
@@ -6357,6 +6651,8 @@ fn ruliad_native_runtime_1m_convergence_matches_federated_oracle() {
             "gates": {
                 "shared_training_contract": true,
                 "shared_dataset_view": true,
+                "canonical_genesis_loaded_by_reference": reference_initialized_from_canonical,
+                "canonical_genesis_loaded_by_all_peers": peer_genesis_tensors_match_canonical,
                 "disjoint_nonempty_leases": true,
                 "bounded_window_rotating_micro_epochs": true,
                 "bounded_stream_segments_balanced_across_shards": true,
@@ -6419,6 +6715,7 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
     run_with_large_stack("ruliad-p2p-1m-diloco", || {
         let _guard = native_swarm_test_guard();
         let seed_value = env_u64(P2P_PARITY_SEED_ENV, 1337);
+        let training_algorithm = RuliadParityTrainingAlgorithm::from_env();
         let rounds = positive_env_usize(P2P_PARITY_ROUNDS_ENV, 6);
         let peer_local_steps = positive_env_usize(P2P_PARITY_LOCAL_STEPS_ENV, 1);
         let random_scaffold = env_bool(P2P_PARITY_RANDOM_SCAFFOLD_ENV, false);
@@ -6451,15 +6748,14 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
             peer_local_steps,
             exported_records,
             random_scaffold,
+            training_algorithm,
         );
         let synchronized_training_config_path = write_ruliad_synchronized_reference_config(
             root.path(),
             seed_value,
-            peer_local_steps
-                .checked_mul(3)
-                .expect("synchronized reference batch count"),
-            3,
+            peer_local_steps,
             random_scaffold,
+            training_algorithm,
         );
         let shared_shard_root = root.path().join("shared-ruliad-shards");
         let deterministic_peer_ids = ["seed", "trainer-b", "trainer-c"].map(|role| {
@@ -6598,6 +6894,21 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
                 .scheduler_state_policy,
             SchedulerStatePolicy::PeerLocalPersistent
         );
+        if matches!(
+            training_algorithm,
+            RuliadParityTrainingAlgorithm::PredictiveCoding
+        ) {
+            assert!(
+                seed_prepared
+                    .manifests
+                    .training_contract
+                    .extensions
+                    .contains_key(
+                        burn_dragon_p2p::config::DRAGON_LOCAL_PC_PROGRAM_CONTRACT_EXTENSION
+                    ),
+                "DiLoCo PC must bind its executable local-learning program into the training contract"
+            );
+        }
         let trainer_b_prepared = prepare_ruliad_native_cpu(
             &make_trainer_config("trainer-b", false),
             Some(&dummy_auth_bundle()),
@@ -7040,11 +7351,17 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
                 &reference_shard_cache,
                 peer_local_steps,
                 synchronized_inner_optimizer_state.as_ref(),
+                training_algorithm,
             );
             let synchronized_elapsed = synchronized_started.elapsed();
             assert_eq!(
                 metric_integer(&synchronized.stats, "train_steps"),
-                peer_local_steps.saturating_mul(3) as i64
+                match training_algorithm {
+                    RuliadParityTrainingAlgorithm::Backpropagation => {
+                        peer_local_steps.saturating_mul(3) as i64
+                    }
+                    RuliadParityTrainingAlgorithm::PredictiveCoding => peer_local_steps as i64,
+                }
             );
             assert_eq!(
                 metric_integer(&synchronized.stats, "optimizer_steps"),
@@ -7270,6 +7587,7 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
             "schema_version": 5,
             "experiment": "dragon_ruliad_1m_three_peer_diloco",
             "seed": seed_value,
+            "training_algorithm": training_algorithm.as_str(),
             "backend": "ndarray-cpu",
             "build_profile": build_profile,
             "identity_fixture": "sha256-seed-role-ed25519-v1",
@@ -7302,7 +7620,12 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
                 "diloco_outer_updates": rounds,
                 "synchronized_optimizer_updates": peer_local_steps.saturating_mul(rounds),
                 "synchronized_microbatches_per_optimizer_update": 3,
-                "synchronized_reference_semantics": "AdamW on gradients accumulated over the same three peer microbatches at each local-step index",
+                "synchronized_reference_semantics": match training_algorithm {
+                    RuliadParityTrainingAlgorithm::Backpropagation =>
+                        "AdamW on gradients accumulated over the same three peer microbatches at each local-step index",
+                    RuliadParityTrainingAlgorithm::PredictiveCoding =>
+                        "exact local-PC derivatives on one concatenated three-peer batch per local-step index, transformed by AdamW",
+                },
                 "inner_optimizer_state_semantics": "peer-local Burn optimizer and scheduler records persist across rounds; state is not transmitted with model updates",
                 "data_supervision": {
                     "batch_count": total_batch_count,
@@ -7380,7 +7703,10 @@ fn ruliad_native_runtime_1m_diloco_matches_protocol_oracle() {
         let report_root = env_path(P2P_DILOCO_REPORT_ROOT_ENV)
             .unwrap_or_else(|| PathBuf::from("target/test-artifacts/p2p-diloco-convergence"));
         fs::create_dir_all(&report_root).expect("create DiLoCo report root");
-        let report_path = report_root.join(format!("seed-{seed_value}-{policy_slug}.json"));
+        let report_path = report_root.join(format!(
+            "seed-{seed_value}-{}-{policy_slug}.json",
+            training_algorithm.as_str()
+        ));
         fs::write(
             &report_path,
             serde_json::to_vec_pretty(&report).expect("serialize DiLoCo report"),

@@ -1,5 +1,5 @@
 use burn::tensor::{Int, Tensor, backend::Backend};
-use burn_dragon_core::DragonModel;
+use burn_dragon_core::{DragonModel, DragonPredictiveCodingSequenceScoreHeadVjp};
 
 /// Criterion data clamped at Dragon's terminal factor.
 ///
@@ -25,6 +25,14 @@ pub(crate) enum LocalPcTerminalCriterion<B: Backend> {
         row_weights: Tensor<B, 1>,
         eps: f32,
     },
+    SequenceEnergySetAtPositions {
+        prompt_positions: Tensor<B, 1, Int>,
+        terminal_positions: Tensor<B, 1, Int>,
+        valid_action_mask: Tensor<B, 2>,
+        row_weights: Tensor<B, 1>,
+        candidates_per_group: usize,
+        eps: f32,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +48,7 @@ pub(super) struct LocalPcTerminalParameterFactor<B: Backend> {
     pub loss: Tensor<B, 1>,
     pub grad_hidden: Tensor<B, 3>,
     pub grad_lm_head: Tensor<B, 2>,
+    pub grad_sequence_score_head: Option<DragonPredictiveCodingSequenceScoreHeadVjp<B>>,
     pub supervised_tokens: Tensor<B, 1>,
     pub verifier_probability_mass: Option<Tensor<B, 1>>,
 }
@@ -118,7 +127,67 @@ where
                         / normalization,
                 )
             }
+            Self::SequenceEnergySetAtPositions { .. } => None,
         }
+    }
+
+    /// Evaluate a verifier objective from the shared hidden trajectory.
+    ///
+    /// Sequence energy is defined before the vocabulary projection, while
+    /// completion likelihood reuses the ordinary token-logit objective. This
+    /// method is diagnostic-only for PC and the global-backprop training arm;
+    /// exact PC uses the analytic VJP below.
+    pub(crate) fn verifier_autodiff_loss_from_hidden(
+        &self,
+        model: &DragonModel<B>,
+        hidden: Tensor<B, 3>,
+    ) -> Option<Tensor<B, 1>> {
+        let Self::SequenceEnergySetAtPositions {
+            prompt_positions,
+            terminal_positions,
+            valid_action_mask,
+            row_weights,
+            candidates_per_group,
+            eps,
+        } = self
+        else {
+            return self.verifier_autodiff_loss(model.predictive_coding_logits(hidden));
+        };
+        let [rows, _time, dim] = hidden.shape().dims::<3>();
+        let candidates = (*candidates_per_group).max(1);
+        assert!(rows.is_multiple_of(candidates));
+        let groups = rows / candidates;
+        let prompt_hidden = hidden.clone().gather(
+            1,
+            prompt_positions
+                .clone()
+                .reshape([rows, 1, 1])
+                .repeat_dim(2, dim),
+        );
+        let terminal_hidden = hidden.gather(
+            1,
+            terminal_positions
+                .clone()
+                .reshape([rows, 1, 1])
+                .repeat_dim(2, dim),
+        );
+        let scores = model
+            .sequence_scores_from_hidden_pair(prompt_hidden, terminal_hidden)?
+            .reshape([groups, candidates]);
+        let log_probability = burn_pc::categorical_conditional_set_log_probabilities(
+            scores,
+            Tensor::ones([groups, candidates], &row_weights.device()),
+            valid_action_mask.clone(),
+            *eps,
+        );
+        let normalization = row_weights.clone().sum().reshape([1]).clamp_min(*eps);
+        Some(
+            (log_probability * row_weights.clone())
+                .sum()
+                .reshape([1])
+                .mul_scalar(-1.0)
+                / normalization,
+        )
     }
 
     pub(super) fn activity_factor(
@@ -211,6 +280,81 @@ where
                     verifier_probability_mass: Some(factor.conditional_probability_mass),
                 }
             }
+            Self::SequenceEnergySetAtPositions {
+                prompt_positions,
+                terminal_positions,
+                valid_action_mask,
+                row_weights,
+                candidates_per_group,
+                eps,
+            } => {
+                let [rows, time, dim] = hidden.shape().dims::<3>();
+                let candidates = (*candidates_per_group).max(1);
+                assert!(rows.is_multiple_of(candidates));
+                let groups = rows / candidates;
+                assert_eq!(prompt_positions.shape().dims::<1>(), [rows]);
+                assert_eq!(terminal_positions.shape().dims::<1>(), [rows]);
+                assert_eq!(valid_action_mask.shape().dims::<2>(), [groups, candidates]);
+                assert_eq!(row_weights.shape().dims::<1>(), [groups]);
+                let prompt_hidden = hidden
+                    .clone()
+                    .gather(
+                        1,
+                        prompt_positions
+                            .clone()
+                            .reshape([rows, 1, 1])
+                            .repeat_dim(2, dim),
+                    )
+                    .reshape([rows, dim]);
+                let terminal_hidden = hidden
+                    .gather(
+                        1,
+                        terminal_positions
+                            .clone()
+                            .reshape([rows, 1, 1])
+                            .repeat_dim(2, dim),
+                    )
+                    .reshape([rows, dim]);
+                let scores = model
+                    .predictive_coding_sequence_scores(
+                        prompt_hidden.clone(),
+                        terminal_hidden.clone(),
+                    )
+                    .expect("validated sequence score head")
+                    .reshape([groups, candidates]);
+                let factor = burn_pc::categorical_conditional_set_nll(
+                    scores,
+                    Tensor::ones([groups, candidates], &prompt_hidden.device()),
+                    valid_action_mask.clone(),
+                    row_weights.clone(),
+                    *eps,
+                );
+                let vjp = model
+                    .predictive_coding_sequence_score_vjp(
+                        prompt_hidden,
+                        terminal_hidden,
+                        factor.grad_logits.reshape([rows]),
+                    )
+                    .expect("validated sequence score VJP");
+                let prompt_mask = prompt_positions
+                    .clone()
+                    .one_hot::<2>(time)
+                    .float()
+                    .reshape([rows, time, 1]);
+                let terminal_mask = terminal_positions
+                    .clone()
+                    .one_hot::<2>(time)
+                    .float()
+                    .reshape([rows, time, 1]);
+                let grad_hidden = vjp.grad_prompt_hidden.reshape([rows, 1, dim]) * prompt_mask
+                    + vjp.grad_terminal_hidden.reshape([rows, 1, dim]) * terminal_mask;
+                LocalPcTerminalActivityFactor {
+                    loss: factor.loss,
+                    grad_hidden,
+                    normalization: factor.normalization,
+                    verifier_probability_mass: Some(factor.conditional_probability_mass),
+                }
+            }
         }
     }
 
@@ -227,6 +371,7 @@ where
                     loss: factor.loss,
                     grad_hidden: factor.grad_hidden,
                     grad_lm_head: factor.grad_lm_head,
+                    grad_sequence_score_head: None,
                     supervised_tokens: factor.supervised_tokens,
                     verifier_probability_mass: None,
                 }
@@ -261,6 +406,7 @@ where
                     loss: factor.loss,
                     grad_hidden: vjp.grad_hidden,
                     grad_lm_head: vjp.grad_lm_head,
+                    grad_sequence_score_head: None,
                     supervised_tokens: factor.normalization,
                     verifier_probability_mass: Some(factor.conditional_probability_mass),
                 }
@@ -303,6 +449,89 @@ where
                     loss: factor.loss,
                     grad_hidden,
                     grad_lm_head,
+                    grad_sequence_score_head: None,
+                    supervised_tokens: factor.normalization,
+                    verifier_probability_mass: Some(factor.conditional_probability_mass),
+                }
+            }
+            Self::SequenceEnergySetAtPositions {
+                prompt_positions,
+                terminal_positions,
+                valid_action_mask,
+                row_weights,
+                candidates_per_group,
+                eps,
+            } => {
+                let [rows, time, dim] = hidden.shape().dims::<3>();
+                let candidates = (*candidates_per_group).max(1);
+                assert!(rows.is_multiple_of(candidates));
+                let groups = rows / candidates;
+                assert_eq!(prompt_positions.shape().dims::<1>(), [rows]);
+                assert_eq!(terminal_positions.shape().dims::<1>(), [rows]);
+                assert_eq!(valid_action_mask.shape().dims::<2>(), [groups, candidates]);
+                assert_eq!(row_weights.shape().dims::<1>(), [groups]);
+                let prompt_hidden = hidden
+                    .clone()
+                    .gather(
+                        1,
+                        prompt_positions
+                            .clone()
+                            .reshape([rows, 1, 1])
+                            .repeat_dim(2, dim),
+                    )
+                    .reshape([rows, dim]);
+                let terminal_hidden = hidden
+                    .clone()
+                    .gather(
+                        1,
+                        terminal_positions
+                            .clone()
+                            .reshape([rows, 1, 1])
+                            .repeat_dim(2, dim),
+                    )
+                    .reshape([rows, dim]);
+                let scores = model
+                    .predictive_coding_sequence_scores(
+                        prompt_hidden.clone(),
+                        terminal_hidden.clone(),
+                    )
+                    .expect("validated sequence score head")
+                    .reshape([groups, candidates]);
+                let factor = burn_pc::categorical_conditional_set_nll(
+                    scores,
+                    Tensor::ones([groups, candidates], &hidden.device()),
+                    valid_action_mask.clone(),
+                    row_weights.clone(),
+                    *eps,
+                );
+                let vjp = model
+                    .predictive_coding_sequence_score_vjp(
+                        prompt_hidden,
+                        terminal_hidden,
+                        factor.grad_logits.clone().reshape([rows]),
+                    )
+                    .expect("validated sequence score VJP");
+                let prompt_mask = prompt_positions
+                    .clone()
+                    .one_hot::<2>(time)
+                    .float()
+                    .reshape([rows, time, 1]);
+                let terminal_mask = terminal_positions
+                    .clone()
+                    .one_hot::<2>(time)
+                    .float()
+                    .reshape([rows, time, 1]);
+                let grad_hidden = vjp.grad_prompt_hidden.clone().reshape([rows, 1, dim])
+                    * prompt_mask
+                    + vjp.grad_terminal_hidden.clone().reshape([rows, 1, dim]) * terminal_mask;
+                LocalPcTerminalParameterFactor {
+                    loss: factor.loss,
+                    grad_hidden,
+                    grad_lm_head: model
+                        .predictive_coding_head_weight()
+                        .expect("validated flat PC head")
+                        .zeros_like(),
+                    grad_sequence_score_head: Some(vjp),
                     supervised_tokens: factor.normalization,
                     verifier_probability_mass: Some(factor.conditional_probability_mass),
                 }

@@ -1404,6 +1404,16 @@ fn try_lowrank_grad_input_cuda_direct<B: BackendTrait>(
 where
     B::FloatTensorPrimitive: 'static,
 {
+    // `AlignedMatmul` is an explicit request for the backend's tensorized
+    // matmul path. Do not silently preempt it with the CUDA source kernel;
+    // this selector is also used for controlled kernel-vs-GEMM ablations.
+    if matches!(
+        shape.grad_input_executor,
+        LowrankGradInputExecutor::AlignedMatmul
+    ) {
+        return None;
+    }
+
     #[cfg(not(feature = "cuda"))]
     {
         let _ = grad_projected;

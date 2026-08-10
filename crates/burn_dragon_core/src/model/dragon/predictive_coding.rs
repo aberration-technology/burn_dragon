@@ -3,10 +3,64 @@ use crate::model::norm::DragonNormVjp;
 use crate::model::residual_stream::lowrank_residual_step_with_metrics_branch_thresholds_relu_native;
 use burn::module::ParamId;
 use burn::tensor::TensorPrimitive;
-use burn_dragon_kernel::api::attention::dense_causal_attention_vjp_with_initial_rho;
+use burn_dragon_kernel::api::attention::{
+    dense_causal_attention_final_rho_input_vjp, dense_causal_attention_final_rho_vjp,
+    dense_causal_attention_input_vjp_with_initial_rho,
+};
 use burn_dragon_kernel::api::projection::{
     relu_lowrank_input_vjp_from_activation, relu_lowrank_vjp_from_activation,
 };
+use std::sync::{Mutex, OnceLock};
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DragonPredictiveCodingVjpProfileSnapshot {
+    pub calls: u64,
+    pub residual_norm_ns: u128,
+    pub decoder_ns: u128,
+    pub y_projection_ns: u128,
+    pub attention_norm_ns: u128,
+    pub attention_ns: u128,
+    pub x_projection_ns: u128,
+    pub assemble_ns: u128,
+}
+
+static DRAGON_PC_VJP_PROFILE: OnceLock<Mutex<DragonPredictiveCodingVjpProfileSnapshot>> =
+    OnceLock::new();
+
+pub fn dragon_predictive_coding_vjp_profile_reset() {
+    if let Ok(mut profile) = DRAGON_PC_VJP_PROFILE
+        .get_or_init(|| Mutex::new(DragonPredictiveCodingVjpProfileSnapshot::default()))
+        .lock()
+    {
+        *profile = DragonPredictiveCodingVjpProfileSnapshot::default();
+    }
+}
+
+pub fn dragon_predictive_coding_vjp_profile_snapshot() -> DragonPredictiveCodingVjpProfileSnapshot {
+    DRAGON_PC_VJP_PROFILE
+        .get_or_init(|| Mutex::new(DragonPredictiveCodingVjpProfileSnapshot::default()))
+        .lock()
+        .map(|profile| *profile)
+        .unwrap_or_default()
+}
+
+fn dragon_pc_vjp_detail_start<B: Backend>(device: &B::Device) -> Option<Instant> {
+    std::env::var_os("DragonModel_STAGE_PROFILE_DETAIL")
+        .is_some()
+        .then(|| {
+            let _ = B::sync(device);
+            Instant::now()
+        })
+}
+
+fn dragon_pc_vjp_detail_finish<B: Backend>(started: Option<Instant>, device: &B::Device) -> u128 {
+    started
+        .map(|started| {
+            let _ = B::sync(device);
+            started.elapsed().as_nanos()
+        })
+        .unwrap_or(0)
+}
 
 /// Exact subset of Dragon currently covered by the plain-backend local VJPs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +83,17 @@ pub struct DragonPredictiveCodingParameterIds {
     pub norm_alpha: ParamId,
     pub norm_shift: ParamId,
     pub lm_head: ParamId,
+    pub sequence_score_head: Option<DragonPredictiveCodingSequenceScoreHeadParameterIds>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DragonPredictiveCodingSequenceScoreHeadParameterIds {
+    pub query_weight: ParamId,
+    pub query_bias: ParamId,
+    pub candidate_weight: ParamId,
+    pub candidate_bias: ParamId,
+    pub score_weight: ParamId,
+    pub score_bias: ParamId,
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +102,10 @@ pub struct DragonPredictiveCodingLayerTrace<B: Backend> {
     /// Clamped rho entering this layer factor. `None` is the all-zero initial
     /// state used by a stateless block.
     pub initial_rho: Option<Tensor<B, 4>>,
+    /// Recurrent state produced by the same attention execution that emitted
+    /// `attention_pre_norm`. Retaining this avoids a second forward reduction
+    /// when the next TBPTT chunk is prepared.
+    pub terminal_rho: Tensor<B, 4>,
     pub attention_pre_norm: Tensor<B, 4>,
     pub attention_readout: Tensor<B, 4>,
     pub residual_pre_norm: Tensor<B, 4>,
@@ -50,6 +119,9 @@ pub struct DragonPredictiveCodingLayerTrace<B: Backend> {
 #[derive(Debug, Clone)]
 pub struct DragonPredictiveCodingLayerVjp<B: Backend> {
     pub grad_input: Tensor<B, 4>,
+    /// Adjoint of the clamped recurrent state entering this chunk. It is
+    /// intentionally exposed even when a TBPTT caller elects to detach it.
+    pub grad_initial_rho: Option<Tensor<B, 4>>,
     pub grad_encoder: Tensor<B, 3>,
     pub grad_encoder_v: Tensor<B, 3>,
     pub grad_decoder: Tensor<B, 2>,
@@ -57,6 +129,19 @@ pub struct DragonPredictiveCodingLayerVjp<B: Backend> {
     pub grad_norm_beta: Tensor<B, 1>,
     pub grad_norm_alpha: Tensor<B, 1>,
     pub grad_norm_shift: Tensor<B, 1>,
+}
+
+/// VJP from a retained terminal rho state through one Dragon layer factor.
+///
+/// Only the query encoder and layer input contribute to the state transition;
+/// the value encoder, decoder, and post-attention normalizations are not on
+/// this path.
+#[derive(Debug, Clone)]
+pub struct DragonPredictiveCodingStateVjp<B: Backend> {
+    pub grad_input: Tensor<B, 4>,
+    pub grad_initial_rho: Option<Tensor<B, 4>>,
+    pub grad_encoder: Tensor<B, 3>,
+    pub grad_decay: Tensor<B, 1>,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +183,19 @@ pub struct DragonPredictiveCodingHeadActivityVjp<B: Backend> {
 pub struct DragonPredictiveCodingLogitsVjp<B: Backend> {
     pub grad_hidden: Tensor<B, 3>,
     pub grad_lm_head: Tensor<B, 2>,
+}
+
+/// Exact VJP for Dragon's optional query-candidate sequence energy head.
+#[derive(Debug, Clone)]
+pub struct DragonPredictiveCodingSequenceScoreHeadVjp<B: Backend> {
+    pub grad_prompt_hidden: Tensor<B, 2>,
+    pub grad_terminal_hidden: Tensor<B, 2>,
+    pub grad_query_weight: Tensor<B, 2>,
+    pub grad_query_bias: Tensor<B, 1>,
+    pub grad_candidate_weight: Tensor<B, 2>,
+    pub grad_candidate_bias: Tensor<B, 1>,
+    pub grad_score_weight: Tensor<B, 2>,
+    pub grad_score_bias: Tensor<B, 1>,
 }
 
 impl<B: Backend> DragonModel<B>
@@ -142,10 +240,15 @@ where
             return Err("local PC requires the flat language-model head".into());
         }
         if self.sequence_kernel.memory_system != SequenceMemorySystem::LinearAttention
-            || self.sequence_kernel.executor != SequenceTrainingExecutor::DenseScoreShortContext
+            || !matches!(
+                self.sequence_kernel.executor,
+                SequenceTrainingExecutor::Reference
+                    | SequenceTrainingExecutor::DenseScoreShortContext
+            )
         {
             return Err(
-                "local PC currently requires linear_attention+dense_score_short_context".into(),
+                "local PC currently requires a linear-attention reference or dense-score executor"
+                    .into(),
             );
         }
         if self.kernel.rotary_embedding != crate::RotaryEmbedding::Alibi {
@@ -171,7 +274,7 @@ where
         Ok(DragonPredictiveCodingSupport {
             layers: self.n_layer,
             shared_parameter_tensors: 3,
-            head_parameter_tensors: 1,
+            head_parameter_tensors: 1 + usize::from(self.sequence_score_head.is_some()) * 6,
             normalization_parameter_tensors: 4,
             embedding_parameter_tensors: 1,
         })
@@ -182,6 +285,21 @@ where
     ) -> Result<DragonPredictiveCodingParameterIds, String> {
         self.predictive_coding_support()?;
         let (norm_gamma, norm_beta, norm_alpha, norm_shift) = self.norm.parameter_ids();
+        let sequence_score_head = self.sequence_score_head.as_ref().map(|head| {
+            DragonPredictiveCodingSequenceScoreHeadParameterIds {
+                query_weight: head.query.weight.id,
+                query_bias: head.query.bias.as_ref().expect("sequence query bias").id,
+                candidate_weight: head.candidate.weight.id,
+                candidate_bias: head
+                    .candidate
+                    .bias
+                    .as_ref()
+                    .expect("sequence candidate bias")
+                    .id,
+                score_weight: head.score.weight.id,
+                score_bias: head.score.bias.as_ref().expect("sequence score bias").id,
+            }
+        });
         Ok(DragonPredictiveCodingParameterIds {
             embedding: self.embed.weight.id,
             encoder: self.encoder.id,
@@ -192,6 +310,7 @@ where
             norm_alpha,
             norm_shift,
             lm_head: self.lm_head.as_ref().expect("validated flat LM head").id,
+            sequence_score_head,
         })
     }
 
@@ -277,57 +396,70 @@ where
         }
     }
 
-    fn predictive_coding_dense_attention(
+    fn predictive_coding_attention(
         &self,
         query: Tensor<B, 4>,
         value: Tensor<B, 4>,
         initial_rho: Option<Tensor<B, 4>>,
-    ) -> Tensor<B, 4> {
+    ) -> RecurrentAttentionOutput<B> {
         let decay = self
             .attention
             .alibi_decay()
             .expect("validated local PC ALiBi decay");
+        if self.sequence_kernel.executor == SequenceTrainingExecutor::Reference {
+            if self.kernel.enabled
+                && self.kernel.wgpu_recurrent_kernel
+                && supports_recurrent_backend::<B>()
+                && let Some(output) = try_fused_recurrent_attention_wgpu(
+                    &query,
+                    &value,
+                    initial_rho.as_ref(),
+                    Some(&decay),
+                )
+            {
+                return output;
+            }
+            let (context, rho) =
+                self.recurrent_attention_reference(query, value, initial_rho, Some(decay));
+            return RecurrentAttentionOutput { context, rho };
+        }
+
         if self.kernel.enabled
             && self.kernel.wgpu_rollout_fused
             && supports_dense_causal_attention_backend::<B>()
             && let Some(output) = try_fused_dense_causal_attention_wgpu(&query, &value, &decay)
         {
-            return match initial_rho {
+            let context = match initial_rho.clone() {
                 Some(rho) => {
                     let value_dim = value.shape().dims::<4>()[3];
                     output
                         + self.recurrent_attention_dense_score_initial_context_reference(
-                            query,
+                            query.clone(),
                             Some(rho),
-                            Some(decay),
+                            Some(decay.clone()),
                             value_dim,
                         )
                 }
                 None => output,
             };
+            let rho = self.recurrent_attention_dense_score_final_rho_reference(
+                query,
+                value,
+                initial_rho,
+                Some(decay),
+            );
+            return RecurrentAttentionOutput { context, rho };
         }
-        self.recurrent_attention_dense_score_context_reference(
-            query,
-            value,
-            initial_rho,
-            Some(decay),
-        )
+        let (context, rho) =
+            self.recurrent_attention_dense_score_reference(query, value, initial_rho, Some(decay));
+        RecurrentAttentionOutput { context, rho }
     }
 
     pub fn predictive_coding_terminal_rho(
         &self,
         trace: &DragonPredictiveCodingLayerTrace<B>,
     ) -> Tensor<B, 4> {
-        let decay = self
-            .attention
-            .alibi_decay()
-            .expect("validated local PC ALiBi decay");
-        self.recurrent_attention_dense_score_final_rho_reference(
-            trace.x_neuron.clone(),
-            trace.input.clone(),
-            trace.initial_rho.clone(),
-            Some(decay),
-        )
+        trace.terminal_rho.clone()
     }
 
     pub fn predictive_coding_neuron_dim_per_head(&self) -> Result<usize, String> {
@@ -543,6 +675,7 @@ where
         let (encoder, encoder_v, decoder, latent) = self.layer_lowrank_weights(layer_index);
         let latent_pattern = &self.kernel.block_sparse.latent;
         let sparse_mask = self.predictive_coding_neuron_mask(latent, &input.device(), context_mask);
+        let mut terminal_rho = None;
         let output = lowrank_residual_step_with_metrics_branch_thresholds_relu_native(
             input.clone(),
             encoder,
@@ -558,7 +691,9 @@ where
             self.kernel.lowrank_grad_input_executor,
             sparse_mask,
             |query, value| {
-                self.predictive_coding_dense_attention(query, value, initial_rho.clone())
+                let output = self.predictive_coding_attention(query, value, initial_rho.clone());
+                terminal_rho = Some(output.rho);
+                output.context
             },
             activation::relu,
             |values| self.predictive_coding_masked_norm(values, activity_mask.as_ref()),
@@ -566,6 +701,7 @@ where
         DragonPredictiveCodingLayerTrace {
             input,
             initial_rho,
+            terminal_rho: terminal_rho.expect("attention closure emits terminal rho"),
             attention_pre_norm: output
                 .attention_pre_norm
                 .expect("full low-rank output retains pre-normalization attention"),
@@ -591,7 +727,27 @@ where
         trace: &DragonPredictiveCodingLayerTrace<B>,
         grad_next: Tensor<B, 4>,
     ) -> DragonPredictiveCodingLayerVjp<B> {
-        self.predictive_coding_layer_vjp_impl(layer_index, trace, grad_next, None, None)
+        self.predictive_coding_layer_vjp_impl(layer_index, trace, grad_next, None, None, None)
+    }
+
+    /// Fused VJP for a layer output and its retained terminal rho state.
+    /// Both cotangents share one query-projection VJP, avoiding a redundant
+    /// low-rank traversal in exact temporal-credit windows.
+    pub fn predictive_coding_layer_vjp_with_terminal_rho(
+        &self,
+        layer_index: usize,
+        trace: &DragonPredictiveCodingLayerTrace<B>,
+        grad_next: Tensor<B, 4>,
+        grad_terminal_rho: Tensor<B, 4>,
+    ) -> DragonPredictiveCodingLayerVjp<B> {
+        self.predictive_coding_layer_vjp_impl(
+            layer_index,
+            trace,
+            grad_next,
+            Some(grad_terminal_rho),
+            None,
+            None,
+        )
     }
 
     pub fn predictive_coding_layer_vjp_with_neuron_mask(
@@ -607,6 +763,7 @@ where
             layer_index,
             trace,
             grad_next,
+            None,
             Some(neuron_mask),
             None,
         )
@@ -628,6 +785,7 @@ where
             layer_index,
             trace,
             grad_next,
+            None,
             Some(neuron_mask),
             Some(activity_mask),
         )
@@ -638,6 +796,7 @@ where
         layer_index: usize,
         trace: &DragonPredictiveCodingLayerTrace<B>,
         grad_next: Tensor<B, 4>,
+        grad_terminal_rho: Option<Tensor<B, 4>>,
         context_mask: Option<Tensor<B, 4>>,
         activity_mask: Option<Tensor<B, 4>>,
     ) -> DragonPredictiveCodingLayerVjp<B> {
@@ -646,7 +805,10 @@ where
         let (encoder, encoder_v, decoder, latent) = self.layer_lowrank_weights(layer_index);
         let sparse_mask =
             self.predictive_coding_neuron_mask(latent, &trace.input.device(), context_mask);
+        let device = trace.input.device();
+        let detail_enabled = std::env::var_os("DragonModel_STAGE_PROFILE_DETAIL").is_some();
 
+        let residual_norm_started = dragon_pc_vjp_detail_start::<B>(&device);
         let residual_sum = trace.input.clone() + trace.residual_delta.clone();
         let DragonNormVjp {
             grad_input: grad_residual_sum,
@@ -666,7 +828,9 @@ where
             grad_residual_sum.clone(),
             activity_mask.as_ref(),
         );
+        let residual_norm_ns = dragon_pc_vjp_detail_finish::<B>(residual_norm_started, &device);
 
+        let decoder_started = dragon_pc_vjp_detail_start::<B>(&device);
         let [batch, heads, time, latent] = trace.y_neuron.shape().dims::<4>();
         let dim = trace.input.shape().dims::<4>()[3];
         let y_flat = trace
@@ -683,6 +847,9 @@ where
 
         let grad_x_from_product = grad_y.clone() * trace.y_gate.clone();
         let grad_y_gate = grad_y * trace.x_neuron.clone();
+        let decoder_ns = dragon_pc_vjp_detail_finish::<B>(decoder_started, &device);
+
+        let y_projection_started = dragon_pc_vjp_detail_start::<B>(&device);
         let y_vjp = relu_lowrank_vjp_from_activation(
             trace.attention_readout.clone(),
             encoder_v,
@@ -692,7 +859,9 @@ where
             self.kernel.lowrank_grad_input_executor,
         )
         .expect("validated local PC y-projection VJP");
+        let y_projection_ns = dragon_pc_vjp_detail_finish::<B>(y_projection_started, &device);
 
+        let attention_norm_started = dragon_pc_vjp_detail_start::<B>(&device);
         let DragonNormVjp {
             grad_input: grad_raw_attention,
             grad_gamma: attention_gamma,
@@ -704,18 +873,73 @@ where
             y_vjp.grad_input,
             activity_mask.as_ref(),
         );
+        let attention_norm_ns = dragon_pc_vjp_detail_finish::<B>(attention_norm_started, &device);
+
+        let attention_started = dragon_pc_vjp_detail_start::<B>(&device);
         let decay = self
             .attention
             .alibi_decay()
             .expect("validated local PC ALiBi decay");
-        let attention_vjp = dense_causal_attention_vjp_with_initial_rho(
-            grad_raw_attention,
-            trace.x_neuron.clone(),
-            trace.input.clone(),
-            decay,
-            trace.initial_rho.clone(),
-        );
-        let grad_x = grad_x_from_product + attention_vjp.grad_query;
+        // Match the derivative executor to the measured forward policy. The
+        // streaming recurrence is exact for dense-score factors too, but its
+        // serial time scan loses decisively to tensorized score operations at
+        // the short-context geometry selected by this executor.
+        let recurrent_vjp = (self.sequence_kernel.executor == SequenceTrainingExecutor::Reference)
+            .then(|| {
+                try_fused_recurrent_attention_input_vjp(
+                    grad_raw_attention.clone(),
+                    trace.x_neuron.clone(),
+                    trace.input.clone(),
+                    trace.initial_rho.clone(),
+                    decay.clone(),
+                    grad_terminal_rho.clone(),
+                )
+            })
+            .flatten();
+        let (grad_query, grad_value, grad_initial_rho) = match recurrent_vjp {
+            Some(vjp) => (vjp.grad_query, vjp.grad_value, vjp.grad_initial_rho),
+            None => {
+                let attention_vjp = dense_causal_attention_input_vjp_with_initial_rho(
+                    grad_raw_attention,
+                    trace.x_neuron.clone(),
+                    trace.input.clone(),
+                    decay,
+                    trace.initial_rho.clone(),
+                );
+                match grad_terminal_rho {
+                    Some(grad_terminal_rho) => {
+                        let state_vjp = dense_causal_attention_final_rho_input_vjp(
+                            grad_terminal_rho,
+                            trace.x_neuron.clone(),
+                            trace.input.clone(),
+                            self.attention
+                                .alibi_decay()
+                                .expect("validated local PC ALiBi decay"),
+                            trace.initial_rho.clone(),
+                        );
+                        (
+                            attention_vjp.grad_query + state_vjp.grad_query,
+                            attention_vjp.grad_value + state_vjp.grad_value,
+                            match (attention_vjp.grad_initial_rho, state_vjp.grad_initial_rho) {
+                                (Some(output), Some(state)) => Some(output + state),
+                                (Some(output), None) => Some(output),
+                                (None, Some(state)) => Some(state),
+                                (None, None) => None,
+                            },
+                        )
+                    }
+                    None => (
+                        attention_vjp.grad_query,
+                        attention_vjp.grad_value,
+                        attention_vjp.grad_initial_rho,
+                    ),
+                }
+            }
+        };
+        let attention_ns = dragon_pc_vjp_detail_finish::<B>(attention_started, &device);
+
+        let x_projection_started = dragon_pc_vjp_detail_start::<B>(&device);
+        let grad_x = grad_x_from_product + grad_query;
         let x_vjp = relu_lowrank_vjp_from_activation(
             trace.input.clone(),
             encoder,
@@ -725,9 +949,12 @@ where
             self.kernel.lowrank_grad_input_executor,
         )
         .expect("validated local PC x-projection VJP");
+        let x_projection_ns = dragon_pc_vjp_detail_finish::<B>(x_projection_started, &device);
 
-        DragonPredictiveCodingLayerVjp {
-            grad_input: grad_residual_sum + attention_vjp.grad_value + x_vjp.grad_input,
+        let assemble_started = dragon_pc_vjp_detail_start::<B>(&device);
+        let result = DragonPredictiveCodingLayerVjp {
+            grad_input: grad_residual_sum + grad_value + x_vjp.grad_input,
+            grad_initial_rho,
             grad_encoder: x_vjp.grad_weight.reshape([
                 self.n_head,
                 self.n_embd,
@@ -743,6 +970,126 @@ where
             grad_norm_beta: residual_beta + mlp_beta + attention_beta,
             grad_norm_alpha: residual_alpha + mlp_alpha + attention_alpha,
             grad_norm_shift: residual_shift + mlp_shift + attention_shift,
+        };
+        let assemble_ns = dragon_pc_vjp_detail_finish::<B>(assemble_started, &device);
+        if detail_enabled
+            && let Ok(mut profile) = DRAGON_PC_VJP_PROFILE
+                .get_or_init(|| Mutex::new(DragonPredictiveCodingVjpProfileSnapshot::default()))
+                .lock()
+        {
+            profile.calls = profile.calls.saturating_add(1);
+            profile.residual_norm_ns = profile.residual_norm_ns.saturating_add(residual_norm_ns);
+            profile.decoder_ns = profile.decoder_ns.saturating_add(decoder_ns);
+            profile.y_projection_ns = profile.y_projection_ns.saturating_add(y_projection_ns);
+            profile.attention_norm_ns = profile.attention_norm_ns.saturating_add(attention_norm_ns);
+            profile.attention_ns = profile.attention_ns.saturating_add(attention_ns);
+            profile.x_projection_ns = profile.x_projection_ns.saturating_add(x_projection_ns);
+            profile.assemble_ns = profile.assemble_ns.saturating_add(assemble_ns);
+        }
+        result
+    }
+
+    pub fn predictive_coding_terminal_rho_vjp(
+        &self,
+        layer_index: usize,
+        trace: &DragonPredictiveCodingLayerTrace<B>,
+        grad_terminal_rho: Tensor<B, 4>,
+    ) -> DragonPredictiveCodingStateVjp<B> {
+        self.predictive_coding_terminal_rho_vjp_impl(
+            layer_index,
+            trace,
+            grad_terminal_rho,
+            None,
+            None,
+        )
+    }
+
+    pub fn predictive_coding_terminal_rho_vjp_with_neuron_mask(
+        &self,
+        layer_index: usize,
+        trace: &DragonPredictiveCodingLayerTrace<B>,
+        grad_terminal_rho: Tensor<B, 4>,
+        neuron_mask: Tensor<B, 4>,
+    ) -> DragonPredictiveCodingStateVjp<B> {
+        self.predictive_coding_validate_neuron_mask(&neuron_mask)
+            .expect("invalid Dragon predictive-coding neuron mask");
+        self.predictive_coding_terminal_rho_vjp_impl(
+            layer_index,
+            trace,
+            grad_terminal_rho,
+            Some(neuron_mask),
+            None,
+        )
+    }
+
+    pub fn predictive_coding_terminal_rho_vjp_with_subnetwork_masks(
+        &self,
+        layer_index: usize,
+        trace: &DragonPredictiveCodingLayerTrace<B>,
+        grad_terminal_rho: Tensor<B, 4>,
+        neuron_mask: Tensor<B, 4>,
+        activity_mask: Tensor<B, 4>,
+    ) -> DragonPredictiveCodingStateVjp<B> {
+        self.predictive_coding_validate_neuron_mask(&neuron_mask)
+            .expect("invalid Dragon predictive-coding neuron mask");
+        self.predictive_coding_validate_activity_mask(&activity_mask)
+            .expect("invalid Dragon predictive-coding activity mask");
+        self.predictive_coding_terminal_rho_vjp_impl(
+            layer_index,
+            trace,
+            grad_terminal_rho,
+            Some(neuron_mask),
+            Some(activity_mask),
+        )
+    }
+
+    fn predictive_coding_terminal_rho_vjp_impl(
+        &self,
+        layer_index: usize,
+        trace: &DragonPredictiveCodingLayerTrace<B>,
+        grad_terminal_rho: Tensor<B, 4>,
+        context_mask: Option<Tensor<B, 4>>,
+        activity_mask: Option<Tensor<B, 4>>,
+    ) -> DragonPredictiveCodingStateVjp<B> {
+        self.predictive_coding_support()
+            .expect("unsupported Dragon predictive-coding architecture");
+        let (encoder, _encoder_v, _decoder, latent) = self.layer_lowrank_weights(layer_index);
+        let sparse_mask =
+            self.predictive_coding_neuron_mask(latent, &trace.input.device(), context_mask);
+        let decay = self
+            .attention
+            .alibi_decay()
+            .expect("validated local PC ALiBi decay");
+        let state_vjp = dense_causal_attention_final_rho_vjp(
+            grad_terminal_rho,
+            trace.x_neuron.clone(),
+            trace.input.clone(),
+            decay,
+            trace.initial_rho.clone(),
+        );
+        let x_vjp = relu_lowrank_vjp_from_activation(
+            trace.input.clone(),
+            encoder,
+            trace.x_neuron.clone(),
+            state_vjp.grad_query,
+            sparse_mask,
+            self.kernel.lowrank_grad_input_executor,
+        )
+        .expect("validated local PC temporal x-projection VJP");
+        let grad_input = state_vjp.grad_value + x_vjp.grad_input;
+        let grad_input = match activity_mask {
+            Some(mask) => grad_input * mask,
+            None => grad_input,
+        };
+        DragonPredictiveCodingStateVjp {
+            grad_input,
+            grad_initial_rho: state_vjp.grad_initial_rho,
+            grad_encoder: x_vjp.grad_weight.reshape([
+                self.n_head,
+                self.n_embd,
+                self.latent_per_head_capacity(),
+            ]),
+            grad_decay: state_vjp.grad_decay,
         }
     }
 
@@ -853,7 +1200,7 @@ where
             .attention
             .alibi_decay()
             .expect("validated local PC ALiBi decay");
-        let attention_vjp = dense_causal_attention_vjp_with_initial_rho(
+        let attention_vjp = dense_causal_attention_input_vjp_with_initial_rho(
             grad_raw_attention,
             trace.x_neuron.clone(),
             trace.input.clone(),
@@ -1070,6 +1417,108 @@ where
         }
     }
 
+    /// Evaluate the optional bilinear sequence-energy head on flattened
+    /// prompt and candidate terminal representations.
+    pub fn predictive_coding_sequence_scores(
+        &self,
+        prompt_hidden: Tensor<B, 2>,
+        terminal_hidden: Tensor<B, 2>,
+    ) -> Result<Tensor<B, 1>, String> {
+        self.predictive_coding_support()?;
+        let head = self.sequence_score_head.as_ref().ok_or_else(|| {
+            "local PC sequence energy requires an enabled sequence score head".to_string()
+        })?;
+        let [rows, dim] = prompt_hidden.shape().dims::<2>();
+        if terminal_hidden.shape().dims::<2>() != [rows, dim] || dim != self.n_embd {
+            return Err("sequence score hidden tensors must share [rows, n_embd] geometry".into());
+        }
+        let projection_dim = head.query.weight.val().shape().dims::<2>()[1];
+        let query = prompt_hidden.matmul(head.query.weight.val())
+            + head
+                .query
+                .bias
+                .as_ref()
+                .expect("sequence query bias")
+                .val()
+                .reshape([1, projection_dim]);
+        let candidate = terminal_hidden.matmul(head.candidate.weight.val())
+            + head
+                .candidate
+                .bias
+                .as_ref()
+                .expect("sequence candidate bias")
+                .val()
+                .reshape([1, projection_dim]);
+        Ok(((query * candidate).matmul(head.score.weight.val())
+            + head
+                .score
+                .bias
+                .as_ref()
+                .expect("sequence score bias")
+                .val()
+                .reshape([1, 1]))
+        .reshape([rows]))
+    }
+
+    /// Analytic VJP for an arbitrary scalar objective over sequence scores.
+    pub fn predictive_coding_sequence_score_vjp(
+        &self,
+        prompt_hidden: Tensor<B, 2>,
+        terminal_hidden: Tensor<B, 2>,
+        grad_scores: Tensor<B, 1>,
+    ) -> Result<DragonPredictiveCodingSequenceScoreHeadVjp<B>, String> {
+        self.predictive_coding_support()?;
+        let head = self.sequence_score_head.as_ref().ok_or_else(|| {
+            "local PC sequence energy requires an enabled sequence score head".to_string()
+        })?;
+        let [rows, dim] = prompt_hidden.shape().dims::<2>();
+        if terminal_hidden.shape().dims::<2>() != [rows, dim]
+            || grad_scores.shape().dims::<1>() != [rows]
+            || dim != self.n_embd
+        {
+            return Err(
+                "sequence score VJP expects prompt/terminal [rows, n_embd] and score [rows]".into(),
+            );
+        }
+
+        let query_weight = head.query.weight.val();
+        let candidate_weight = head.candidate.weight.val();
+        let score_weight = head.score.weight.val();
+        let projection_dim = query_weight.shape().dims::<2>()[1];
+        let query = prompt_hidden.clone().matmul(query_weight.clone())
+            + head
+                .query
+                .bias
+                .as_ref()
+                .expect("sequence query bias")
+                .val()
+                .reshape([1, projection_dim]);
+        let candidate = terminal_hidden.clone().matmul(candidate_weight.clone())
+            + head
+                .candidate
+                .bias
+                .as_ref()
+                .expect("sequence candidate bias")
+                .val()
+                .reshape([1, projection_dim]);
+        let interaction = query.clone() * candidate.clone();
+        let grad_score = grad_scores.reshape([rows, 1]);
+        let grad_interaction = grad_score.clone().matmul(score_weight.clone().transpose());
+        let grad_query = grad_interaction.clone() * candidate;
+        let grad_candidate = grad_interaction * query;
+
+        Ok(DragonPredictiveCodingSequenceScoreHeadVjp {
+            grad_prompt_hidden: grad_query.clone().matmul(query_weight.transpose()),
+            grad_terminal_hidden: grad_candidate.clone().matmul(candidate_weight.transpose()),
+            grad_query_weight: prompt_hidden.transpose().matmul(grad_query.clone()),
+            grad_query_bias: grad_query.sum_dim(0).reshape([projection_dim]),
+            grad_candidate_weight: terminal_hidden.transpose().matmul(grad_candidate.clone()),
+            grad_candidate_bias: grad_candidate.sum_dim(0).reshape([projection_dim]),
+            grad_score_weight: interaction.transpose().matmul(grad_score.clone()),
+            grad_score_bias: grad_score.sum_dim(0).reshape([1]),
+        })
+    }
+
     pub fn predictive_coding_head_vjp(
         &self,
         hidden: Tensor<B, 3>,
@@ -1214,6 +1663,46 @@ mod tests {
             expected.current().clone().reshape([1, 4, 8]),
         );
         assert!(diff < 1.0e-5, "PC factor forward mismatch: {diff}");
+    }
+
+    #[test]
+    fn recurrent_executor_pc_layer_matches_language_pipeline_stage() {
+        let device = Default::default();
+        let mut recurrent_config = config();
+        recurrent_config.sequence_kernel.executor = SequenceTrainingExecutor::Reference;
+        let model = DragonModel::<TestBackend>::new(recurrent_config, &device);
+        model
+            .predictive_coding_support()
+            .expect("recurrent executor is supported");
+        let tokens = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]),
+            &device,
+        );
+        let activity = model.predictive_coding_initial_activity(tokens.clone());
+        let trace = model.predictive_coding_forward_layer(activity, 0);
+        let mut state = model.init_state_ephemeral();
+        let expected = model.forward_language_pipeline_stage_with_state(
+            model.begin_language_pipeline(tokens),
+            &mut state,
+            0..1,
+            None,
+        );
+        let output_diff = max_abs_diff(
+            trace.next.reshape([1, 4, 8]),
+            expected.current().clone().reshape([1, 4, 8]),
+        );
+        let rho_diff = max_abs_diff(
+            trace.terminal_rho,
+            state.layers[0].rho.clone().expect("pipeline terminal rho"),
+        );
+        assert!(
+            output_diff < 1.0e-5,
+            "recurrent PC factor forward mismatch: {output_diff}"
+        );
+        assert!(
+            rho_diff < 1.0e-5,
+            "recurrent PC terminal rho mismatch: {rho_diff}"
+        );
     }
 
     #[test]
@@ -1390,6 +1879,179 @@ mod tests {
         assert!(
             activity_only_diff < 2.0e-4,
             "activity-only VJP mismatch: {activity_only_diff}"
+        );
+    }
+
+    #[test]
+    fn recurrent_layer_and_terminal_rho_vjps_match_local_autodiff() {
+        let device = Default::default();
+        let model = DragonModel::<TestAutodiffBackend>::new(config(), &device);
+        let tokens = Tensor::<TestAutodiffBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]),
+            &device,
+        );
+        let input = model
+            .predictive_coding_initial_activity(tokens)
+            .detach()
+            .require_grad();
+        let initial_rho = Tensor::<TestAutodiffBackend, 4>::random(
+            [1, 2, 8, 8],
+            burn::tensor::Distribution::Normal(0.0, 0.1),
+            &device,
+        )
+        .require_grad();
+        let trace = model
+            .predictive_coding_forward_layer_with_recurrent_state(
+                input.clone(),
+                0,
+                Some(initial_rho.clone()),
+                None,
+                None,
+            )
+            .expect("supported recurrent layer");
+        let grad_next =
+            Tensor::<TestAutodiffBackend, 4>::ones([1, 1, 4, 8], &device).mul_scalar(0.125);
+        let mut output_grads = (trace.next * grad_next).sum().backward();
+        let reference_initial_rho_grad = initial_rho
+            .grad_remove(&mut output_grads)
+            .expect("output path initial-rho gradient");
+
+        let plain = model.valid();
+        let plain_input = input.clone().detach().inner();
+        let plain_rho = initial_rho.clone().detach().inner();
+        let plain_trace = plain
+            .predictive_coding_forward_layer_with_recurrent_state(
+                plain_input.clone(),
+                0,
+                Some(plain_rho.clone()),
+                None,
+                None,
+            )
+            .expect("supported plain recurrent layer");
+        let output_vjp = plain.predictive_coding_layer_vjp(
+            0,
+            &plain_trace,
+            Tensor::<TestBackend, 4>::ones([1, 1, 4, 8], &device).mul_scalar(0.125),
+        );
+        let output_state_diff = max_abs_diff(
+            reference_initial_rho_grad,
+            output_vjp
+                .grad_initial_rho
+                .expect("analytic output path initial-rho gradient"),
+        );
+        assert!(
+            output_state_diff < 2.0e-4,
+            "output path initial-rho VJP mismatch: {output_state_diff}"
+        );
+
+        let state_input = input.detach().require_grad();
+        let state_initial_rho = initial_rho.detach().require_grad();
+        let state_trace = model
+            .predictive_coding_forward_layer_with_recurrent_state(
+                state_input.clone(),
+                0,
+                Some(state_initial_rho.clone()),
+                None,
+                None,
+            )
+            .expect("supported recurrent state factor");
+        let terminal_rho = model.predictive_coding_terminal_rho(&state_trace);
+        let grad_terminal_rho = Tensor::<TestAutodiffBackend, 4>::random(
+            [1, 2, 8, 8],
+            burn::tensor::Distribution::Normal(0.0, 0.1),
+            &device,
+        );
+        let mut state_grads = (terminal_rho * grad_terminal_rho.clone()).sum().backward();
+        let reference_input_grad = state_input
+            .grad_remove(&mut state_grads)
+            .expect("terminal-rho input gradient");
+        let reference_initial_rho_grad = state_initial_rho
+            .grad_remove(&mut state_grads)
+            .expect("terminal-rho initial-state gradient");
+        let ids = model.shared_lowrank_param_ids();
+        let parameter_grads = GradientsParams::from_grads(state_grads, &model);
+        let reference_encoder_grad = parameter_grads
+            .get::<TestBackend, 3>(ids.encoder)
+            .expect("terminal-rho encoder gradient");
+
+        let state_vjp = plain.predictive_coding_terminal_rho_vjp(
+            0,
+            &plain_trace,
+            grad_terminal_rho.clone().inner(),
+        );
+        let input_diff = max_abs_diff(reference_input_grad, state_vjp.grad_input);
+        let initial_rho_diff = max_abs_diff(
+            reference_initial_rho_grad,
+            state_vjp
+                .grad_initial_rho
+                .expect("analytic terminal-rho initial-state gradient"),
+        );
+        let encoder_diff = max_abs_diff(reference_encoder_grad, state_vjp.grad_encoder);
+        assert!(
+            input_diff < 2.0e-4,
+            "state input VJP mismatch: {input_diff}"
+        );
+        assert!(
+            initial_rho_diff < 2.0e-4,
+            "state recurrence VJP mismatch: {initial_rho_diff}"
+        );
+        assert!(
+            encoder_diff < 2.0e-4,
+            "state encoder VJP mismatch: {encoder_diff}"
+        );
+
+        let output_vjp = plain.predictive_coding_layer_vjp(
+            0,
+            &plain_trace,
+            Tensor::<TestBackend, 4>::ones([1, 1, 4, 8], &device).mul_scalar(0.125),
+        );
+        let state_vjp = plain.predictive_coding_terminal_rho_vjp(
+            0,
+            &plain_trace,
+            grad_terminal_rho.clone().inner(),
+        );
+        let fused = plain.predictive_coding_layer_vjp_with_terminal_rho(
+            0,
+            &plain_trace,
+            Tensor::<TestBackend, 4>::ones([1, 1, 4, 8], &device).mul_scalar(0.125),
+            grad_terminal_rho.inner(),
+        );
+        let fused_input_diff = max_abs_diff(
+            output_vjp.grad_input.clone() + state_vjp.grad_input,
+            fused.grad_input,
+        );
+        let fused_encoder_diff = max_abs_diff(
+            output_vjp.grad_encoder.clone() + state_vjp.grad_encoder,
+            fused.grad_encoder,
+        );
+        let fused_state_diff = max_abs_diff(
+            output_vjp
+                .grad_initial_rho
+                .expect("output initial-rho gradient")
+                + state_vjp
+                    .grad_initial_rho
+                    .expect("state initial-rho gradient"),
+            fused.grad_initial_rho.expect("fused initial-rho gradient"),
+        );
+        assert!(
+            fused_input_diff < 2.0e-4,
+            "fused input mismatch: {fused_input_diff}"
+        );
+        assert!(
+            fused_encoder_diff < 2.0e-4,
+            "fused encoder mismatch: {fused_encoder_diff}"
+        );
+        assert!(
+            fused_state_diff < 2.0e-4,
+            "fused initial-rho mismatch: {fused_state_diff}"
+        );
+        assert!(
+            max_abs_diff(output_vjp.grad_encoder_v, fused.grad_encoder_v) < 2.0e-4,
+            "fused value-encoder gradient changed"
+        );
+        assert!(
+            max_abs_diff(output_vjp.grad_decoder, fused.grad_decoder) < 2.0e-4,
+            "fused decoder gradient changed"
         );
     }
 

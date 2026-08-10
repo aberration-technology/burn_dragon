@@ -197,6 +197,19 @@ pub trait TokenSequenceDataset: Send + Sync {
         })
     }
 
+    /// Return a deterministic, curriculum-independent structured validation batch. This is used
+    /// by fixed-holdout validation for corpora whose padded document capacity is much larger than
+    /// the semantic payload; random offsets in those corpora are not meaningful examples.
+    fn fixed_holdout_token_windows_with_loss_masks(
+        &self,
+        _epoch_index: usize,
+        _absolute_step: usize,
+        _batch_size: usize,
+        _block_size: usize,
+    ) -> Option<SourceSelectedBatch> {
+        None
+    }
+
     /// Return ruliad prompt/eval metadata aligned to a live source-selected step, if available.
     /// The random data loader requests this only when a verifier-reward policy auxiliary is
     /// explicitly enabled, keeping ordinary batch construction on the token-only hot path.
@@ -275,6 +288,16 @@ pub trait TokenSequenceDataset: Send + Sync {
 
     fn source_selection_snapshot(&self) -> Option<burn_dragon_universality::RuliadMetricSnapshot> {
         None
+    }
+
+    /// Snapshot the source policy as it applies at a concrete training step.
+    /// Implementations with time-dependent curricula must override this rather
+    /// than exposing their unconstrained/materialized distribution.
+    fn source_selection_snapshot_at_step(
+        &self,
+        _absolute_step: usize,
+    ) -> Option<burn_dragon_universality::RuliadMetricSnapshot> {
+        self.source_selection_snapshot()
     }
 
     /// Whether sampled batches should include a per-target loss mask.
@@ -591,17 +614,29 @@ where
         .then(|| vec![0i64; batch_size * block_size]);
     let mut ruliad_policy_batch = None;
 
-    if source_selection_enabled
-        && let Some(SourceSelectedBatch {
-            windows: source_windows,
-            loss_masks: source_loss_masks,
-        }) = dataset.source_selected_token_windows_with_loss_masks(
+    let structured_batch = if matches!(split, DatasetSplit::Val) && !source_selection_enabled {
+        dataset.fixed_holdout_token_windows_with_loss_masks(
+            epoch_index,
+            absolute_step,
+            batch_size,
+            block_size,
+        )
+    } else if source_selection_enabled {
+        dataset.source_selected_token_windows_with_loss_masks(
             split,
             epoch_index,
             absolute_step,
             batch_size,
             block_size,
         )
+    } else {
+        None
+    };
+
+    if let Some(SourceSelectedBatch {
+        windows: source_windows,
+        loss_masks: source_loss_masks,
+    }) = structured_batch
     {
         assert_eq!(
             source_windows.len(),
@@ -829,6 +864,7 @@ where
         targets,
         loss_mask,
         ruliad_policy_batch,
+        absolute_step,
         dataloader_cpu_ns: cpu_start
             .map(|start| start.elapsed().as_nanos())
             .unwrap_or_default(),
@@ -882,6 +918,11 @@ pub struct SequenceBatch<B: Backend> {
     pub loss_mask: Option<Tensor<B, 2, Int>>,
     pub summary_event_mask: Option<Tensor<B, 2, Int>>,
     pub ruliad_policy_batch: Option<Arc<RuliadPolicyBatch>>,
+    /// Authoritative consumed-batch clock used by scheduled training objectives.
+    ///
+    /// Manual/test batches may omit it and fall back to the model-local update
+    /// counter. Production data loaders always set it.
+    pub absolute_step: Option<usize>,
     pub reset_stream_state: bool,
 }
 
@@ -890,6 +931,7 @@ struct HostSequenceBatch {
     targets: Vec<i64>,
     loss_mask: Option<Vec<i64>>,
     ruliad_policy_batch: Option<Arc<RuliadPolicyBatch>>,
+    absolute_step: usize,
     dataloader_cpu_ns: u128,
     reset_stream_state: bool,
 }
@@ -1047,6 +1089,7 @@ impl<B: Backend> SequenceBatch<B> {
             loss_mask: None,
             summary_event_mask,
             ruliad_policy_batch: None,
+            absolute_step: None,
             reset_stream_state: false,
         }
     }
@@ -1061,6 +1104,11 @@ impl<B: Backend> SequenceBatch<B> {
         ruliad_policy_batch: Option<Arc<RuliadPolicyBatch>>,
     ) -> Self {
         self.ruliad_policy_batch = ruliad_policy_batch;
+        self
+    }
+
+    pub fn with_absolute_step(mut self, absolute_step: usize) -> Self {
+        self.absolute_step = Some(absolute_step);
         self
     }
 
@@ -1118,6 +1166,7 @@ fn finalize_host_batch_on_device<B: Backend>(
         targets,
         loss_mask,
         ruliad_policy_batch,
+        absolute_step,
         dataloader_cpu_ns,
         reset_stream_state,
     } = host;
@@ -1153,6 +1202,7 @@ fn finalize_host_batch_on_device<B: Backend>(
     SequenceBatch::new(inputs_tensor, targets_tensor, summary_event_mask)
         .with_loss_mask(loss_mask_tensor)
         .with_ruliad_policy_batch(ruliad_policy_batch)
+        .with_absolute_step(absolute_step)
         .with_reset_stream_state(reset_stream_state)
 }
 
@@ -1845,6 +1895,8 @@ impl<B: Backend> Iterator for StreamingIterator<B> {
         let ruliad_policy_batch = if self.source_selection_enabled
             && self.ruliad_policy_batch_schedule.includes(absolute_step)
         {
+            // The cadence is keyed by the consumed update, while the sampled
+            // metadata remains aligned with the logical source document.
             let selection_step =
                 absolute_step.saturating_sub(self.chunk_index_in_document.min(absolute_step));
             self.dataset
@@ -1908,6 +1960,7 @@ impl<B: Backend> Iterator for StreamingIterator<B> {
             SequenceBatch::new(inputs_tensor, targets_tensor, summary_event_mask)
                 .with_loss_mask(loss_mask_tensor)
                 .with_ruliad_policy_batch(ruliad_policy_batch)
+                .with_absolute_step(absolute_step)
                 .with_reset_stream_state(reset_stream_state),
         )
     }
@@ -3085,7 +3138,7 @@ mod random_loader_tests {
             selected_steps: Arc::new(Mutex::new(Vec::new())),
             policy_steps: Some(Arc::clone(&random_policy_steps)),
         });
-        let random_attached = RandomDataLoader::<TestBackend>::new(
+        let random_schedule = RandomDataLoader::<TestBackend>::new(
             random_dataset,
             DatasetSplit::Train,
             &device,
@@ -3094,11 +3147,18 @@ mod random_loader_tests {
         )
         .with_ruliad_policy_supervision(supervision)
         .iter()
-        .map(|batch| batch.ruliad_policy_batch.is_some())
+        .map(|batch| (batch.absolute_step, batch.ruliad_policy_batch.is_some()))
         .collect::<Vec<_>>();
         assert_eq!(
-            random_attached,
-            vec![false, false, true, false, true, false]
+            random_schedule,
+            vec![
+                (Some(0), false),
+                (Some(1), false),
+                (Some(2), true),
+                (Some(3), false),
+                (Some(4), true),
+                (Some(5), false),
+            ]
         );
         let mut random_policy_steps = random_policy_steps
             .lock()
@@ -3115,7 +3175,7 @@ mod random_loader_tests {
             selected_steps: Arc::new(Mutex::new(Vec::new())),
             policy_steps: Some(Arc::clone(&streaming_policy_steps)),
         });
-        let streaming_attached = StreamingDataLoader::<TestBackend>::new(
+        let streaming_schedule = StreamingDataLoader::<TestBackend>::new(
             streaming_dataset,
             DatasetSplit::Train,
             &device,
@@ -3126,9 +3186,9 @@ mod random_loader_tests {
         )
         .with_ruliad_policy_supervision(supervision)
         .iter()
-        .map(|batch| batch.ruliad_policy_batch.is_some())
+        .map(|batch| (batch.absolute_step, batch.ruliad_policy_batch.is_some()))
         .collect::<Vec<_>>();
-        assert_eq!(streaming_attached, random_attached);
+        assert_eq!(streaming_schedule, random_schedule);
         assert_eq!(
             streaming_policy_steps
                 .lock()

@@ -8,6 +8,7 @@ pub struct TrainProfileSnapshot {
     pub dataloader_host_to_device_copy_bytes: u128,
     pub host_sync_points: u64,
     pub forward_ns: u128,
+    pub stream_advance_ns: u128,
     pub local_learning_ns: u128,
     pub auxiliary_objective_ns: u128,
     pub proof_policy_ns: u128,
@@ -25,6 +26,18 @@ pub struct TrainProfileSnapshot {
     pub hidden_model_probe_ns: u128,
     pub detail_probe_steps: u64,
     pub train_steps: u64,
+    pub source_batches: u64,
+    pub source_tokens: u128,
+    pub structured_terminal_steps: u64,
+    pub structured_terminal_rows: u64,
+    pub structured_terminal_padded_tokens: u128,
+    pub local_pc_context_forward_ns: u128,
+    pub local_pc_terminal_factor_ns: u128,
+    pub local_pc_layer_vjp_ns: u128,
+    pub local_pc_initial_vjp_ns: u128,
+    pub local_pc_gradient_pack_ns: u128,
+    pub local_pc_detail_steps: u64,
+    pub local_pc_detail_layer_vjps: u64,
     pub max_step_reserved_before_bytes: u64,
     pub max_step_in_use_before_bytes: u64,
     pub max_step_reserved_after_forward_bytes: u64,
@@ -138,6 +151,7 @@ struct TrainProfileState {
     dataloader_host_to_device_copy_bytes: u128,
     host_sync_points: u64,
     forward_ns: u128,
+    stream_advance_ns: u128,
     local_learning_ns: u128,
     auxiliary_objective_ns: u128,
     proof_policy_ns: u128,
@@ -155,6 +169,18 @@ struct TrainProfileState {
     hidden_model_probe_ns: u128,
     detail_probe_steps: u64,
     train_steps: u64,
+    source_batches: u64,
+    source_tokens: u128,
+    structured_terminal_steps: u64,
+    structured_terminal_rows: u64,
+    structured_terminal_padded_tokens: u128,
+    local_pc_context_forward_ns: u128,
+    local_pc_terminal_factor_ns: u128,
+    local_pc_layer_vjp_ns: u128,
+    local_pc_initial_vjp_ns: u128,
+    local_pc_gradient_pack_ns: u128,
+    local_pc_detail_steps: u64,
+    local_pc_detail_layer_vjps: u64,
     max_step_reserved_before_bytes: u64,
     max_step_in_use_before_bytes: u64,
     max_step_reserved_after_forward_bytes: u64,
@@ -258,6 +284,7 @@ pub fn snapshot() -> TrainProfileSnapshot {
             dataloader_host_to_device_copy_bytes: profile.dataloader_host_to_device_copy_bytes,
             host_sync_points: profile.host_sync_points,
             forward_ns: profile.forward_ns,
+            stream_advance_ns: profile.stream_advance_ns,
             local_learning_ns: profile.local_learning_ns,
             auxiliary_objective_ns: profile.auxiliary_objective_ns,
             proof_policy_ns: profile.proof_policy_ns,
@@ -275,6 +302,18 @@ pub fn snapshot() -> TrainProfileSnapshot {
             hidden_model_probe_ns: profile.hidden_model_probe_ns,
             detail_probe_steps: profile.detail_probe_steps,
             train_steps: profile.train_steps,
+            source_batches: profile.source_batches,
+            source_tokens: profile.source_tokens,
+            structured_terminal_steps: profile.structured_terminal_steps,
+            structured_terminal_rows: profile.structured_terminal_rows,
+            structured_terminal_padded_tokens: profile.structured_terminal_padded_tokens,
+            local_pc_context_forward_ns: profile.local_pc_context_forward_ns,
+            local_pc_terminal_factor_ns: profile.local_pc_terminal_factor_ns,
+            local_pc_layer_vjp_ns: profile.local_pc_layer_vjp_ns,
+            local_pc_initial_vjp_ns: profile.local_pc_initial_vjp_ns,
+            local_pc_gradient_pack_ns: profile.local_pc_gradient_pack_ns,
+            local_pc_detail_steps: profile.local_pc_detail_steps,
+            local_pc_detail_layer_vjps: profile.local_pc_detail_layer_vjps,
             max_step_reserved_before_bytes: profile.max_step_reserved_before_bytes,
             max_step_in_use_before_bytes: profile.max_step_in_use_before_bytes,
             max_step_reserved_after_forward_bytes: profile.max_step_reserved_after_forward_bytes,
@@ -434,6 +473,65 @@ pub fn record_train_step(forward_ns: u128, loss_backward_ns: u128) {
     });
 }
 
+pub fn record_source_batch(batch_size: usize, sequence_len: usize) {
+    record(|profile| {
+        profile.source_batches = profile.source_batches.saturating_add(1);
+        profile.source_tokens = profile
+            .source_tokens
+            .saturating_add((batch_size as u128).saturating_mul(sequence_len as u128));
+    });
+}
+
+pub fn record_structured_terminal(rows: usize, padded_tokens: usize) {
+    record(|profile| {
+        profile.structured_terminal_steps = profile.structured_terminal_steps.saturating_add(1);
+        profile.structured_terminal_rows =
+            profile.structured_terminal_rows.saturating_add(rows as u64);
+        profile.structured_terminal_padded_tokens = profile
+            .structured_terminal_padded_tokens
+            .saturating_add(padded_tokens as u128);
+    });
+}
+
+pub fn record_local_pc_context_forward(elapsed_ns: u128) {
+    record(|profile| {
+        profile.local_pc_context_forward_ns = profile
+            .local_pc_context_forward_ns
+            .saturating_add(elapsed_ns);
+    });
+}
+
+pub fn record_local_pc_fixed_detail(
+    terminal_factor_ns: u128,
+    layer_vjp_ns: u128,
+    initial_vjp_ns: u128,
+    gradient_pack_ns: u128,
+    layer_vjps: usize,
+) {
+    record(|profile| {
+        profile.local_pc_terminal_factor_ns = profile
+            .local_pc_terminal_factor_ns
+            .saturating_add(terminal_factor_ns);
+        profile.local_pc_layer_vjp_ns = profile.local_pc_layer_vjp_ns.saturating_add(layer_vjp_ns);
+        profile.local_pc_initial_vjp_ns = profile
+            .local_pc_initial_vjp_ns
+            .saturating_add(initial_vjp_ns);
+        profile.local_pc_gradient_pack_ns = profile
+            .local_pc_gradient_pack_ns
+            .saturating_add(gradient_pack_ns);
+        profile.local_pc_detail_steps = profile.local_pc_detail_steps.saturating_add(1);
+        profile.local_pc_detail_layer_vjps = profile
+            .local_pc_detail_layer_vjps
+            .saturating_add(layer_vjps as u64);
+    });
+}
+
+pub fn record_stream_advance(elapsed_ns: u128) {
+    record(|profile| {
+        profile.stream_advance_ns = profile.stream_advance_ns.saturating_add(elapsed_ns);
+    });
+}
+
 pub fn record_local_learning_step(elapsed_ns: u128) {
     record(|profile| {
         profile.local_learning_ns = profile.local_learning_ns.saturating_add(elapsed_ns);
@@ -544,7 +642,9 @@ pub fn record_detail_probe(
 #[cfg(test)]
 mod tests {
     use super::{
-        detail_due_for, record_auxiliary_objectives, record_local_learning_step, reset, snapshot,
+        detail_due_for, record_auxiliary_objectives, record_local_learning_step,
+        record_local_pc_context_forward, record_local_pc_fixed_detail, record_source_batch,
+        record_stream_advance, record_structured_terminal, reset, snapshot,
     };
 
     #[test]
@@ -577,6 +677,42 @@ mod tests {
         assert_eq!(snapshot.forward_ns, 0);
         assert_eq!(snapshot.loss_backward_ns, 0);
         assert_eq!(snapshot.train_steps, 2);
+        reset();
+    }
+
+    #[test]
+    fn source_and_structured_work_are_counted_independently() {
+        reset();
+        record_source_batch(3, 17);
+        record_source_batch(2, 11);
+        record_structured_terminal(7, 91);
+        record_stream_advance(13);
+        let snapshot = snapshot();
+        assert_eq!(snapshot.source_batches, 2);
+        assert_eq!(snapshot.source_tokens, 73);
+        assert_eq!(snapshot.structured_terminal_steps, 1);
+        assert_eq!(snapshot.structured_terminal_rows, 7);
+        assert_eq!(snapshot.structured_terminal_padded_tokens, 91);
+        assert_eq!(snapshot.stream_advance_ns, 13);
+        assert_eq!(snapshot.train_steps, 0);
+        reset();
+    }
+
+    #[test]
+    fn local_pc_detail_profile_tracks_synchronized_substages() {
+        reset();
+        record_local_pc_context_forward(11);
+        record_local_pc_context_forward(13);
+        record_local_pc_fixed_detail(17, 19, 23, 29, 4);
+        record_local_pc_fixed_detail(31, 37, 41, 43, 4);
+        let snapshot = snapshot();
+        assert_eq!(snapshot.local_pc_context_forward_ns, 24);
+        assert_eq!(snapshot.local_pc_terminal_factor_ns, 48);
+        assert_eq!(snapshot.local_pc_layer_vjp_ns, 56);
+        assert_eq!(snapshot.local_pc_initial_vjp_ns, 64);
+        assert_eq!(snapshot.local_pc_gradient_pack_ns, 72);
+        assert_eq!(snapshot.local_pc_detail_steps, 2);
+        assert_eq!(snapshot.local_pc_detail_layer_vjps, 8);
         reset();
     }
 }

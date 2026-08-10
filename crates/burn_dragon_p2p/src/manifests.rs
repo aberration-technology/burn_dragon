@@ -17,8 +17,9 @@ use sha2::{Digest, Sha256};
 
 use crate::capability::{DragonCapabilityClass, DragonTrainingFootprint};
 use crate::config::{
-    DRAGON_RULIAD_SEMANTIC_CONTRACT_EXTENSION, DragonExperimentKind, DragonManifestBundle,
-    DragonManifestSeed, DragonPromotionConfig, DragonPromotionMode, dragon_model_schema_hash,
+    DRAGON_LOCAL_PC_PROGRAM_CONTRACT_EXTENSION, DRAGON_RULIAD_SEMANTIC_CONTRACT_EXTENSION,
+    DragonExperimentKind, DragonManifestBundle, DragonManifestSeed, DragonPromotionConfig,
+    DragonPromotionMode, dragon_model_schema_hash,
 };
 use crate::profile::{
     DRAGON_BROWSER_EXECUTION_CONTRACT_EXTENSION, DragonBrowserExperimentProfile,
@@ -245,6 +246,9 @@ fn dragon_training_contract(
                 "dataset": dataset_contract.descriptor,
                 "block_size": config.training.block_size,
                 "tbptt_chunk_size": config.training.tbptt_chunk_size,
+                "tbptt_credit_window_chunks": config.training.tbptt_credit_window_chunks,
+                "tbptt_persist_across_steps": config.training.tbptt_persist_across_steps,
+                "sequence_batching": config.training.sequence_batching,
                 "context_strategy": config.training.context_strategy,
             })
         }),
@@ -253,6 +257,7 @@ fn dragon_training_contract(
         "dragon-objective",
         &training_config.map(|config| {
             serde_json::json!({
+                "algorithm": config.training.algorithm,
                 "objective": config.training.objective,
                 "input_corruption": config.training.input_corruption,
                 "logit_entropy_floor": config.training.logit_entropy_floor,
@@ -260,6 +265,8 @@ fn dragon_training_contract(
                 "greedy_rollout_unlikelihood": config.training.greedy_rollout_unlikelihood,
                 "dynamics_anchor": config.training.dynamics_anchor,
                 "predictive_coding": config.training.predictive_coding,
+                "local_predictive_coding": config.training.local_predictive_coding,
+                "predictive_context_routing": config.training.predictive_context_routing,
                 "latent_reasoning": config.training.latent_reasoning,
                 "ruliad_supervision": config.training.ruliad_supervision,
                 "gdpo": config.training.gdpo,
@@ -327,6 +334,22 @@ fn dragon_training_contract(
             ruliad_semantic_hash,
         );
     }
+    if let Some(config) = training_config.filter(|config| {
+        matches!(
+            config.training.algorithm,
+            burn_dragon_language::TrainingAlgorithm::PredictiveCoding
+        )
+    }) {
+        let pc_manifest =
+            burn_dragon_language::train::dragon_predictive_coding_checkpoint_manifest(
+                model_config.n_layer,
+                &config.training.local_predictive_coding,
+            )?;
+        extensions.insert(
+            DRAGON_LOCAL_PC_PROGRAM_CONTRACT_EXTENSION.into(),
+            stable_content_id("dragon-local-pc-program", &pc_manifest),
+        );
+    }
     let contract = TrainingContractManifest {
         version: TRAINING_CONTRACT_VERSION,
         workload_id: WorkloadId::new(format!("dragon-{}", experiment_kind.workload_slug())),
@@ -353,7 +376,13 @@ fn dragon_training_contract(
         } else {
             SchedulerStatePolicy::ResetPerWindow
         },
-        recurrent_state_policy: RecurrentStatePolicy::LeaseScoped,
+        recurrent_state_policy: if training_config
+            .is_some_and(|config| config.training.tbptt_persist_across_steps)
+        {
+            RecurrentStatePolicy::LeaseScoped
+        } else {
+            RecurrentStatePolicy::Ephemeral
+        },
         update_codec: update_codec.clone(),
         aggregation_hash: stable_content_id(
             "dragon-aggregation",
@@ -862,6 +891,88 @@ mod tests {
         })
         .expect("training contract")
         .0
+    }
+
+    fn local_pc_training_config() -> TrainingConfig {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut config = burn_dragon_language::load_training_config(&[manifest_dir
+            .join("../../config/language/experiments/predictive_coding/local-pc-1m.toml")])
+        .expect("load local-PC training profile");
+        config.dataset.source = DatasetSourceConfig::NemotronClimbMix {
+            revision: Some("contract-test".into()),
+            max_records: Some(1),
+        };
+        config
+    }
+
+    #[test]
+    fn local_pc_and_temporal_credit_semantics_are_contract_bound() {
+        let baseline_config = local_pc_training_config();
+        let baseline = local_training_contract(&baseline_config);
+        assert_eq!(
+            baseline.recurrent_state_policy,
+            RecurrentStatePolicy::Ephemeral
+        );
+        assert!(
+            baseline
+                .extensions
+                .contains_key(DRAGON_LOCAL_PC_PROGRAM_CONTRACT_EXTENSION)
+        );
+
+        let mut solver_drift = baseline_config.clone();
+        solver_drift
+            .training
+            .local_predictive_coding
+            .inference
+            .steps += 1;
+        let solver_drift = local_training_contract(&solver_drift);
+        assert_ne!(baseline.objective_hash, solver_drift.objective_hash);
+        assert_ne!(
+            baseline
+                .extensions
+                .get(DRAGON_LOCAL_PC_PROGRAM_CONTRACT_EXTENSION),
+            solver_drift
+                .extensions
+                .get(DRAGON_LOCAL_PC_PROGRAM_CONTRACT_EXTENSION)
+        );
+        assert_ne!(
+            baseline.contract_id().expect("baseline contract"),
+            solver_drift.contract_id().expect("solver-drift contract")
+        );
+
+        let mut temporal_drift = baseline_config.clone();
+        temporal_drift.training.tbptt_chunk_size = Some(64);
+        temporal_drift.training.tbptt_credit_window_chunks = 2;
+        temporal_drift.training.tbptt_persist_across_steps = true;
+        temporal_drift.training.sequence_batching =
+            burn_dragon_language::config::SequenceBatchingMode::Streaming;
+        let temporal_drift = local_training_contract(&temporal_drift);
+        assert_ne!(
+            baseline.preprocessing_hash,
+            temporal_drift.preprocessing_hash
+        );
+        assert_eq!(
+            temporal_drift.recurrent_state_policy,
+            RecurrentStatePolicy::LeaseScoped
+        );
+        assert_ne!(
+            baseline.contract_id().expect("baseline contract"),
+            temporal_drift
+                .contract_id()
+                .expect("temporal-drift contract")
+        );
+
+        let mut hardware_local_batch = baseline_config;
+        hardware_local_batch.training.batch_size =
+            hardware_local_batch.training.batch_size.saturating_add(7);
+        let hardware_local_batch = local_training_contract(&hardware_local_batch);
+        assert_eq!(
+            baseline.contract_id().expect("baseline contract"),
+            hardware_local_batch
+                .contract_id()
+                .expect("hardware-local batch contract"),
+            "peer-local batch calibration must remain outside semantic revision identity"
+        );
     }
 
     #[test]

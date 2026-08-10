@@ -1,4 +1,7 @@
-use crate::config::{LocalPredictiveCodingConfig, PredictiveCodingFactorReduction};
+use crate::config::{
+    LocalPredictiveCodingAdjointConditioning, LocalPredictiveCodingConfig,
+    PredictiveCodingFactorReduction,
+};
 
 /// Materialized, backend-independent factor graph for one Dragon block.
 /// Activity nodes are inferred per batch; the token target remains clamped.
@@ -74,6 +77,18 @@ pub fn dragon_predictive_coding_checkpoint_manifest(
         || "none".to_string(),
         |value| format!("{:08x}", value.to_bits()),
     );
+    let alm_gradient_norm_scope = match config.augmented_lagrangian.gradient_norm_scope {
+        burn_pc::PcGradientNormScope::Global => "global",
+        burn_pc::PcGradientNormScope::PerSample => "per_sample",
+        burn_pc::PcGradientNormScope::PerRow => "per_row",
+    };
+    let alm_max_grad_norm = config
+        .augmented_lagrangian
+        .max_primal_grad_norm
+        .map_or_else(
+            || "none".to_string(),
+            |value| format!("{:08x}", value.to_bits()),
+        );
     let consensus_max_norm = config.tied_consensus.max_update_norm.map_or_else(
         || "none".to_string(),
         |value| format!("{:08x}", value.to_bits()),
@@ -90,19 +105,37 @@ pub fn dragon_predictive_coding_checkpoint_manifest(
         burn_pc::PcFeedbackInitialization::Gaussian => "gaussian",
         burn_pc::PcFeedbackInitialization::Identity => "identity",
     };
+    let adjoint_predictor = match config.amortized_adjoint.predictor {
+        burn_pc::PcAdjointPredictorKind::DirectLinear => "direct_linear",
+        burn_pc::PcAdjointPredictorKind::ResidualConditioned => "residual_conditioned",
+    };
+    let adjoint_conditioning = match config.adjoint_conditioning {
+        LocalPredictiveCodingAdjointConditioning::LocalResidual => "local_residual",
+        LocalPredictiveCodingAdjointConditioning::TerminalDisplacement => "terminal_displacement",
+    };
     let terminal_criterion = match config.terminal_criterion {
         crate::config::LocalPredictiveCodingTerminalCriterion::NextToken => "next_token",
         crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSet => {
             "ruliad_verifier_set"
         }
     };
+    let temporal_credit_mode = match config.temporal_credit.mode {
+        burn_pc::PcTemporalCreditMode::Detached => "detached",
+        burn_pc::PcTemporalCreditMode::ExactWindow => "exact_window",
+    };
     let program_digest = format!(
-        "dragon-pc-program-v4;solver={};terminal={terminal_criterion};schedule={learning_schedule};parameterization={parameterization};shared_reuse={shared_reuse_reduction};factor_reduction={factor_reduction};inference_steps={};step_size={:08x};latent_decay={:08x};max_grad_norm={max_grad_norm};gradient_norm_scope={gradient_norm_scope};eps={:08x};prediction_precision={:08x};incremental_parameter_step_scale={:016x};dkp_preliminary_step={:08x};dkp_feedback_step={:08x};dkp_forward_decay={:08x};dkp_feedback_decay={:08x};dkp_signal_scale={:08x};dkp_feedback_initialization={feedback_initialization};adjoint_enabled={};adjoint_every={};adjoint_lr={:08x};adjoint_decay={:08x};adjoint_max_update={adjoint_max_update};adjoint_eps={:08x};consensus_damping={:08x};consensus_min_curvature={:08x};consensus_max_norm={consensus_max_norm};consensus_eps={:08x}",
+        "dragon-pc-program-v9;solver={};terminal={terminal_criterion};schedule={learning_schedule};parameterization={parameterization};shared_reuse={shared_reuse_reduction};factor_reduction={factor_reduction};temporal_credit={temporal_credit_mode};temporal_window_chunks={};inference_steps={};step_size={:08x};latent_decay={:08x};max_grad_norm={max_grad_norm};gradient_norm_scope={gradient_norm_scope};eps={:08x};alm_steps={};alm_primal_step={:08x};alm_dual_step={:08x};alm_penalty={:08x};alm_max_grad_norm={alm_max_grad_norm};alm_gradient_norm_scope={alm_gradient_norm_scope};alm_eps={:08x};prediction_precision={:08x};incremental_parameter_step_scale={:016x};dkp_preliminary_step={:08x};dkp_feedback_step={:08x};dkp_forward_decay={:08x};dkp_feedback_decay={:08x};dkp_signal_scale={:08x};dkp_feedback_initialization={feedback_initialization};adjoint_enabled={};adjoint_warmup={};adjoint_every={};adjoint_predictor={adjoint_predictor};adjoint_conditioning={adjoint_conditioning};adjoint_conditioning_clip={:08x};adjoint_lr={:08x};adjoint_decay={:08x};adjoint_max_update={adjoint_max_update};adjoint_eps={:08x};consensus_damping={:08x};consensus_min_curvature={:08x};consensus_max_norm={consensus_max_norm};consensus_eps={:08x}",
         config.solver.as_str(),
+        config.temporal_credit.window_chunks,
         config.inference.steps,
         config.inference.step_size.to_bits(),
         config.inference.latent_decay.to_bits(),
         config.inference.eps.to_bits(),
+        config.augmented_lagrangian.steps,
+        config.augmented_lagrangian.primal_step_size.to_bits(),
+        config.augmented_lagrangian.dual_step_size.to_bits(),
+        config.augmented_lagrangian.penalty.to_bits(),
+        config.augmented_lagrangian.eps.to_bits(),
         config.prediction_precision.to_bits(),
         config.incremental_parameter_step_scale.to_bits(),
         config.direct_feedback.preliminary_step_size.to_bits(),
@@ -111,7 +144,9 @@ pub fn dragon_predictive_coding_checkpoint_manifest(
         config.direct_feedback.feedback_weight_decay.to_bits(),
         config.direct_feedback.signal_scale.to_bits(),
         config.amortized_adjoint.enabled,
+        config.amortized_adjoint.teacher_warmup_updates,
         config.amortized_adjoint.teacher_every_updates,
+        config.amortized_adjoint.conditioning_clip.to_bits(),
         config.amortized_adjoint.calibration.learning_rate.to_bits(),
         config.amortized_adjoint.calibration.weight_decay.to_bits(),
         config.amortized_adjoint.calibration.eps.to_bits(),

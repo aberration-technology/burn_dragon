@@ -363,15 +363,15 @@ where
         require_exact,
     )?;
     model.restore_gradient_scale_step_from_checkpoint(record.gradient_scale_step);
-    if model.uses_dkp_predictive_coding() && require_exact && record.dkp_feedback.is_none() {
+    if model.uses_local_pc_feedback_state() && require_exact && record.dkp_feedback.is_none() {
         return Err(anyhow!(
-            "exact DKP resume requires feedback state in {}",
+            "exact local-PC resume requires feedback-bank state in {}",
             path.display()
         ));
     }
-    if !model.uses_dkp_predictive_coding() && require_exact && record.dkp_feedback.is_some() {
+    if !model.uses_local_pc_feedback_state() && require_exact && record.dkp_feedback.is_some() {
         return Err(anyhow!(
-            "runtime-state checkpoint {} contains DKP feedback but the requested solver is not direct_kolen_pollack",
+            "runtime-state checkpoint {} contains a local-PC feedback bank but the requested solver does not own one",
             path.display()
         ));
     }
@@ -445,7 +445,10 @@ mod tests {
 
     type TestBackend = Autodiff<NdArray<f32>>;
 
-    fn dkp_model(device: &NdArrayDevice) -> LanguageTrainModel<TestBackend> {
+    fn local_pc_model(
+        device: &NdArrayDevice,
+        local_pc: LocalPredictiveCodingConfig,
+    ) -> LanguageTrainModel<TestBackend> {
         let mut config = DragonConfig {
             n_layer: 2,
             n_embd: 8,
@@ -459,10 +462,34 @@ mod tests {
         config.fused_kernels.rotary_embedding = RotaryEmbedding::Alibi;
         LanguageTrainModel::new(DragonModel::new(config, device))
             .with_training_algorithm(TrainingAlgorithm::PredictiveCoding)
-            .with_local_predictive_coding(LocalPredictiveCodingConfig {
+            .with_local_predictive_coding(local_pc)
+    }
+
+    fn dkp_model(device: &NdArrayDevice) -> LanguageTrainModel<TestBackend> {
+        local_pc_model(
+            device,
+            LocalPredictiveCodingConfig {
                 solver: LocalPredictiveCodingSolver::DirectKolenPollack,
                 ..LocalPredictiveCodingConfig::default()
-            })
+            },
+        )
+    }
+
+    fn residual_adjoint_model(device: &NdArrayDevice) -> LanguageTrainModel<TestBackend> {
+        local_pc_model(
+            device,
+            LocalPredictiveCodingConfig {
+                solver: LocalPredictiveCodingSolver::AmortizedAdjoint,
+                amortized_adjoint: burn_pc::PcAmortizedAdjointConfig {
+                    enabled: true,
+                    teacher_warmup_updates: 4,
+                    teacher_every_updates: 8,
+                    predictor: burn_pc::PcAdjointPredictorKind::ResidualConditioned,
+                    ..burn_pc::PcAmortizedAdjointConfig::default()
+                },
+                ..LocalPredictiveCodingConfig::default()
+            },
+        )
     }
 
     fn pc_manifest() -> burn_pc::PcCheckpointManifest {
@@ -660,5 +687,41 @@ mod tests {
             .to_vec::<f32>()
             .expect("feedback values");
         assert!(values.iter().all(|value| (*value - 0.25).abs() < 1.0e-6));
+    }
+
+    #[test]
+    fn exact_residual_adjoint_resume_restores_wide_feedback_bank() {
+        let device = Default::default();
+        let source = residual_adjoint_model(&device);
+        source.restore_dkp_feedback_from_checkpoint(Some(
+            super::super::local_predictive_coding::DkpFeedbackState {
+                feedback: Tensor::from_data(
+                    TensorData::new(vec![0.125_f32; 256], [2, 8, 16]),
+                    &device,
+                ),
+                updates: 73,
+            },
+        ));
+        let directory = tempfile::tempdir().expect("temporary checkpoint directory");
+        fs::create_dir_all(directory.path().join("checkpoint")).expect("checkpoint directory");
+        save_runtime_state_checkpoint(directory.path(), 5, &source)
+            .expect("save exact residual-adjoint runtime state");
+
+        let restored = residual_adjoint_model(&device);
+        assert!(
+            load_runtime_state_checkpoint(directory.path(), 5, &restored, &device, true, false)
+                .expect("restore exact residual-adjoint runtime state")
+        );
+        let feedback = restored
+            .dkp_feedback_for_checkpoint()
+            .expect("restored residual-adjoint feedback bank");
+        assert_eq!(feedback.updates, 73);
+        assert_eq!(feedback.feedback.shape().dims::<3>(), [2, 8, 16]);
+        let values = feedback
+            .feedback
+            .into_data()
+            .to_vec::<f32>()
+            .expect("feedback values");
+        assert!(values.iter().all(|value| (*value - 0.125).abs() < 1.0e-6));
     }
 }

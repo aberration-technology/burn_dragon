@@ -102,6 +102,141 @@ fn stateful_reference_attention<B: BackendTrait>(
         + (query * state_decay).matmul(initial_rho)
 }
 
+fn terminal_rho_reference<B: BackendTrait>(
+    query: Tensor<B, 4>,
+    value: Tensor<B, 4>,
+    decay: Tensor<B, 1>,
+    initial_rho: Tensor<B, 4>,
+) -> Tensor<B, 4> {
+    let [_, heads, time, _] = query.shape().dims::<4>();
+    let value = if value.shape().dims::<4>()[1] == heads {
+        value
+    } else {
+        value.repeat_dim(1, heads)
+    };
+    let positions = Tensor::<B, 1, Int>::arange(0..time as i64, &query.device())
+        .float()
+        .reshape([1, 1, time, 1]);
+    let exponents = positions
+        .mul_scalar(-1.0)
+        .add_scalar(time as f32)
+        .repeat_dim(1, heads);
+    let weights = decay
+        .clone()
+        .reshape([1, heads, 1, 1])
+        .repeat_dim(2, time)
+        .powf(exponents);
+    initial_rho * decay.reshape([1, heads, 1, 1]).powf_scalar(time as f32)
+        + (query * weights).swap_dims(2, 3).matmul(value)
+}
+
+#[test]
+fn terminal_rho_vjp_matches_autodiff_reference() {
+    let device = burn::tensor::Device::<CpuAutodiffBackend>::default();
+    let query = Tensor::<CpuAutodiffBackend, 4>::from_data(
+        TensorData::new(
+            (0..24).map(|index| index as f32 * 0.03 - 0.2).collect(),
+            [1, 2, 3, 4],
+        ),
+        &device,
+    )
+    .require_grad();
+    let value = Tensor::<CpuAutodiffBackend, 4>::from_data(
+        TensorData::new(
+            (0..18).map(|index| index as f32 * 0.05 - 0.15).collect(),
+            [1, 1, 3, 6],
+        ),
+        &device,
+    )
+    .require_grad();
+    let decay =
+        Tensor::<CpuAutodiffBackend, 1>::from_data(TensorData::new(vec![0.95, 0.9], [2]), &device)
+            .require_grad();
+    let initial_rho = Tensor::<CpuAutodiffBackend, 4>::from_data(
+        TensorData::new(
+            (0..48).map(|index| index as f32 * 0.01 - 0.12).collect(),
+            [1, 2, 4, 6],
+        ),
+        &device,
+    )
+    .require_grad();
+    let grad_final_rho = Tensor::<CpuAutodiffBackend, 4>::from_data(
+        TensorData::new(
+            (0..48).map(|index| index as f32 * 0.02 - 0.1).collect(),
+            [1, 2, 4, 6],
+        ),
+        &device,
+    );
+    let reference = terminal_rho_reference(
+        query.clone(),
+        value.clone(),
+        decay.clone(),
+        initial_rho.clone(),
+    );
+    let reference_grads = (reference * grad_final_rho.clone()).sum().backward();
+    let vjp = dense_causal_attention_final_rho_vjp(
+        grad_final_rho.clone().inner(),
+        query.clone().inner(),
+        value.clone().inner(),
+        decay.clone().inner(),
+        Some(initial_rho.clone().inner()),
+    );
+    let input_vjp = dense_causal_attention_final_rho_input_vjp(
+        grad_final_rho.inner(),
+        query.clone().inner(),
+        value.clone().inner(),
+        decay.clone().inner(),
+        Some(initial_rho.clone().inner()),
+    );
+
+    assert_close_backend(
+        vjp.grad_query,
+        query.grad(&reference_grads).expect("reference query VJP"),
+        1.0e-5,
+        1.0e-5,
+    );
+    assert_close_backend(
+        vjp.grad_value,
+        value.grad(&reference_grads).expect("reference value VJP"),
+        1.0e-5,
+        1.0e-5,
+    );
+    assert_close_backend(
+        vjp.grad_decay,
+        decay.grad(&reference_grads).expect("reference decay VJP"),
+        1.0e-5,
+        1.0e-5,
+    );
+    assert_close_backend(
+        vjp.grad_initial_rho.expect("state VJP"),
+        initial_rho
+            .grad(&reference_grads)
+            .expect("reference state VJP"),
+        1.0e-5,
+        1.0e-5,
+    );
+    assert_close_backend(
+        input_vjp.grad_query,
+        query.grad(&reference_grads).expect("input-only query VJP"),
+        1.0e-5,
+        1.0e-5,
+    );
+    assert_close_backend(
+        input_vjp.grad_value,
+        value.grad(&reference_grads).expect("input-only value VJP"),
+        1.0e-5,
+        1.0e-5,
+    );
+    assert_close_backend(
+        input_vjp.grad_initial_rho.expect("input-only state VJP"),
+        initial_rho
+            .grad(&reference_grads)
+            .expect("input-only reference state VJP"),
+        1.0e-5,
+        1.0e-5,
+    );
+}
+
 #[test]
 fn stateful_dense_causal_attention_vjp_matches_autodiff_reference() {
     let device = burn::tensor::Device::<CpuAutodiffBackend>::default();
@@ -147,6 +282,13 @@ fn stateful_dense_causal_attention_vjp_matches_autodiff_reference() {
     );
     let reference_grads = (reference * grad_output.clone()).sum().backward();
     let vjp = dense_causal_attention_vjp_with_initial_rho(
+        grad_output.clone().inner(),
+        query.clone().inner(),
+        value.clone().inner(),
+        decay.clone().inner(),
+        Some(initial_rho.clone().inner()),
+    );
+    let input_vjp = dense_causal_attention_input_vjp_with_initial_rho(
         grad_output.inner(),
         query.clone().inner(),
         value.clone().inner(),
@@ -177,6 +319,26 @@ fn stateful_dense_causal_attention_vjp_matches_autodiff_reference() {
         initial_rho
             .grad(&reference_grads)
             .expect("reference state VJP"),
+        1.0e-5,
+        1.0e-5,
+    );
+    assert_close_backend(
+        input_vjp.grad_query,
+        query.grad(&reference_grads).expect("input-only query VJP"),
+        1.0e-5,
+        1.0e-5,
+    );
+    assert_close_backend(
+        input_vjp.grad_value,
+        value.grad(&reference_grads).expect("input-only value VJP"),
+        1.0e-5,
+        1.0e-5,
+    );
+    assert_close_backend(
+        input_vjp.grad_initial_rho.expect("input-only state VJP"),
+        initial_rho
+            .grad(&reference_grads)
+            .expect("input-only reference state VJP"),
         1.0e-5,
         1.0e-5,
     );

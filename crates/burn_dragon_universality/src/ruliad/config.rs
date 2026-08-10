@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
+use toml::Value;
 
 use crate::config::UsizeRangeConfig;
 use crate::ruliad::search::RuliadSamplerConfig;
@@ -766,6 +767,11 @@ pub struct RuliadSourceSelectionColdStartConfig {
     pub ramp_steps: usize,
     #[serde(default)]
     pub release_requires_mastery: bool,
+    /// Once mastery releases a difficulty level, keep it eligible. Subsequent
+    /// regressions still increase remediation pressure on easier buckets, but
+    /// do not discontinuously remove previously encountered material.
+    #[serde(default = "default_cold_start_monotonic_mastery_release")]
+    pub monotonic_mastery_release: bool,
     #[serde(default = "default_cold_start_mastery_min_feedback_count")]
     pub mastery_min_feedback_count: usize,
     #[serde(default = "default_cold_start_mastery_verifier_min")]
@@ -788,6 +794,7 @@ impl Default for RuliadSourceSelectionColdStartConfig {
             hold_steps: default_cold_start_hold_steps(),
             ramp_steps: default_cold_start_ramp_steps(),
             release_requires_mastery: false,
+            monotonic_mastery_release: default_cold_start_monotonic_mastery_release(),
             mastery_min_feedback_count: default_cold_start_mastery_min_feedback_count(),
             mastery_verifier_min: default_cold_start_mastery_verifier_min(),
             mastery_completion_health_min: default_cold_start_mastery_completion_health_min(),
@@ -1084,12 +1091,113 @@ impl RuliadCorpusConfig {
 }
 
 pub fn load_ruliad_config(path: &Path) -> Result<RuliadCorpusConfig> {
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("failed to read ruliad config {}", path.display()))?;
-    let config: RuliadCorpusConfig =
-        toml::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))?;
+    let mut stack = Vec::new();
+    let value = load_ruliad_config_value(path, &mut stack)?;
+    let config: RuliadCorpusConfig = value
+        .try_into()
+        .with_context(|| format!("failed to decode ruliad config {}", path.display()))?;
     config.validate()?;
     Ok(config)
+}
+
+fn load_ruliad_config_value(path: &Path, stack: &mut Vec<PathBuf>) -> Result<Value> {
+    let canonical = fs::canonicalize(path)
+        .with_context(|| format!("failed to canonicalize ruliad config {}", path.display()))?;
+    if let Some(index) = stack.iter().position(|seen| seen == &canonical) {
+        let mut cycle = stack[index..]
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        cycle.push(canonical.display().to_string());
+        return Err(anyhow!(
+            "ruliad config extends cycle detected: {}",
+            cycle.join(" -> ")
+        ));
+    }
+
+    stack.push(canonical.clone());
+    let result = (|| {
+        let contents = fs::read_to_string(&canonical)
+            .with_context(|| format!("failed to read ruliad config {}", canonical.display()))?;
+        let mut value: Value = toml::from_str(&contents)
+            .with_context(|| format!("failed to parse {} as TOML", canonical.display()))?;
+        let extends = take_ruliad_config_extends(&mut value)
+            .with_context(|| format!("failed to parse extends in {}", canonical.display()))?;
+        let Some(extends) = extends else {
+            return Ok(value);
+        };
+
+        let base_dir = canonical.parent().unwrap_or_else(|| Path::new("."));
+        let mut merged = Value::Table(toml::value::Table::new());
+        for parent in extends {
+            let parent = if parent.is_absolute() {
+                parent
+            } else {
+                base_dir.join(parent)
+            };
+            let base = load_ruliad_config_value(&parent, stack)?;
+            merge_ruliad_config_values(&mut merged, base);
+        }
+        merge_ruliad_config_values(&mut merged, value);
+        Ok(merged)
+    })();
+    stack.pop();
+    result
+}
+
+fn take_ruliad_config_extends(value: &mut Value) -> Result<Option<Vec<PathBuf>>> {
+    let Value::Table(table) = value else {
+        return Err(anyhow!("ruliad config root must be a TOML table"));
+    };
+    let Some(extends) = table.remove("extends") else {
+        return Ok(None);
+    };
+    match extends {
+        Value::String(path) => Ok(Some(vec![PathBuf::from(path)])),
+        Value::Array(values) => values
+            .into_iter()
+            .map(|value| match value {
+                Value::String(path) => Ok(PathBuf::from(path)),
+                other => Err(anyhow!(
+                    "extends entries must be strings, got {}",
+                    other.type_str()
+                )),
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Some),
+        other => Err(anyhow!(
+            "extends must be a string or array of strings, got {}",
+            other.type_str()
+        )),
+    }
+}
+
+fn merge_ruliad_config_values(base: &mut Value, overlay: Value) {
+    match (base, overlay) {
+        (Value::Table(base_table), Value::Table(overlay_table)) => {
+            if let Some(Value::String(overlay_type)) = overlay_table.get("type") {
+                let type_changed = match base_table.get("type") {
+                    Some(Value::String(base_type)) => base_type != overlay_type,
+                    Some(_) => true,
+                    None => !base_table.is_empty(),
+                };
+                if type_changed {
+                    base_table.clear();
+                }
+            }
+            for (key, overlay_value) in overlay_table {
+                match base_table.get_mut(&key) {
+                    Some(base_value) => {
+                        merge_ruliad_config_values(base_value, overlay_value);
+                    }
+                    None => {
+                        base_table.insert(key, overlay_value);
+                    }
+                }
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
 }
 
 pub fn default_ruliad_families() -> Vec<RuliadFamilyConfig> {
@@ -1230,6 +1338,10 @@ fn default_difficulty_levels() -> UsizeRangeConfig {
 }
 
 fn default_source_selection_feedback_updates_enabled() -> bool {
+    true
+}
+
+fn default_cold_start_monotonic_mastery_release() -> bool {
     true
 }
 
@@ -1494,5 +1606,88 @@ mod tests {
             .validate()
             .expect_err("invalid verifier threshold rejected");
         assert!(err.to_string().contains("mastery_verifier_min"));
+    }
+
+    #[test]
+    fn ruliad_config_extends_merges_nested_overrides_relative_to_child() {
+        let dir = tempdir().expect("tempdir");
+        let base_path = dir.path().join("base.toml");
+        let child_dir = dir.path().join("experiments");
+        fs::create_dir_all(&child_dir).expect("create child config directory");
+        let child_path = child_dir.join("closed-loop.toml");
+        let base = RuliadCorpusConfig {
+            output_dir: dir.path().join("base-output"),
+            seed: 7,
+            name: "base".to_string(),
+            train_samples: 32,
+            validation_samples: 16,
+            chunk_token_capacity: 4096,
+            serialization: RuliadSerializationConfig::default(),
+            tokenization: RuliadTokenizationConfig::default(),
+            formal_generalization: Default::default(),
+            source_selection: RuliadSourceSelectionConfig {
+                enabled: true,
+                difficulty_levels: UsizeRangeConfig { min: 0, max: 2 },
+                cold_start: RuliadSourceSelectionColdStartConfig {
+                    enabled: true,
+                    max_difficulty_level: 0,
+                    hold_steps: 2_048,
+                    ramp_steps: 8_192,
+                    release_requires_mastery: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            families: formal_ruliad_families(),
+            proof_tasks: None,
+            lean_task_limit: None,
+        };
+        fs::write(&base_path, toml::to_string(&base).expect("serialize base")).expect("write base");
+        fs::write(
+            &child_path,
+            r#"
+extends = "../base.toml"
+name = "closed-loop"
+
+[source_selection.cold_start]
+hold_steps = 64
+ramp_steps = 256
+mastery_min_feedback_count = 4
+"#,
+        )
+        .expect("write child");
+
+        let loaded = load_ruliad_config(&child_path).expect("load merged config");
+        assert_eq!(loaded.name, "closed-loop");
+        assert_eq!(loaded.seed, 7);
+        assert_eq!(loaded.source_selection.difficulty_levels.max, 2);
+        assert_eq!(loaded.source_selection.cold_start.hold_steps, 64);
+        assert_eq!(loaded.source_selection.cold_start.ramp_steps, 256);
+        assert_eq!(
+            loaded
+                .source_selection
+                .cold_start
+                .mastery_min_feedback_count,
+            4
+        );
+        assert!(loaded.source_selection.cold_start.release_requires_mastery);
+    }
+
+    #[test]
+    fn ruliad_config_extends_rejects_cycles_and_non_string_entries() {
+        let dir = tempdir().expect("tempdir");
+        let first = dir.path().join("first.toml");
+        let second = dir.path().join("second.toml");
+        fs::write(&first, "extends = \"second.toml\"\n").expect("write first");
+        fs::write(&second, "extends = \"first.toml\"\n").expect("write second");
+        let cycle = load_ruliad_config(&first).expect_err("extends cycle must fail");
+        assert!(cycle.to_string().contains("extends cycle detected"));
+
+        let invalid = dir.path().join("invalid.toml");
+        fs::write(&invalid, "extends = [\"first.toml\", 7]\n").expect("write invalid");
+        let invalid = load_ruliad_config(&invalid).expect_err("non-string extends must fail");
+        assert!(invalid.to_string().contains("failed to parse extends"));
+        let details = format!("{invalid:#}");
+        assert!(details.contains("extends entries must be strings"));
     }
 }

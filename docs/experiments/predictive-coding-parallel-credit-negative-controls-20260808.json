@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-08",
+  "backend": "cuda",
+  "device": "NVIDIA GB10",
+  "decision": "reject",
+  "claim_scope": "negative-control screens; projected-adjoint learning is one seed and tied-gradient lifelong learning is three seeds in a dev-profile executable",
+  "projected_adjoint": {
+    "model_parameters": 937154,
+    "shared_layer_uses": 4,
+    "gradient_fidelity": [
+      {"rank": 1, "global_cosine": 0.679760, "norm_ratio": 0.66856, "relative_l2": 0.73352},
+      {"rank": 2, "global_cosine": 0.679863, "norm_ratio": 0.67568, "relative_l2": 0.73335},
+      {"rank": 3, "global_cosine": 0.685015, "norm_ratio": 0.68146, "relative_l2": 0.72854},
+      {"rank": 4, "global_cosine": 0.688558, "norm_ratio": 0.68256, "relative_l2": 0.72521}
+    ],
+    "quality_screen": {
+      "updates": 128,
+      "seeds": [20260910],
+      "batch_size": 32,
+      "free_rollout_verifier_accuracy_all_arms": 0.0,
+      "arms": [
+        {"name": "adamw", "validation": 1.104, "objective": 0.9741, "action_top1": 0.6250, "action_nll": 0.9002, "model_tokens_per_second": 68720},
+        {"name": "exact_fixed_prediction", "validation": 1.093, "objective": 0.9637, "action_top1": 0.6250, "action_nll": 0.9174, "model_tokens_per_second": 47890},
+        {"name": "projected_rank_1", "validation": 1.132, "objective": 1.0330, "action_top1": 0.5625, "action_nll": 0.9820, "model_tokens_per_second": 26350},
+        {"name": "projected_rank_2", "validation": 1.176, "objective": 1.0750, "action_top1": 0.5625, "action_nll": 0.9522, "model_tokens_per_second": 18870},
+        {"name": "projected_rank_3", "validation": 1.125, "objective": 0.9978, "action_top1": 0.7812, "action_nll": 0.8832, "model_tokens_per_second": 13930},
+        {"name": "projected_rank_4", "validation": 1.133, "objective": 1.0040, "action_top1": 0.7188, "action_nll": 0.9116, "model_tokens_per_second": 11910}
+      ]
+    },
+    "artifact": "target/pc-projected-rank-screen-128-20260808"
+  },
+  "tied_gradient_conflict_reduction": {
+    "model_parameters": 888194,
+    "tasks": 4,
+    "updates_per_task": 128,
+    "seeds": [17, 29, 43],
+    "arms": [
+      {"name": "adamw", "final_accuracy_mean": 0.392655, "final_accuracy_ci95": 0.02195, "backward_transfer_mean": -0.809181, "forgetting_mean": 0.809181, "tokens_per_second": 48930},
+      {"name": "exact_fixed_prediction", "final_accuracy_mean": 0.394378, "final_accuracy_ci95": 0.04909, "backward_transfer_mean": -0.807496, "forgetting_mean": 0.807496, "tokens_per_second": 41580},
+      {"name": "conflict_reduction", "final_accuracy_mean": 0.399548, "final_accuracy_ci95": 0.00557, "backward_transfer_mean": -0.800603, "forgetting_mean": 0.800603, "tokens_per_second": 34270}
+    ],
+    "paired_conflict_minus_fixed": {
+      "final_accuracy_mean": 0.00517,
+      "final_accuracy_ci95": 0.04853,
+      "backward_transfer_mean": 0.006893,
+      "backward_transfer_ci95": 0.06471,
+      "tokens_per_second_mean": -7308,
+      "tokens_per_second_ci95": 2782
+    },
+    "artifact": "target/pc-tied-conflict-lifelong-128x3-dev-20260808.json"
+  },
+  "promotion_gate": {
+    "projected_adjoint": "failed numerical fidelity, verifier, and throughput gates",
+    "tied_gradient_conflict_reduction": "failed paired retention confidence and throughput gates",
+    "production_surface": "removed"
+  }
+}

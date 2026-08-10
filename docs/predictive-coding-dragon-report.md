@@ -40,6 +40,77 @@ retention; layer-local prediction improves acquisition inside that system. A den
 control forgets more under the same local derivative. AdamW remains the production default because
 neither local solver has established a quality or long-horizon continual-learning advantage.
 
+## 2026-08-08 capability and promotion contract
+
+The current evidence supports a narrower and more useful claim than "SotA." Exact fixed-prediction
+PC is a numerically faithful, no-global-backward alternative execution contract for Dragon. It has
+short-horizon quality parity with AdamW and passes native three-peer convergence contracts. It does
+not exceed AdamW in verified reasoning quality, throughput, or long-horizon continual retention.
+AdamW therefore remains the production default; exact PC is a qualified research alternative.
+
+The strongest source-frozen local comparison used a one-million-class CUDA Dragon, batch 32, 640
+updates, and three paired seeds. Source-selection feedback was disabled so the learner did not
+change its own curriculum. The exogenous matrix used a static expert policy for the same reason.
+
+| Matrix | Learner | Cold valid | Stream warm | Action top-1 | Solve | Goal | Free verifier | Model tok/s |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Source-frozen, 640 x 3 | AdamW | 1.122 | 0.8300 | **0.8333** | **0.5312** | **0.5196** | 0 | **20,110** |
+| Source-frozen, 640 x 3 | Exact PC | **1.106** | **0.8291** | 0.7396 | 0.4583 | 0.4692 | 0 | 14,410 |
+| Exogenous, 512 x 3 | AdamW | 1.113 | **1.015** | 0.7188 | 0.4688 | 0.4930 | 0 | **55,770** |
+| Exogenous, 512 x 3 | Exact PC | **1.085** | 1.026 | 0.7188 | 0.4688 | **0.4972** | 0 | 42,830 |
+| Exogenous, 512 x 3 | ePC | 1.113 | 1.012 | 0.7188 | 0.4479 | 0.5168 | 0 | 23,010 |
+
+Exact-PC-minus-AdamW exogenous validation is `-0.02814 +/- 0.0348`; solve and constrained
+action accuracy are identical, and goal completion is `+0.0042 +/- 0.01044`. These intervals do
+not establish superiority. Exact PC is about 23% slower in the exogenous matrix and 28% slower in
+the source-frozen matrix. GPU utilization remains dense (about 87% mean and 96% median), which
+localizes the deficit to serial local-VJP work rather than CPU transfer or launch starvation.
+
+Native decentralization is mechanically stronger. A release three-peer, three-round, signed
+full-head run passed canonical-genesis load, exact candidate/canonical tensor parity, validation
+parity, disjoint leases, merge receipts, and a process-restart drill for all three seeds. Its
+synchronized progress ratios are `0.9035`, `0.9399`, and `0.9513` against a hard `0.90` gate. A
+six-round blockwise-INT8 DiLoCo matrix passed the same convergence threshold with endpoint ratios
+`0.9048`, `0.9299`, and `0.9413`; encoded update payloads are 25.6% of FP32. The latter test does
+not require signed peer payloads and uses tiny one-step CPU rounds, so it is protocol and
+convergence evidence, not a heterogeneous GPU throughput or Byzantine-resilience result.
+
+Browser PC revisions fail closed to observer-only because the WebGPU browser trainer does not yet
+implement the local-PC program. The remaining hard blockers are nonzero free-rollout verifier
+accuracy, a statistically supported quality advantage, AdamW throughput parity, multi-hour
+retention, larger-scale replication, heterogeneous GPU-peer convergence, browser WebGPU PC, and a
+clean-tree publication repetition. Until those gates pass, neither "beyond AdamW" nor "SotA" is a
+supported claim.
+
+The complete machine-readable record, including provenance limitations and every promotion gate,
+is `docs/experiments/predictive-coding-capability-contract-20260808.json`.
+
+## 2026-08-08 rejected parallel-credit controls
+
+Two mechanisms that could have changed exact fixed-prediction PC beyond global-gradient parity
+were implemented, numerically tested, and rejected rather than retained as dormant configuration.
+
+The state-conditioned projected-adjoint control transported terminal credit through rank-one to
+rank-four bases built from terminal gradients, activities, terminal displacement, and residuals.
+On the 937,154-parameter four-use CUDA diagnostic, ranks one through four reached global gradient
+cosines of only `0.680`, `0.680`, `0.685`, and `0.689`; relative L2 error remained above `0.725`.
+The corresponding one-seed, 128-update verifier screen produced no free-rollout verifier solves.
+Rank one retained only 38% of AdamW model throughput and higher ranks were slower. The static basis
+therefore neither approximated the tied-depth adjoint sufficiently nor provided an efficiency win.
+
+The second control applied a backend-resident symmetric PCGrad-style reduction to conflicting
+logical-depth gradients of Dragon's shared parameters. It was inactive at initialization because
+the measured depth-factor pairs did not conflict. In a three-seed, four-task dense lifelong stream,
+it changed final accuracy by `+0.00517 +/- 0.04853` and backward transfer by
+`+0.00689 +/- 0.06471` versus exact fixed prediction, while reducing throughput by about 17.6%.
+The signs varied by seed and catastrophic forgetting remained near `0.80` for every learner.
+
+**Decision:** both controls fail their promotion gates and have been removed from the public solver
+and experiment surfaces. The retained negative-control record is
+`docs/experiments/predictive-coding-parallel-credit-negative-controls-20260808.json`. Exact fixed
+prediction remains the sole gradient-equivalent no-global-backward control; the next promotion gate
+must test sustained recurrent stability, not another short proxy.
+
 ## 2026-08-07 error-coordinate PC and executable contracts
 
 `solver = "error_equilibrium"` implements error-coordinate predictive coding (ePC) as a strict
@@ -1455,8 +1526,9 @@ scripts/pc_paper_analyze.py \
 The analyzer writes:
 
 - `normalized_summary.csv`: normalized legacy summary rows
-- `summary_by_arm.csv`: mean and 95% CI by iteration count and arm
-- `paired_deltas.csv`: paired seed deltas for AdamW+PC minus AdamW
+- `summary_by_arm.csv`: mean and 95% CI by matrix, backend, profile, iteration count, batch size,
+  and arm
+- `paired_deltas.csv`: paired seed deltas only across exactly matched experimental contexts
 - `event_run_summary.csv`: final event-stream metrics per generated run
 - `source_bucket_summary.csv`: final source-selection bucket telemetry when present
 - `gpu_summary.csv`: GPU utilization and power summaries
@@ -1486,6 +1558,56 @@ Statistical rules:
 - Report mean, standard deviation, and two-sided 95% Student-t intervals for small matrices.
 - Keep fixed-token and fixed-wall-clock conclusions separate.
 - Do not claim improvement unless quality and wall-clock results both support it.
+
+## Residual-Conditioned Adjoint Promotion (2026-08-08)
+
+This promotion slice tests whether Dragon can remove the serial reverse-depth local-VJP wave by
+learning each layer-output adjoint from terminal credit and a model-owned trace feature. The generic
+`burn_pc` predictor has an exact residual identity base plus independent static and conditioned
+linear corrections. Dragon supplies either the local residual or terminal displacement, owns the
+checkpoint geometry, and fingerprints the complete predictor/warmup/cadence contract. A configured
+warmup uses exact local teachers on every update before entering its sparse refresh cadence.
+
+The selected fixed-token matrix used the CUDA backend, the 1M-class local-PC profile, block size
+128, batch size 32, 512 updates, three paired seeds, a fixed holdout, open-loop source selection,
+and no TBPTT. Values are means with two-sided 95% Student-t intervals.
+
+| Arm | Cold validation CE | Source cadence CE | Verifier accuracy | Partial progress | Wall tok/s | Model tok/s | Duty |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| AdamW | 2.019 +/- 0.0646 | 1.262 +/- 0.0375 | 0.1458 +/- 0.179 | 0.3490 +/- 0.221 | 63,840 +/- 5,300 | 76,790 +/- 5,840 | 0.8313 +/- 0.0069 |
+| Exact fixed-prediction PC | 2.062 +/- 0.100 | 1.265 +/- 0.0296 | 0.1146 +/- 0.162 | 0.3099 +/- 0.174 | 39,360 +/- 1,830 | 46,890 +/- 2,000 | 0.8394 +/- 0.0056 |
+| Residual adjoint, teacher every 2 | 2.041 +/- 0.111 | 1.299 +/- 0.0152 | 0.1667 +/- 0.0448 | 0.3507 +/- 0.0395 | 28,850 +/- 1,010 | 39,050 +/- 1,830 | 0.7389 +/- 0.0087 |
+| Residual adjoint, warmup 64/every 16 | 2.080 +/- 0.125 | 1.310 +/- 0.0267 | 0.1979 +/- 0.0448 | 0.3168 +/- 0.140 | 32,410 +/- 2,040 | 46,140 +/- 2,770 | 0.7025 +/- 0.0020 |
+
+The warmup-64/every-16 arm has a `+0.0521 +/- 0.162` paired verifier delta versus AdamW, but its
+validation CE delta is `+0.0615 +/- 0.110`, source cadence CE is worse, and wall throughput is about
+49% lower. This is directional verifier evidence, not a resolved quality advantage. It remains a
+research arm; neither the production default nor the P2P protocol changes.
+
+The tensorized first-order residual-Jacobian approximation is retained only as an explicit negative
+control. At 128 updates across three seeds it reached `2.710 +/- 0.257` validation CE, zero verifier
+accuracy, and 22,240 wall tok/s. Per-layer normalization makes the assumed near-identity product
+approximation invalid for the current Dragon factorization.
+
+Batch scaling shows that the bottleneck is kernel/intermediate traffic rather than insufficient
+batch memory. These are 64-update, single-seed CUDA screens; all observed peaks remained below
+22.4 GB.
+
+| Arm | Batch | Wall tok/s | Model tok/s | Peak host/shared memory |
+| --- | ---: | ---: | ---: | ---: |
+| AdamW | 32 | 44,540 | 76,050 | 9.64 GB |
+| AdamW | 64 | 54,250 | 77,070 | 12.65 GB |
+| AdamW | 128 | 60,670 | 78,130 | 15.45 GB |
+| Exact fixed-prediction PC | 32 | 32,430 | 48,340 | 8.31 GB |
+| Exact fixed-prediction PC | 64 | 35,610 | 47,150 | 9.21 GB |
+| Exact fixed-prediction PC | 128 | 35,820 | 44,520 | 11.51 GB |
+| Residual adjoint, teacher every 2 | 64 | 26,830 | 39,090 | 14.64 GB |
+| Residual adjoint, teacher every 2 | 128 | 24,900 | 34,600 | 22.36 GB |
+
+Canonical artifacts are under
+`target/pc-paper/adjoint-promotion-512x3-combined-20260808`,
+`target/pc-paper/first-order-adjoint-128x3-20260808`, and the
+`target/pc-paper/{local-pc,amortized}-batch*-64-20260808` directories.
 
 ## Claim Boundary
 
@@ -1520,6 +1642,13 @@ Supported by current evidence:
 14. Tied direct Kolen-Pollack training runs end to end without a global backward call, preserves
     feedback and recurrent state across exact resume, and executes densely on CUDA. Identity
     feedback improves its short-run convergence, but does not make it competitive.
+15. Residual-conditioned adjoint prediction has an exact identity initialization, checkpointed
+    warmup/cadence semantics, and no hidden global backward path. Its three-seed verifier direction
+    is promising but its CE and throughput do not clear promotion gates.
+16. Increasing batch size from 64 to 128 does not improve exact or amortized local-PC model
+    throughput, so the current performance gap is not explained by batch starvation.
+17. The first-order residual-Jacobian suffix approximation is numerically well-defined but is an
+    unsuitable solver for Dragon's normalized factors and is retained only as a negative control.
 
 Not yet supported:
 

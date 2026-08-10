@@ -1,0 +1,4 @@
+extends = "local-pc-verifier-1m.toml"
+
+[model]
+fused_lowrank_grad_input_executor = "aligned_matmul"

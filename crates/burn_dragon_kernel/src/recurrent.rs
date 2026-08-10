@@ -1,6 +1,7 @@
 use burn_dragon_time::Instant;
 use std::any::{Any, TypeId};
 use std::marker::PhantomData;
+use std::sync::{Mutex, OnceLock};
 
 use burn::tensor::Tensor as BurnTensor;
 use burn::tensor::backend::Backend as BackendTrait;
@@ -31,6 +32,9 @@ mod backward_runtime;
 mod forward_runtime;
 
 use self::backward_runtime::recurrent_attention_autodiff_custom;
+pub use self::backward_runtime::{
+    RecurrentAttentionInputVjp, try_fused_recurrent_attention_input_vjp,
+};
 use self::forward_runtime::{
     try_direct_path_autodiff_cube_runtime, try_direct_path_runtime,
     try_direct_path_runtime_with_state_history, try_fusion_path_runtime,
@@ -52,7 +56,37 @@ type CudaCubeAutodiffTensor = burn::tensor::ops::FloatTensor<CudaCubeAutodiffBac
 
 pub type RecurrentProfileSnapshot = KernelProfileSnapshot;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecurrentVjpRouteProfileSnapshot {
+    pub attempts: u64,
+    pub cuda_streaming_direct: u64,
+    pub cuda_streaming_fusion: u64,
+    pub history_fallback: u64,
+}
+
+impl RecurrentVjpRouteProfileSnapshot {
+    pub fn successes(self) -> u64 {
+        self.cuda_streaming_direct
+            .saturating_add(self.cuda_streaming_fusion)
+            .saturating_add(self.history_fallback)
+    }
+
+    pub fn failures(self) -> u64 {
+        self.attempts.saturating_sub(self.successes())
+    }
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+pub(super) enum RecurrentVjpRouteKind {
+    CudaStreamingDirect,
+    CudaStreamingFusion,
+    HistoryFallback,
+}
+
 static RECURRENT_PROFILE: KernelProfileSite = KernelProfileSite::new();
+static RECURRENT_VJP_ROUTE_PROFILE: OnceLock<Mutex<RecurrentVjpRouteProfileSnapshot>> =
+    OnceLock::new();
 
 pub fn recurrent_profile_reset() {
     profile_reset(&RECURRENT_PROFILE);
@@ -60,6 +94,57 @@ pub fn recurrent_profile_reset() {
 
 pub fn recurrent_profile_snapshot() -> RecurrentProfileSnapshot {
     profile_snapshot(&RECURRENT_PROFILE)
+}
+
+pub fn recurrent_vjp_route_profile_reset() {
+    if let Ok(mut state) = RECURRENT_VJP_ROUTE_PROFILE
+        .get_or_init(|| Mutex::new(RecurrentVjpRouteProfileSnapshot::default()))
+        .lock()
+    {
+        *state = RecurrentVjpRouteProfileSnapshot::default();
+    }
+}
+
+pub fn recurrent_vjp_route_profile_snapshot() -> RecurrentVjpRouteProfileSnapshot {
+    RECURRENT_VJP_ROUTE_PROFILE
+        .get_or_init(|| Mutex::new(RecurrentVjpRouteProfileSnapshot::default()))
+        .lock()
+        .map(|state| *state)
+        .unwrap_or_default()
+}
+
+pub(super) fn recurrent_vjp_route_profile_record_attempt() {
+    if !profile_enabled() {
+        return;
+    }
+    if let Ok(mut state) = RECURRENT_VJP_ROUTE_PROFILE
+        .get_or_init(|| Mutex::new(RecurrentVjpRouteProfileSnapshot::default()))
+        .lock()
+    {
+        state.attempts = state.attempts.saturating_add(1);
+    }
+}
+
+pub(super) fn recurrent_vjp_route_profile_record_route(route: RecurrentVjpRouteKind) {
+    if !profile_enabled() {
+        return;
+    }
+    if let Ok(mut state) = RECURRENT_VJP_ROUTE_PROFILE
+        .get_or_init(|| Mutex::new(RecurrentVjpRouteProfileSnapshot::default()))
+        .lock()
+    {
+        match route {
+            RecurrentVjpRouteKind::CudaStreamingDirect => {
+                state.cuda_streaming_direct = state.cuda_streaming_direct.saturating_add(1);
+            }
+            RecurrentVjpRouteKind::CudaStreamingFusion => {
+                state.cuda_streaming_fusion = state.cuda_streaming_fusion.saturating_add(1);
+            }
+            RecurrentVjpRouteKind::HistoryFallback => {
+                state.history_fallback = state.history_fallback.saturating_add(1);
+            }
+        }
+    }
 }
 
 #[derive(Debug)]

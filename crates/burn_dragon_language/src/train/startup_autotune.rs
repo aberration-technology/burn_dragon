@@ -199,6 +199,7 @@ where
             model_config: &model_config,
             block_size: config.training.block_size,
             tbptt_chunk_size: config.training.tbptt_chunk_size,
+            tbptt_credit_window_chunks: config.training.tbptt_credit_window_chunks,
             batch_size: candidate,
             probe_steps: autotune.probe_steps,
             device_target_bytes,
@@ -259,6 +260,7 @@ where
                 model_config: &model_config,
                 block_size: config.training.block_size,
                 tbptt_chunk_size: config.training.tbptt_chunk_size,
+                tbptt_credit_window_chunks: config.training.tbptt_credit_window_chunks,
                 batch_size: candidate,
                 probe_steps: autotune.probe_steps,
                 device_target_bytes,
@@ -752,6 +754,7 @@ where
         model_config,
         block_size,
         tbptt_chunk_size,
+        tbptt_credit_window_chunks,
         batch_size,
         probe_steps,
         device_target_bytes,
@@ -764,7 +767,8 @@ where
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let model = LanguageTrainModel::new(DragonModel::<B>::new(model_config.clone(), device))
-            .with_tbptt_chunk_size(tbptt_chunk_size);
+            .with_tbptt_chunk_size(tbptt_chunk_size)
+            .with_tbptt_credit_window_chunks(tbptt_credit_window_chunks);
         let mut peak_usage: Option<DeviceMemoryUsage> = None;
         let mut peak_host_usage: Option<SystemMemorySnapshot> = baseline_host_usage;
 
@@ -870,6 +874,7 @@ where
         model_config,
         block_size,
         tbptt_chunk_size,
+        tbptt_credit_window_chunks,
         batch_size,
         probe_steps,
         device_target_bytes,
@@ -882,7 +887,8 @@ where
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let model = LanguageTrainModel::new(DragonModel::<B>::new(model_config.clone(), device))
-            .with_tbptt_chunk_size(tbptt_chunk_size);
+            .with_tbptt_chunk_size(tbptt_chunk_size)
+            .with_tbptt_credit_window_chunks(tbptt_credit_window_chunks);
         let mut peak_usage: Option<DeviceMemoryUsage> = None;
         let mut peak_host_usage: Option<SystemMemorySnapshot> = baseline_host_usage;
 
@@ -1015,6 +1021,7 @@ struct ProbeBatchRequest<'a, B: BackendTrait> {
     model_config: &'a DragonConfig,
     block_size: usize,
     tbptt_chunk_size: Option<usize>,
+    tbptt_credit_window_chunks: usize,
     batch_size: usize,
     probe_steps: usize,
     device_target_bytes: Option<u64>,

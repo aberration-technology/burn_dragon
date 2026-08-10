@@ -3685,17 +3685,14 @@ fn ruliad_prompt_schema_value_rows_train_semantic_proof_step_fields() {
     assert_eq!(decoded_targets, vec!["3|", "r0|", "f|", "1.1\n[/R2]"]);
 }
 
-#[test]
-fn prompt_value_binding_primary_step_uses_local_pc_without_global_backward() {
-    let device = burn::tensor::Device::<TestBackend>::default();
-    TestBackend::seed(&device, 41);
-    let tokenizer = burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
-        &burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
-            vocab_size: 257,
-            eos_id: None,
-        },
-    )
-    .expect("tokenizer");
+fn prompt_value_binding_policy_batch() -> crate::dataset::RuliadPolicyBatch {
+    let tokenization = burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+        vocab_size: 257,
+        eos_id: None,
+    };
+    let tokenizer =
+        burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(&tokenization)
+            .expect("tokenizer");
     let item = burn_dragon_universality::RuliadEvalItem {
         oracle_hash: "binding-test".to_string(),
         sample_index: 1,
@@ -3709,7 +3706,7 @@ fn prompt_value_binding_primary_step_uses_local_pc_without_global_backward() {
         difficulty_level: Some(0),
         spec: None,
     };
-    let policy_batch = Arc::new(crate::dataset::RuliadPolicyBatch {
+    crate::dataset::RuliadPolicyBatch {
         samples: vec![crate::dataset::RuliadPolicySample {
             prompt_tokens: tokenizer
                 .encode_payload(&item.prompt)
@@ -3718,37 +3715,47 @@ fn prompt_value_binding_primary_step_uses_local_pc_without_global_backward() {
                 .collect(),
             item,
         }],
-        tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
-            vocab_size: 257,
-            eos_id: None,
-        },
+        tokenization,
         stop_token_id: None,
-    });
+    }
+}
+
+fn prompt_value_binding_model_config() -> DragonConfig {
+    let mut config = tiny_model_config();
+    config.vocab_size = 257;
+    config.sequence_kernel = burn_dragon_core::SequenceKernelConfig::dense_score_short_context();
+    config.fused_kernels.rotary_embedding = burn_dragon_core::RotaryEmbedding::Alibi;
+    config
+}
+
+#[test]
+fn prompt_value_binding_primary_step_uses_local_pc_without_global_backward() {
+    let device = burn::tensor::Device::<TestBackend>::default();
+    TestBackend::seed(&device, 41);
+    let policy_batch = Arc::new(prompt_value_binding_policy_batch());
     let dir = tempfile::tempdir().expect("tempdir");
     let telemetry_path = dir.path().join("prompt_value_binding.jsonl");
-    let mut model_config = tiny_model_config();
-    model_config.vocab_size = 257;
-    model_config.sequence_kernel =
-        burn_dragon_core::SequenceKernelConfig::dense_score_short_context();
-    model_config.fused_kernels.rotary_embedding = burn_dragon_core::RotaryEmbedding::Alibi;
-    let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(model_config, &device))
-        .with_training_algorithm(TrainingAlgorithm::PredictiveCoding)
-        .with_local_predictive_coding(LocalPredictiveCodingConfig {
-            solver: LocalPredictiveCodingSolver::FixedPrediction,
+    let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+        prompt_value_binding_model_config(),
+        &device,
+    ))
+    .with_training_algorithm(TrainingAlgorithm::PredictiveCoding)
+    .with_local_predictive_coding(LocalPredictiveCodingConfig {
+        solver: LocalPredictiveCodingSolver::FixedPrediction,
+        ..Default::default()
+    })
+    .with_ruliad_supervision(RuliadSupervisionConfig {
+        mode: RuliadSupervisionMode::AnswerCompletion,
+        prompt_value_binding: crate::config::RuliadPromptValueBindingConfig {
+            enabled: true,
+            every_steps: 2,
+            phase_steps: 1,
+            max_rows_per_step: 8,
             ..Default::default()
-        })
-        .with_ruliad_supervision(RuliadSupervisionConfig {
-            mode: RuliadSupervisionMode::AnswerCompletion,
-            prompt_value_binding: crate::config::RuliadPromptValueBindingConfig {
-                enabled: true,
-                every_steps: 2,
-                phase_steps: 1,
-                max_rows_per_step: 8,
-                ..Default::default()
-            },
-            ..Default::default()
-        })
-        .with_ruliad_prompt_value_binding_telemetry_path(Some(telemetry_path.clone()));
+        },
+        ..Default::default()
+    })
+    .with_ruliad_prompt_value_binding_telemetry_path(Some(telemetry_path.clone()));
     let profile = model.local_predictive_coding_profile();
     let train_batch = SequenceBatch::new(
         Tensor::from_data(
@@ -3784,6 +3791,61 @@ fn prompt_value_binding_primary_step_uses_local_pc_without_global_backward() {
     assert_eq!(event["global_backward_calls"], 0);
     assert_eq!(event["rows"], 4);
     assert!(event["active_tokens"].as_u64().unwrap_or_default() > 0);
+}
+
+#[test]
+fn prompt_value_binding_fixed_prediction_matches_global_backpropagation() {
+    let device = burn::tensor::Device::<TestBackend>::default();
+    TestBackend::seed(&device, 43);
+    let model =
+        crate::train::test_support::deterministic_matrix_parameters(
+            DragonModel::<TestBackend>::new(prompt_value_binding_model_config(), &device),
+        );
+    let learner =
+        LanguageTrainModel::new(model.clone()).with_ruliad_supervision(RuliadSupervisionConfig {
+            mode: RuliadSupervisionMode::AnswerCompletion,
+            prompt_value_binding: crate::config::RuliadPromptValueBindingConfig {
+                enabled: true,
+                every_steps: 2,
+                phase_steps: 1,
+                max_rows_per_step: 8,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    let batch = prompt_value_binding_policy_batch();
+    let prepared = learner
+        .prepare_ruliad_prompt_value_binding_batch(&batch, &device, 96)
+        .expect("prompt-value binding batch");
+    assert_eq!(prepared.rows, 4);
+    assert!(prepared.active_tokens > 0);
+
+    let report = crate::train::local_predictive_coding::local_predictive_coding_gradient_fidelity(
+        &model,
+        prepared.inputs,
+        prepared.targets,
+        Some(prepared.loss_mask),
+        &LocalPredictiveCodingConfig {
+            solver: LocalPredictiveCodingSolver::FixedPrediction,
+            factor_reduction: PredictiveCodingFactorReduction::Sum,
+            ..Default::default()
+        },
+    )
+    .expect("prompt-value binding gradient fidelity");
+
+    assert!(report.loss_absolute_error < 1.0e-6, "{report:?}");
+    assert_eq!(report.pc_step.global_backward_calls, 0);
+    assert!(
+        report.global.cosine.is_some_and(|cosine| cosine > 0.999_99),
+        "{report:?}"
+    );
+    assert!(
+        report
+            .global
+            .relative_l2_error
+            .is_some_and(|error| error < 1.0e-4),
+        "{report:?}"
+    );
 }
 
 #[test]

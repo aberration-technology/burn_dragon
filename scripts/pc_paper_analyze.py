@@ -397,6 +397,15 @@ EVENT_SUMMARY_COLUMNS = [
     "pc_deployment_aligned_last",
     "pc_amortization_components_last",
     "pc_amortization_loss_last",
+    "prompt_value_binding_event_count",
+    "prompt_value_binding_active_steps",
+    "prompt_value_binding_skipped_steps",
+    "prompt_value_binding_algorithm_last",
+    "prompt_value_binding_sample_groups_total",
+    "prompt_value_binding_rows_total",
+    "prompt_value_binding_active_tokens_total",
+    "prompt_value_binding_padded_tokens_total",
+    "prompt_value_binding_global_backward_calls_total",
 ]
 
 CAPABILITY_COVERAGE_COLUMNS = [
@@ -787,7 +796,12 @@ def discover_inputs(paths: Iterable[str]) -> tuple[list[Path], list[Path], list[
                 gpu_csvs.append(candidate)
             elif name.endswith(".csv") and "summary" in name:
                 summary_csvs.append(candidate)
-            elif name in {"training_events.jsonl", "source_selection.jsonl", "capacity_scaling.jsonl"}:
+            elif name in {
+                "training_events.jsonl",
+                "source_selection.jsonl",
+                "capacity_scaling.jsonl",
+                "ruliad_prompt_value_binding.jsonl",
+            }:
                 event_jsonls.append(candidate)
             elif name.endswith(".json") and candidate.parent.name == "manifests":
                 manifest_jsons.append(candidate)
@@ -1192,6 +1206,14 @@ def default_event_summary(run: str, run_dir: Path) -> dict[str, Any]:
     summary["pc_structured_terminal_skipped_steps_total"] = 0
     summary["pc_structured_terminal_groups_total"] = 0
     summary["pc_structured_terminal_rows_total"] = 0
+    summary["prompt_value_binding_event_count"] = 0
+    summary["prompt_value_binding_active_steps"] = 0
+    summary["prompt_value_binding_skipped_steps"] = 0
+    summary["prompt_value_binding_sample_groups_total"] = 0
+    summary["prompt_value_binding_rows_total"] = 0
+    summary["prompt_value_binding_active_tokens_total"] = 0
+    summary["prompt_value_binding_padded_tokens_total"] = 0
+    summary["prompt_value_binding_global_backward_calls_total"] = 0
     summary["_pc_ms_values"] = []
     summary["_source_loss_by_step"] = {}
     summary["_source_loss_unkeyed"] = []
@@ -1273,7 +1295,27 @@ def collect_event_summaries(
             run = event.get("run_id") or run_dir.name
             summary = summaries.setdefault(run, default_event_summary(run, run_dir))
             event_type = event.get("type")
-            if path.name == "source_selection.jsonl" or event_type == "source_selection":
+            if path.name == "ruliad_prompt_value_binding.jsonl":
+                summary["prompt_value_binding_event_count"] += 1
+                summary["prompt_value_binding_algorithm_last"] = event.get("algorithm", "")
+                if event.get("skip_reason"):
+                    summary["prompt_value_binding_skipped_steps"] += 1
+                else:
+                    summary["prompt_value_binding_active_steps"] += 1
+                summary["prompt_value_binding_sample_groups_total"] += as_int(
+                    event.get("sample_groups")
+                ) or 0
+                summary["prompt_value_binding_rows_total"] += as_int(event.get("rows")) or 0
+                summary["prompt_value_binding_active_tokens_total"] += as_int(
+                    event.get("active_tokens")
+                ) or 0
+                summary["prompt_value_binding_padded_tokens_total"] += as_int(
+                    event.get("padded_tokens")
+                ) or 0
+                summary["prompt_value_binding_global_backward_calls_total"] += as_int(
+                    event.get("global_backward_calls")
+                ) or 0
+            elif path.name == "source_selection.jsonl" or event_type == "source_selection":
                 update_source(summary, event)
                 if any(
                     event.get(key)
@@ -2864,6 +2906,36 @@ def self_test() -> None:
             )
             + "\n"
         )
+        (events / "ruliad_prompt_value_binding.jsonl").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "step_index": 1,
+                    "algorithm": "predictive_coding",
+                    "skip_reason": None,
+                    "sample_groups": 3,
+                    "rows": 8,
+                    "active_tokens": 16,
+                    "padded_tokens": 4,
+                    "global_backward_calls": 0,
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "version": 1,
+                    "step_index": 3,
+                    "algorithm": "predictive_coding",
+                    "skip_reason": "missing_or_empty_policy_batch",
+                    "sample_groups": 0,
+                    "rows": 0,
+                    "active_tokens": 0,
+                    "padded_tokens": 0,
+                    "global_backward_calls": 0,
+                }
+            )
+            + "\n"
+        )
         manifests = root / "manifests"
         manifests.mkdir()
         log_path = root / "run-a.log"
@@ -2926,6 +2998,15 @@ def self_test() -> None:
         assert event_rows[0]["wall_tokens_per_second"] == "512.0"
         assert event_rows[0]["model_tokens_per_second"] == "640.0"
         assert event_rows[0]["model_duty_fraction"] == "0.8"
+        assert event_rows[0]["prompt_value_binding_event_count"] == "2"
+        assert event_rows[0]["prompt_value_binding_active_steps"] == "1"
+        assert event_rows[0]["prompt_value_binding_skipped_steps"] == "1"
+        assert event_rows[0]["prompt_value_binding_algorithm_last"] == "predictive_coding"
+        assert event_rows[0]["prompt_value_binding_sample_groups_total"] == "3"
+        assert event_rows[0]["prompt_value_binding_rows_total"] == "8"
+        assert event_rows[0]["prompt_value_binding_active_tokens_total"] == "16"
+        assert event_rows[0]["prompt_value_binding_padded_tokens_total"] == "4"
+        assert event_rows[0]["prompt_value_binding_global_backward_calls_total"] == "0"
         assert event_rows[0]["valid_loss_mean"] == "0.45"
         assert event_rows[0]["stream_warm_loss_mean"] == "0.55"
         assert event_rows[0]["validation_objective_loss_last"] == "0.6"

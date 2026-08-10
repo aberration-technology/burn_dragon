@@ -13,6 +13,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import re
 import statistics
 import sys
@@ -1978,7 +1979,7 @@ def read_gpu_csvs(
     paths: Iterable[Path], manifests: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     manifest_by_gpu_path = {
-        str(Path(str(manifest.get("gpu_path")))): manifest
+        str(Path(str(manifest.get("gpu_path"))).resolve()): manifest
         for manifest in manifests
         if manifest.get("gpu_path")
     }
@@ -1996,7 +1997,7 @@ def read_gpu_csvs(
                 if power_value is not None:
                     power.append(power_value)
         row = {key: "" for key in GPU_COLUMNS}
-        manifest = manifest_by_gpu_path.get(str(path))
+        manifest = manifest_by_gpu_path.get(str(path.resolve()))
         row.update(
             {
                 "file": str(path),
@@ -2989,6 +2990,13 @@ def self_test() -> None:
         gpu = list(csv.DictReader((out / "gpu_summary.csv").open()))
         assert gpu[0]["arm"] == "adamwpc"
         assert gpu[0]["util_mean"] == "90.0"
+        relative_gpu_path = Path(os.path.relpath(gpu_path, Path.cwd()))
+        relative_gpu = read_gpu_csvs(
+            [relative_gpu_path], read_manifests([manifests / "run-a.json"])
+        )
+        assert relative_gpu[0]["trial_key"] == "pc-smoke-run-a"
+        assert relative_gpu[0]["arm"] == "adamwpc"
+        assert relative_gpu[0]["seed"] == 7
         three_sample_stats = stats([1.0, 2.0, 3.0])
         assert math.isclose(three_sample_stats.ci95, 4.303 / math.sqrt(3.0))
         markdown = (out / "paper_tables.md").read_text()

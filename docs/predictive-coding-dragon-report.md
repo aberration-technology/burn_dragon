@@ -1,6 +1,6 @@
 # Predictive Coding in Dragon Training
 
-Date: 2026-08-07
+Date: 2026-08-08
 
 ## Status
 
@@ -48,9 +48,13 @@ short-horizon quality parity with AdamW and passes native three-peer convergence
 not exceed AdamW in verified reasoning quality, throughput, or long-horizon continual retention.
 AdamW therefore remains the production default; exact PC is a qualified research alternative.
 
-The strongest source-frozen local comparison used a one-million-class CUDA Dragon, batch 32, 640
-updates, and three paired seeds. Source-selection feedback was disabled so the learner did not
-change its own curriculum. The exogenous matrix used a static expert policy for the same reason.
+The authoritative short-horizon comparison is now a clean-tree, five-seed CUDA replication at
+commit `1d7c362`. It used a 937,154-parameter Dragon, batch 32, 512 updates, streaming sequence
+batching, persistent rho, 64-token TBPTT, fixed holdout validation, and a static expert source
+policy. Source-selection feedback was disabled, so the learner could not change its own
+curriculum. Every trial completed under the same release-binary hash and a 75% system-memory hard
+guard. The earlier three-seed source-frozen and exogenous matrices remain useful exploratory
+controls but are no longer the provenance authority.
 
 | Matrix | Learner | Cold valid | Stream warm | Action top-1 | Solve | Goal | Free verifier | Model tok/s |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -59,12 +63,18 @@ change its own curriculum. The exogenous matrix used a static expert policy for 
 | Exogenous, 512 x 3 | AdamW | 1.113 | **1.015** | 0.7188 | 0.4688 | 0.4930 | 0 | **55,770** |
 | Exogenous, 512 x 3 | Exact PC | **1.085** | 1.026 | 0.7188 | 0.4688 | **0.4972** | 0 | 42,830 |
 | Exogenous, 512 x 3 | ePC | 1.113 | 1.012 | 0.7188 | 0.4479 | 0.5168 | 0 | 23,010 |
+| Clean exogenous, 512 x 5 | AdamW | **1.0889** | **1.0180** | 0.7188 | 0.4625 | 0.4958 | 0 | **55,310** |
+| Clean exogenous, 512 x 5 | Exact PC | 1.0962 | 1.0241 | **0.7313** | **0.4813** | **0.5227** | 0 | 41,704 |
 
-Exact-PC-minus-AdamW exogenous validation is `-0.02814 +/- 0.0348`; solve and constrained
-action accuracy are identical, and goal completion is `+0.0042 +/- 0.01044`. These intervals do
-not establish superiority. Exact PC is about 23% slower in the exogenous matrix and 28% slower in
-the source-frozen matrix. GPU utilization remains dense (about 87% mean and 96% median), which
-localizes the deficit to serial local-VJP work rather than CPU transfer or launch starvation.
+In the clean replication, exact-PC-minus-AdamW cold validation is
+`+0.00736 +/- 0.03633`, constrained action top-1 is `+0.0125 +/- 0.02125`, solve rate is
+`+0.01875 +/- 0.03470`, and goal completion is `+0.02689 +/- 0.05637`. Every interval includes
+zero. Both arms have zero free-rollout verifier accuracy. Exact PC is 24.6% slower in model-step
+throughput (`41,704` versus `55,310 tok/s`) and 7.4% slower end to end because identical verifier
+work dilutes the learner cost. Mean GPU utilization is 87.2% for PC and 86.7% for AdamW, with a
+95.8% median for both, which localizes the deficit to serial local-VJP work rather than CPU transfer
+or launch starvation. The earlier three-seed matrices showed the same 23% to 28% model-throughput
+deficit.
 
 Native decentralization is mechanically stronger. A release three-peer, three-round, signed
 full-head run passed canonical-genesis load, exact candidate/canonical tensor parity, validation
@@ -79,11 +89,12 @@ Browser PC revisions fail closed to observer-only because the WebGPU browser tra
 implement the local-PC program. The remaining hard blockers are nonzero free-rollout verifier
 accuracy, a statistically supported quality advantage, AdamW throughput parity, multi-hour
 retention, larger-scale replication, heterogeneous GPU-peer convergence, browser WebGPU PC, and a
-clean-tree publication repetition. Until those gates pass, neither "beyond AdamW" nor "SotA" is a
-supported claim.
+clean fixed-wall-clock publication repetition. The clean five-seed fixed-token repetition is
+complete. Until the remaining gates pass, neither "beyond AdamW" nor "SotA" is a supported claim.
 
 The complete machine-readable record, including provenance limitations and every promotion gate,
-is `docs/experiments/predictive-coding-capability-contract-20260808.json`.
+is `docs/experiments/predictive-coding-capability-contract-20260808.json`; the compact clean-run
+record is `docs/experiments/predictive-coding-clean-exogenous-five-seed-20260808.json`.
 
 ## 2026-08-08 rejected parallel-credit controls
 

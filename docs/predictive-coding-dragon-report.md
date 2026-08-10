@@ -76,6 +76,27 @@ work dilutes the learner cost. Mean GPU utilization is 87.2% for PC and 86.7% fo
 or launch starvation. The earlier three-seed matrices showed the same 23% to 28% model-throughput
 deficit.
 
+A second clean-tree replication held wall time fixed at 180 seconds per arm and deferred policy,
+correctness, and sequence-state probes until after the timed region. This corrects an excluded
+predecessor run in which an epoch-four policy probe consumed the remaining budget and left every
+arm at 512 updates. The corrected matrix used the same five seeds, model, batch, stream, holdout,
+and source-policy controls, with checkpoints every 256 updates and a planned horizon of 8,192
+updates.
+
+| Fixed wall clock | Completed updates | Best holdout | Final-best | Regression | Val slope | Mean GPU util | Median GPU util |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| AdamW | **1,689.6 +/- 174.1** | 1.1273 +/- 0.0178 | **0.2103 +/- 0.0679** | **0.1861 +/- 0.0580** | **0.03426 +/- 0.00939** | 78.6% | 88.2% |
+| Exact PC | 1,280.0 | **1.0970 +/- 0.0283** | 0.2163 +/- 0.0341 | 0.1972 +/- 0.0316 | 0.04277 +/- 0.00938 | **81.1%** | **89.0%** |
+
+Exact PC reaches a lower best holdout loss in this budget: paired PC-minus-AdamW is
+`-0.03029 +/- 0.02754`. It also completes `409.6 +/- 174.1` fewer checkpointed updates. That
+best-checkpoint result is not retained. AdamW and PC end about 19% and 20% above their respective
+best losses, and both have significantly positive validation slopes. PC-minus-AdamW final-best is
+`+0.00605 +/- 0.05629`; PC therefore provides no observed stability benefit. Reasoning probes were
+deliberately excluded from the timed region, so this matrix makes no verifier-quality claim. It
+closes the clean fixed-wall-clock reproducibility gate while failing the continual-retention and
+throughput gates.
+
 Native decentralization is mechanically stronger. A release three-peer, three-round, signed
 full-head run passed canonical-genesis load, exact candidate/canonical tensor parity, validation
 parity, disjoint leases, merge receipts, and a process-restart drill for all three seeds. Its
@@ -87,14 +108,15 @@ convergence evidence, not a heterogeneous GPU throughput or Byzantine-resilience
 
 Browser PC revisions fail closed to observer-only because the WebGPU browser trainer does not yet
 implement the local-PC program. The remaining hard blockers are nonzero free-rollout verifier
-accuracy, a statistically supported quality advantage, AdamW throughput parity, multi-hour
-retention, larger-scale replication, heterogeneous GPU-peer convergence, browser WebGPU PC, and a
-clean fixed-wall-clock publication repetition. The clean five-seed fixed-token repetition is
+accuracy, retained quality beyond AdamW, AdamW throughput parity, the observed post-best validation
+regression, multi-hour retention, larger-scale replication, heterogeneous GPU-peer convergence,
+and browser WebGPU PC. Both clean five-seed fixed-token and fixed-wall-clock repetitions are
 complete. Until the remaining gates pass, neither "beyond AdamW" nor "SotA" is a supported claim.
 
 The complete machine-readable record, including provenance limitations and every promotion gate,
 is `docs/experiments/predictive-coding-capability-contract-20260808.json`; the compact clean-run
-record is `docs/experiments/predictive-coding-clean-exogenous-five-seed-20260808.json`.
+records are `docs/experiments/predictive-coding-clean-exogenous-five-seed-20260808.json` and
+`docs/experiments/predictive-coding-clean-wall-clock-five-seed-20260808.json`.
 
 ## 2026-08-08 rejected parallel-credit controls
 

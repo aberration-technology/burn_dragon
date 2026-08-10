@@ -127,6 +127,7 @@ SUMMARY_COLUMNS = [
     "checkpoint_promoted_count",
     "checkpoint_last_epoch",
     "checkpoint_last_absolute_step",
+    "checkpoint_completed_steps",
     "checkpoint_last_promoted_epoch",
     "checkpoint_promotion_ineligible_count",
     "capability_statistical_regression_count",
@@ -210,6 +211,7 @@ ANALYSIS_METRICS = [
     "checkpoint_promoted_count",
     "checkpoint_last_epoch",
     "checkpoint_last_absolute_step",
+    "checkpoint_completed_steps",
     "checkpoint_last_promoted_epoch",
     "checkpoint_promotion_ineligible_count",
     "capability_statistical_regression_count",
@@ -334,6 +336,7 @@ EVENT_SUMMARY_COLUMNS = [
     "checkpoint_count",
     "checkpoint_last_epoch",
     "checkpoint_last_absolute_step",
+    "checkpoint_completed_steps",
     "checkpoint_promoted_count",
     "checkpoint_last_promoted_epoch",
     "checkpoint_promotion_ineligible_count",
@@ -1356,8 +1359,14 @@ def collect_event_summaries(
             elif event_type == "checkpoint":
                 summary["checkpoint_count"] += 1
                 summary["checkpoint_last_epoch"] = event.get("epoch", "")
-                summary["checkpoint_last_absolute_step"] = event.get(
-                    "absolute_step", ""
+                absolute_step = as_int(event.get("absolute_step"))
+                summary["checkpoint_last_absolute_step"] = (
+                    absolute_step if absolute_step is not None else ""
+                )
+                # Scheduler steps are zero-based; a checkpoint emitted at step N
+                # contains N + 1 completed optimizer updates.
+                summary["checkpoint_completed_steps"] = (
+                    absolute_step + 1 if absolute_step is not None else ""
                 )
                 if event.get("promoted") is True:
                     summary["checkpoint_promoted_count"] += 1
@@ -1809,6 +1818,9 @@ def normalize_event_summaries(rows: Iterable[dict[str, Any]]) -> list[dict[str, 
                 "checkpoint_last_absolute_step": as_float(
                     event.get("checkpoint_last_absolute_step")
                 ),
+                "checkpoint_completed_steps": as_float(
+                    event.get("checkpoint_completed_steps")
+                ),
                 "checkpoint_last_promoted_epoch": as_float(
                     event.get("checkpoint_last_promoted_epoch")
                 ),
@@ -2144,7 +2156,7 @@ def write_markdown(
                 iters=row.get("iters", ""),
                 wall_clock_seconds=row.get("wall_clock_seconds", ""),
                 completed_updates=fmt_mean_ci(
-                    row, "checkpoint_last_absolute_step"
+                    row, "checkpoint_completed_steps"
                 ),
                 batch_size=row.get("batch_size", ""),
                 checkpoint_interval=row.get("checkpoint_interval_iters", ""),
@@ -2937,6 +2949,7 @@ def self_test() -> None:
         assert event_rows[0]["checkpoint_count"] == "2"
         assert event_rows[0]["checkpoint_last_epoch"] == "3"
         assert event_rows[0]["checkpoint_last_absolute_step"] == "255"
+        assert event_rows[0]["checkpoint_completed_steps"] == "256"
         assert event_rows[0]["checkpoint_promoted_count"] == "1"
         assert event_rows[0]["checkpoint_last_promoted_epoch"] == "3"
         assert event_rows[0]["ruliad_policy_solve_rate_best"] == "0.6"
@@ -2998,6 +3011,7 @@ def self_test() -> None:
         assert event_normalized["checkpoint_promoted_count"] == "1.0"
         assert event_normalized["checkpoint_last_epoch"] == "3.0"
         assert event_normalized["checkpoint_last_absolute_step"] == "255.0"
+        assert event_normalized["checkpoint_completed_steps"] == "256.0"
         assert event_normalized["ruliad_policy_solve_rate_best"] == "0.6"
         assert event_normalized["ruliad_policy_solve_rate_promoted"] == "0.5"
         assert event_normalized["checkpoint_promotion_ineligible_count"] == "1.0"

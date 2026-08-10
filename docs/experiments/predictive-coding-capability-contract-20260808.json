@@ -3,7 +3,7 @@
   "date": "2026-08-08",
   "decision": "research_qualified_not_promoted",
   "sota_claim_supported": false,
-  "claim_scope": "Exact fixed-prediction PC is a numerically faithful no-global-backward Dragon learner with clean-tree five-seed short-horizon local quality parity and native three-peer convergence parity at the tested one-million-parameter scale. It has not exceeded AdamW quality, throughput, free-rollout correctness, or long-horizon continual-learning behavior.",
+  "claim_scope": "Exact fixed-prediction PC is a numerically faithful no-global-backward Dragon learner with clean-tree five-seed fixed-token quality parity, clean-tree five-seed fixed-wall-clock evidence, and native three-peer convergence parity at the tested one-million-parameter scale. It has not exceeded AdamW retained quality, throughput, free-rollout correctness, or long-horizon continual-learning behavior.",
   "implementation_contract": {
     "production_default": "adamw_backpropagation",
     "qualified_research_alternative": "exact_fixed_prediction_pc",
@@ -236,6 +236,76 @@
     "artifact": "target/pc-paper/clean-exogenous-5seed-1d7c362",
     "summary": "docs/experiments/predictive-coding-clean-exogenous-five-seed-20260808.json"
   },
+  "local_exogenous_clean_wall_clock_five_seed_matrix": {
+    "backend": "cuda",
+    "device": "NVIDIA GB10",
+    "model_parameters": 937154,
+    "wall_clock_seconds_per_run": 180,
+    "planned_updates_per_run": 8192,
+    "seeds": [
+      20261010,
+      20261011,
+      20261012,
+      20261013,
+      20261014
+    ],
+    "batch_size": 32,
+    "checkpoint_interval_updates": 256,
+    "expensive_ruliad_probes_deferred": true,
+    "source_selection_feedback_updates_enabled": false,
+    "validation_objective": "fixed_holdout",
+    "learning_rate": 0.001,
+    "git_sha": "2e813c782e2254cb85259dfb6c5479d604f4be43",
+    "git_dirty": false,
+    "clean_git_required": true,
+    "arms": [
+      {
+        "name": "adamw",
+        "completed_checkpointed_updates": 1689.6,
+        "completed_checkpointed_updates_ci95": 174.07445826,
+        "validation_best": 1.12730149,
+        "validation_best_ci95": 0.01781149,
+        "validation_final_minus_best": 0.21026067,
+        "validation_final_minus_best_ci95": 0.06787743,
+        "validation_regression_fraction": 0.18613519,
+        "validation_regression_fraction_ci95": 0.05801107,
+        "validation_slope_per_checkpoint": 0.03426341,
+        "validation_slope_per_checkpoint_ci95": 0.00938762,
+        "gpu_utilization_mean_percent": 78.621,
+        "gpu_utilization_median_percent": 88.2
+      },
+      {
+        "name": "exact_fixed_prediction_pc",
+        "completed_checkpointed_updates": 1280.0,
+        "completed_checkpointed_updates_ci95": 0.0,
+        "validation_best": 1.09701226,
+        "validation_best_ci95": 0.02830174,
+        "validation_final_minus_best": 0.21630583,
+        "validation_final_minus_best_ci95": 0.03413545,
+        "validation_regression_fraction": 0.19722807,
+        "validation_regression_fraction_ci95": 0.03161515,
+        "validation_slope_per_checkpoint": 0.04276912,
+        "validation_slope_per_checkpoint_ci95": 0.00937550,
+        "gpu_utilization_mean_percent": 81.095,
+        "gpu_utilization_median_percent": 89.0
+      }
+    ],
+    "paired_exact_pc_minus_adamw": {
+      "completed_checkpointed_updates": -409.6,
+      "completed_checkpointed_updates_ci95": 174.07445826,
+      "validation_best": -0.03028923,
+      "validation_best_ci95": 0.02754204,
+      "validation_final_minus_best": 0.00604516,
+      "validation_final_minus_best_ci95": 0.05629036,
+      "validation_regression_fraction": 0.01109289,
+      "validation_regression_fraction_ci95": 0.04999544,
+      "validation_slope_per_checkpoint": 0.00850571,
+      "validation_slope_per_checkpoint_ci95": 0.01306410
+    },
+    "conclusion": "Exact PC reaches a slightly lower best holdout loss while completing fewer updates, but neither learner retains its best checkpoint and PC does not reduce the subsequent validation regression.",
+    "artifact": "target/pc-paper/clean-wall180-train-5seed-2e813c7",
+    "summary": "docs/experiments/predictive-coding-clean-wall-clock-five-seed-20260808.json"
+  },
   "gpu_density": {
     "device": "NVIDIA GB10",
     "backend": "cuda",
@@ -319,8 +389,8 @@
     "experiment_script_clean_tree_gate_available": true,
     "analyzer_self_test_available": true,
     "publication_grade_clean_tree_fixed_token_repetition_complete": true,
-    "publication_grade_fixed_wall_clock_repetition_complete": false,
-    "publication_grade_clean_tree_repetition_complete": false
+    "publication_grade_fixed_wall_clock_repetition_complete": true,
+    "publication_grade_clean_tree_repetition_complete": true
   },
   "promotion_gates": {
     "mechanical_no_global_backward": true,
@@ -336,7 +406,7 @@
     "heterogeneous_gpu_peer_replication": false,
     "browser_webgpu_pc_training": false,
     "publication_grade_clean_tree_fixed_token_replication": true,
-    "publication_grade_clean_tree_replication": false
+    "publication_grade_clean_tree_replication": true
   },
   "blocking_evidence": [
     "Free-rollout verifier accuracy is zero in every completed local arm.",
@@ -344,7 +414,8 @@
     "No completed paired quality interval establishes a PC advantage over AdamW.",
     "Temporal-k2 and error-equilibrium PC did not improve the exogenous gate.",
     "Browser peers fail closed to observer-only for PC revisions because the browser trainer does not implement local PC.",
-    "The clean-tree five-seed fixed-token replication is complete, but no clean fixed-wall-clock replication or multi-hour retention gate has completed.",
+    "The clean-tree fixed-wall-clock replication is complete, but both learners regress by roughly 19% to 20% from their best validation checkpoint and exact PC does not improve that stability signal.",
+    "No multi-hour retention gate has completed.",
     "No heterogeneous native-GPU plus browser-PC convergence experiment has completed."
   ]
 }

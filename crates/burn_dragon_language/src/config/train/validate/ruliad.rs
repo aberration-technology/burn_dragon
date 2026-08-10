@@ -824,6 +824,19 @@ impl TrainingConfig {
                 "dataset.ruliad_source_selection_feedback_updates_enabled requires dataset.type=\"universality_ruliad\""
             ));
         }
+        if self
+            .dataset
+            .ruliad_source_selection_cold_start_enabled
+            .is_some()
+            && !matches!(
+                self.dataset.source,
+                DatasetSourceConfig::UniversalityRuliad { .. }
+            )
+        {
+            return Err(anyhow!(
+                "dataset.ruliad_source_selection_cold_start_enabled requires dataset.type=\"universality_ruliad\""
+            ));
+        }
         Ok(())
     }
 }

@@ -21,6 +21,11 @@ pub struct DatasetConfig {
     /// controlled optimizer and training-algorithm comparisons.
     #[serde(default)]
     pub ruliad_source_selection_feedback_updates_enabled: Option<bool>,
+    /// Optional run-level override for the Ruliad cold-start curriculum gate.
+    /// Disabling it exposes every currently materialized difficulty bucket and
+    /// is useful for open-loop train/holdout distribution controls.
+    #[serde(default)]
+    pub ruliad_source_selection_cold_start_enabled: Option<bool>,
     #[serde(flatten)]
     pub source: DatasetSourceConfig,
     #[serde(default)]

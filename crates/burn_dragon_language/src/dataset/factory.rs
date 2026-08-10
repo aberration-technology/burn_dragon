@@ -6,6 +6,7 @@ use crate::config::{
 };
 
 use super::{Dataset, HuggingFaceDataset, UniversalityDataset};
+use crate::dataset::universality::RuliadSourceSelectionOverrides;
 
 pub fn build_dataset(
     cfg: &DatasetConfig,
@@ -62,11 +63,14 @@ pub fn build_dataset(
             })?,
         ),
         DatasetSourceConfig::UniversalityRuliad { config } => Dataset::from_universality(
-            UniversalityDataset::new_ruliad_on_the_fly(
+            UniversalityDataset::new_ruliad_on_the_fly_with_overrides(
                 config,
                 training.block_size,
                 training.batch_size,
                 &cfg.tokenizer,
+                RuliadSourceSelectionOverrides {
+                    cold_start_enabled: cfg.ruliad_source_selection_cold_start_enabled,
+                },
             )
             .and_then(|dataset| {
                 dataset.with_source_selection_state_path(
@@ -98,7 +102,7 @@ pub fn build_dataset(
             ds.train_split_ratio()
         ),
         Dataset::Universality(ds) => format!(
-            "Prepared {} {} from {} with batch_size={}, block_size={}, split_ratio={}{}{}",
+            "Prepared {} {} from {} with batch_size={}, block_size={}, split_ratio={}{}{}{}",
             ds.source_kind_label(),
             ds.dataset_name(),
             ds.source_path().display(),
@@ -107,6 +111,9 @@ pub fn build_dataset(
             ds.train_split_ratio(),
             ds.source_selection_feedback_updates_enabled()
                 .map(|enabled| format!(", source_selection_feedback_updates={enabled}"))
+                .unwrap_or_default(),
+            ds.source_selection_cold_start_enabled()
+                .map(|enabled| format!(", source_selection_cold_start={enabled}"))
                 .unwrap_or_default(),
             ds.train_probe_summary().map(|summary| format!(
                 ", train_docs={}, val_docs={}, doc_tokens={}, probe_mean_gzip={:.4}, probe_complexity={:.2}, runtime_doc_cache_limit={}",

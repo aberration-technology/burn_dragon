@@ -222,6 +222,11 @@ struct LiveSourceSelectionState {
     control: Mutex<LiveSourceSelectionControl>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct RuliadSourceSelectionOverrides {
+    pub cold_start_enabled: Option<bool>,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
 struct LiveSourceSelectionControl {
     difficulty_pressure: f32,

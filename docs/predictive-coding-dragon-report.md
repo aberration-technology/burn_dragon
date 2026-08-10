@@ -97,6 +97,32 @@ deliberately excluded from the timed region, so this matrix makes no verifier-qu
 closes the clean fixed-wall-clock reproducibility gate while failing the continual-retention and
 throughput gates.
 
+The apparent fixed-wall-clock collapse is strongly learning-rate dependent. A clean paired
+five-seed repetition at `3e-4`, with every other timed control unchanged, reverses the validation
+slope for both learners:
+
+| Learning rate `3e-4` | Completed updates | Best holdout | Final-best | Regression | Val slope | Source cadence |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| AdamW | **1,740.8 +/- 142.1** | **1.0901 +/- 0.0098** | 0.1464 +/- 0.0328 | 0.1343 +/- 0.0299 | -0.00995 +/- 0.00753 | **0.6715 +/- 0.0098** |
+| Exact PC | 1,280.0 | 1.1067 +/- 0.0150 | **0.0947 +/- 0.0389** | **0.0855 +/- 0.0346** | **-0.03909 +/- 0.01123** | 0.6970 +/- 0.0064 |
+
+Relative to PC at `1e-3`, the lower rate changes endpoint holdout by
+`-0.1860 +/- 0.0477`, final-minus-best by `-0.1216 +/- 0.0419`, regression fraction by
+`-0.1117 +/- 0.0417`, and slope by `-0.08186 +/- 0.01521`. These are retained-stability gains,
+not merely a shifted optimum. In the matched `3e-4` comparison, PC-minus-AdamW slope is
+`-0.02915 +/- 0.01815`, while best loss is `+0.01667 +/- 0.01350` and source-cadence loss is
+`+0.02545 +/- 0.00851`. PC is still improving more quickly at the timed boundary, but reaches a
+slightly worse best checkpoint and learns the observed source stream less well. Endpoint loss and
+final-best differences remain statistically unresolved.
+
+The `3e-4` rate is therefore promoted as the one-million-parameter Ruliad experiment default, not
+as evidence that PC exceeds AdamW. The source contract also matters: these runs freeze capability
+feedback while retaining the corpus cold start, so training stays at difficulty 0 while the fixed
+holdout covers materialized difficulties 0 and 1. The runner now records an explicit cold-start
+override, and the next control disables the cap so train and holdout cover the same materialized
+frontier. The machine-readable rate ablation is
+`docs/experiments/predictive-coding-stability-learning-rate-ablation-20260808.json`.
+
 Native decentralization is mechanically stronger. A release three-peer, three-round, signed
 full-head run passed canonical-genesis load, exact candidate/canonical tensor parity, validation
 parity, disjoint leases, merge receipts, and a process-restart drill for all three seeds. Its

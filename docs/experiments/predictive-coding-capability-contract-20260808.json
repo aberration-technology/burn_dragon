@@ -11,7 +11,8 @@
     "parameter_derivatives": "analytic_local_vjp",
     "tied_weight_reduction": "one physical shared-weight update after logical-depth reduction",
     "checkpoint_identity": "complete executable PC program and factor-graph fingerprint",
-    "browser_pc_policy": "observer_only_fail_closed"
+    "browser_pc_policy": "observer_only_fail_closed",
+    "selected_one_million_parameter_ruliad_learning_rate": 0.0003
   },
   "numerical_fidelity": {
     "backend": "cuda",
@@ -306,6 +307,42 @@
     "artifact": "target/pc-paper/clean-wall180-train-5seed-2e813c7",
     "summary": "docs/experiments/predictive-coding-clean-wall-clock-five-seed-20260808.json"
   },
+  "local_exogenous_learning_rate_stability_ablation": {
+    "backend": "cuda",
+    "wall_clock_seconds_per_run": 180,
+    "seeds": 5,
+    "selected_learning_rate": 0.0003,
+    "rejected_learning_rate": 0.001,
+    "adamw_3e_minus_4_minus_1e_minus_3": {
+      "validation_best": -0.03722654,
+      "validation_best_ci95": 0.02057796,
+      "validation_slope_per_checkpoint": -0.04420856,
+      "validation_slope_per_checkpoint_ci95": 0.01567989
+    },
+    "exact_pc_3e_minus_4_minus_1e_minus_3": {
+      "validation_last": -0.18601687,
+      "validation_last_ci95": 0.04773710,
+      "validation_final_minus_best": -0.12158082,
+      "validation_final_minus_best_ci95": 0.04192124,
+      "validation_regression_fraction": -0.11171372,
+      "validation_regression_fraction_ci95": 0.04173529,
+      "validation_slope_per_checkpoint": -0.08186392,
+      "validation_slope_per_checkpoint_ci95": 0.01520803
+    },
+    "paired_exact_pc_minus_adamw_at_3e_minus_4": {
+      "validation_best": 0.01666948,
+      "validation_best_ci95": 0.01350432,
+      "validation_last": -0.04188402,
+      "validation_last_ci95": 0.08942440,
+      "validation_slope_per_checkpoint": -0.02914965,
+      "validation_slope_per_checkpoint_ci95": 0.01814656,
+      "source_loss_cadence_mean": 0.02544889,
+      "source_loss_cadence_mean_ci95": 0.00851299
+    },
+    "conclusion": "The lower rate removes the positive-slope bounded collapse for both learners and materially improves retained PC quality. PC has a more favorable slope but a worse best checkpoint and source-cadence loss, so this promotes the rate rather than the learner.",
+    "artifact": "target/pc-paper/clean-wall180-lr3e4-5seed-7952f4e-analysis",
+    "summary": "docs/experiments/predictive-coding-stability-learning-rate-ablation-20260808.json"
+  },
   "gpu_density": {
     "device": "NVIDIA GB10",
     "backend": "cuda",
@@ -406,7 +443,8 @@
     "heterogeneous_gpu_peer_replication": false,
     "browser_webgpu_pc_training": false,
     "publication_grade_clean_tree_fixed_token_replication": true,
-    "publication_grade_clean_tree_replication": true
+    "publication_grade_clean_tree_replication": true,
+    "bounded_stability_at_selected_learning_rate": true
   },
   "blocking_evidence": [
     "Free-rollout verifier accuracy is zero in every completed local arm.",
@@ -414,7 +452,8 @@
     "No completed paired quality interval establishes a PC advantage over AdamW.",
     "Temporal-k2 and error-equilibrium PC did not improve the exogenous gate.",
     "Browser peers fail closed to observer-only for PC revisions because the browser trainer does not implement local PC.",
-    "The clean-tree fixed-wall-clock replication is complete, but both learners regress by roughly 19% to 20% from their best validation checkpoint and exact PC does not improve that stability signal.",
+    "At the selected 3e-4 rate, both learners have negative bounded validation slopes, but they remain 8.6% to 13.4% above their best checkpoint at the timed endpoint and no multi-hour retention result exists.",
+    "The open-loop source stream is cold-start-capped at difficulty 0 while the fixed holdout spans materialized difficulties 0 and 1; a distribution-aligned repetition is required before attributing residual drift to the learner.",
     "No multi-hour retention gate has completed.",
     "No heterogeneous native-GPU plus browser-PC convergence experiment has completed."
   ]

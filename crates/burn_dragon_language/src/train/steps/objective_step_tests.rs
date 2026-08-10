@@ -661,7 +661,7 @@ fn model_visited_verifier_terminal_preserves_stream_state_for_backprop_and_local
         ..LocalPredictiveCodingConfig::default()
     })
     .with_ruliad_supervision(RuliadSupervisionConfig {
-        proof_policy: proof_policy.clone(),
+        proof_policy,
         ..RuliadSupervisionConfig::default()
     })
     .with_tbptt_chunk_size(Some(64))

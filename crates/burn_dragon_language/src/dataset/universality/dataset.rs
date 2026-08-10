@@ -181,6 +181,22 @@ impl UniversalityDataset {
         batch_size: usize,
         tokenizer_cfg: &TokenizerConfig,
     ) -> io::Result<Self> {
+        Self::new_ruliad_on_the_fly_with_overrides(
+            config_path,
+            block_size,
+            batch_size,
+            tokenizer_cfg,
+            RuliadSourceSelectionOverrides::default(),
+        )
+    }
+
+    pub(crate) fn new_ruliad_on_the_fly_with_overrides(
+        config_path: impl AsRef<Path>,
+        block_size: usize,
+        batch_size: usize,
+        tokenizer_cfg: &TokenizerConfig,
+        overrides: RuliadSourceSelectionOverrides,
+    ) -> io::Result<Self> {
         let tokenizer = validate_pretokenized_tokenizer(tokenizer_cfg)?;
         let config_path = config_path.as_ref().to_path_buf();
         let corpus = burn_dragon_universality::OnlineRuliadCorpus::load(&config_path)
@@ -227,8 +243,12 @@ impl UniversalityDataset {
         let source_selection = corpus
             .source_selection_enabled()
             .then(|| {
+                let mut source_selection = corpus.config().source_selection.clone();
+                if let Some(enabled) = overrides.cold_start_enabled {
+                    source_selection.cold_start.enabled = enabled;
+                }
                 LiveSourceSelectionState::new(
-                    corpus.config().source_selection.clone(),
+                    source_selection,
                     corpus.config().clone(),
                     corpus.sampler_candidates(),
                 )
@@ -290,6 +310,16 @@ impl UniversalityDataset {
                         .load(Ordering::Relaxed)
                 })
             }
+        }
+    }
+
+    pub fn source_selection_cold_start_enabled(&self) -> Option<bool> {
+        match &self.storage {
+            UniversalityStorage::Manifest(_) => None,
+            UniversalityStorage::OnTheFly(storage) => storage
+                .source_selection
+                .as_ref()
+                .map(|source_selection| source_selection.cold_start.enabled),
         }
     }
 

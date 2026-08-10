@@ -43,11 +43,12 @@ REQUIRE_CLEAN_GIT="${BURN_DRAGON_PC_PAPER_REQUIRE_CLEAN_GIT:-0}"
 SEEDS_CSV="${BURN_DRAGON_PC_PAPER_SEEDS:-}"
 ITERS_CSV="${BURN_DRAGON_PC_PAPER_ITERS:-}"
 ARMS_CSV="${BURN_DRAGON_PC_PAPER_ARMS:-}"
-LOCAL_LEARNING_RATE="${BURN_DRAGON_PC_PAPER_LOCAL_LEARNING_RATE:-0.001}"
+LOCAL_LEARNING_RATE="${BURN_DRAGON_PC_PAPER_LOCAL_LEARNING_RATE:-0.0003}"
 COSINE_MIN_LR="${BURN_DRAGON_PC_PAPER_COSINE_MIN_LR:-0.0001}"
 COSINE_WARMUP_STEPS="${BURN_DRAGON_PC_PAPER_COSINE_WARMUP_STEPS:-0}"
 ADJOINT_CALIBRATION_LR="${BURN_DRAGON_PC_PAPER_ADJOINT_CALIBRATION_LR:-0.1}"
 SOURCE_SELECTION_FEEDBACK_UPDATES="${BURN_DRAGON_PC_PAPER_SOURCE_SELECTION_FEEDBACK_UPDATES:-}"
+RULIAD_COLD_START_ENABLED="${BURN_DRAGON_PC_PAPER_RULIAD_COLD_START_ENABLED:-}"
 RULIAD_PANEL_MODE="${BURN_DRAGON_PC_PAPER_RULIAD_PANEL_MODE:-auto}"
 RULIAD_PANEL_BASE_DIFFICULTY_LEVELS="${BURN_DRAGON_PC_PAPER_RULIAD_PANEL_BASE_DIFFICULTY_LEVELS:-4}"
 MIN_CAPABILITY_FEEDBACK_ROUNDS="${BURN_DRAGON_PC_PAPER_MIN_CAPABILITY_FEEDBACK_ROUNDS:-0}"
@@ -94,7 +95,7 @@ Safety guards:
                                                     fixed holdout validation; requires wall-clock mode
 
 Local-factor controls:
-  BURN_DRAGON_PC_PAPER_LOCAL_LEARNING_RATE          Default: 0.001
+  BURN_DRAGON_PC_PAPER_LOCAL_LEARNING_RATE          Default: 0.0003 (five-seed stability gate)
   BURN_DRAGON_PC_PAPER_COSINE_MIN_LR                Default: 0.0001
   BURN_DRAGON_PC_PAPER_COSINE_WARMUP_STEPS          Default: 0 (omitted)
   BURN_DRAGON_PC_PAPER_BLOCK_SIZE                    Optional model/training block size override
@@ -103,6 +104,8 @@ Local-factor controls:
   BURN_DRAGON_PC_PAPER_SEQUENCE_STATE_PROBE         true for recurrent matrices
   BURN_DRAGON_PC_PAPER_SEQUENCE_STATE_PROBE_PAIRED_BATCHES  Default: 8
   BURN_DRAGON_PC_PAPER_SOURCE_SELECTION_FEEDBACK_UPDATES    true | false | unset
+  BURN_DRAGON_PC_PAPER_RULIAD_COLD_START_ENABLED            true | false | unset; false exposes
+                                                            all materialized difficulty buckets
   BURN_DRAGON_PC_PAPER_VALIDATION_OBJECTIVE                 fixed_holdout | source_weighted | stream_warm
   BURN_DRAGON_PC_PAPER_RULIAD_PANEL_BASE_DIFFICULTY_LEVELS  Default: 4; 0 disables stratification
   BURN_DRAGON_PC_PAPER_RULIAD_POLICY_PROBE_EVERY_EPOCHS     Optional constrained-action cadence
@@ -737,6 +740,13 @@ case "$VALIDATION_OBJECTIVE" in
     exit 2
     ;;
 esac
+case "$RULIAD_COLD_START_ENABLED" in
+  ""|true|false) ;;
+  *)
+    echo "BURN_DRAGON_PC_PAPER_RULIAD_COLD_START_ENABLED must be true, false, or unset" >&2
+    exit 2
+    ;;
+esac
 
 if [[ ! "$RULIAD_DAGGER_START_AFTER_STEPS" =~ ^[0-9]+$ ]]; then
   echo "BURN_DRAGON_PC_PAPER_RULIAD_DAGGER_START_AFTER_STEPS must be a non-negative integer" >&2
@@ -1330,18 +1340,24 @@ write_overlay() {
   if [[ "$TBPTT_PERSIST_ACROSS_STEPS" == "true" ]]; then
     tbptt_persist_line="tbptt_persist_across_steps = true"
   fi
-  if [[ -n "$SOURCE_SELECTION_FEEDBACK_UPDATES" ]]; then
+  : > "$path"
+  if [[ -n "$SOURCE_SELECTION_FEEDBACK_UPDATES" || -n "$RULIAD_COLD_START_ENABLED" ]]; then
     if [[ "$SOURCE_SELECTION_FEEDBACK_UPDATES" != "true" && "$SOURCE_SELECTION_FEEDBACK_UPDATES" != "false" ]]; then
-      echo "BURN_DRAGON_PC_PAPER_SOURCE_SELECTION_FEEDBACK_UPDATES must be true or false" >&2
-      return 2
+      if [[ -n "$SOURCE_SELECTION_FEEDBACK_UPDATES" ]]; then
+        echo "BURN_DRAGON_PC_PAPER_SOURCE_SELECTION_FEEDBACK_UPDATES must be true or false" >&2
+        return 2
+      fi
     fi
-    cat > "$path" <<EOF
+    cat >> "$path" <<EOF
 [dataset]
-ruliad_source_selection_feedback_updates_enabled = $SOURCE_SELECTION_FEEDBACK_UPDATES
-
 EOF
-  else
-    : > "$path"
+    if [[ -n "$SOURCE_SELECTION_FEEDBACK_UPDATES" ]]; then
+      echo "ruliad_source_selection_feedback_updates_enabled = $SOURCE_SELECTION_FEEDBACK_UPDATES" >> "$path"
+    fi
+    if [[ -n "$RULIAD_COLD_START_ENABLED" ]]; then
+      echo "ruliad_source_selection_cold_start_enabled = $RULIAD_COLD_START_ENABLED" >> "$path"
+    fi
+    echo >> "$path"
   fi
 
   cat >> "$path" <<EOF
@@ -2484,6 +2500,7 @@ write_manifest() {
   local train_binary_sha256
   local runner_sha256
   local source_feedback_json="null"
+  local source_cold_start_json="null"
   local closed_loop_cadence_json="null"
   local block_size_json="null"
   local tbptt_credit_window_chunks=1
@@ -2714,6 +2731,9 @@ write_manifest() {
   if [[ -n "$SOURCE_SELECTION_FEEDBACK_UPDATES" ]]; then
     source_feedback_json="$SOURCE_SELECTION_FEEDBACK_UPDATES"
   fi
+  if [[ -n "$RULIAD_COLD_START_ENABLED" ]]; then
+    source_cold_start_json="$RULIAD_COLD_START_ENABLED"
+  fi
   if [[ -n "$RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS" ]]; then
     closed_loop_cadence_json="$RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS"
   fi
@@ -2770,6 +2790,7 @@ write_manifest() {
   "sequence_state_probe": $SEQUENCE_STATE_PROBE,
   "sequence_state_probe_paired_batches": $SEQUENCE_STATE_PROBE_PAIRED_BATCHES,
   "source_selection_feedback_updates_enabled": $source_feedback_json,
+  "ruliad_source_selection_cold_start_enabled": $source_cold_start_json,
   "validation_objective": $(json_escape "$VALIDATION_OBJECTIVE"),
   "validation_sampling": "fixed_holdout",
   "ruliad_panel_base_difficulty_levels": $RULIAD_PANEL_BASE_DIFFICULTY_LEVELS,
@@ -2907,6 +2928,7 @@ echo "adjoint_calibration_learning_rate=$ADJOINT_CALIBRATION_LR"
 echo "block_size=${BLOCK_SIZE:-profile} tbptt_chunk_size=$TBPTT_CHUNK_SIZE tbptt_persist_across_steps=$TBPTT_PERSIST_ACROSS_STEPS sequence_batching=$SEQUENCE_BATCHING"
 echo "sequence_state_probe=$SEQUENCE_STATE_PROBE paired_batches=$SEQUENCE_STATE_PROBE_PAIRED_BATCHES"
 echo "source_selection_feedback_updates=$SOURCE_SELECTION_FEEDBACK_UPDATES"
+echo "ruliad_cold_start_enabled=${RULIAD_COLD_START_ENABLED:-profile}"
 echo "validation_objective=$VALIDATION_OBJECTIVE"
 echo "ruliad_panel_base_difficulty_levels=$RULIAD_PANEL_BASE_DIFFICULTY_LEVELS"
 if (( DEFER_EXPENSIVE_RULIAD_PROBES == 1 )); then

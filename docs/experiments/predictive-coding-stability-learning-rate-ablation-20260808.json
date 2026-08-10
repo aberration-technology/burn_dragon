@@ -1,0 +1,211 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-08",
+  "experiment": "predictive_coding_fixed_wall_clock_learning_rate_stability",
+  "decision": "promote_3e_minus_4_for_one_million_parameter_ruliad_stability",
+  "backend": "cuda",
+  "device": "NVIDIA GB10",
+  "model_parameters": 937154,
+  "wall_clock_seconds_per_run": 180,
+  "batch_size": 32,
+  "checkpoint_interval_updates": 256,
+  "seeds": [
+    20261010,
+    20261011,
+    20261012,
+    20261013,
+    20261014
+  ],
+  "shared_controls": {
+    "source_selection": "static_expert_exogenous",
+    "source_selection_feedback_updates_enabled": false,
+    "cold_start_contract": "profile_default_difficulty_zero_train_vs_materialized_difficulty_zero_and_one_holdout",
+    "validation_objective": "fixed_holdout",
+    "sequence_batching": "streaming",
+    "tbptt_chunk_size": 64,
+    "tbptt_persist_across_steps": true,
+    "expensive_ruliad_probes_deferred": true
+  },
+  "learning_rate_3e_minus_4_mean_and_ci95": {
+    "adamw": {
+      "completed_checkpointed_updates": [
+        1740.8,
+        142.1312
+      ],
+      "validation_last": [
+        1.47808576,
+        0.05919999
+      ],
+      "validation_best": [
+        1.09007495,
+        0.00977239
+      ],
+      "validation_final_minus_best": [
+        0.14639990,
+        0.03281649
+      ],
+      "validation_regression_fraction": [
+        0.13428041,
+        0.02988736
+      ],
+      "validation_slope_per_checkpoint": [
+        -0.00994515,
+        0.00752621
+      ],
+      "source_loss_cadence_mean": [
+        0.67152155,
+        0.00982848
+      ]
+    },
+    "exact_fixed_prediction_pc": {
+      "completed_checkpointed_updates": [
+        1280.0,
+        0.0
+      ],
+      "validation_last": [
+        1.43620174,
+        0.04472574
+      ],
+      "validation_best": [
+        1.10674443,
+        0.01495169
+      ],
+      "validation_final_minus_best": [
+        0.09472501,
+        0.03886395
+      ],
+      "validation_regression_fraction": [
+        0.08551436,
+        0.03459286
+      ],
+      "validation_slope_per_checkpoint": [
+        -0.03909480,
+        0.01122831
+      ],
+      "source_loss_cadence_mean": [
+        0.69697044,
+        0.00641197
+      ]
+    },
+    "paired_exact_pc_minus_adamw": {
+      "completed_checkpointed_updates": [
+        -460.8,
+        142.1312
+      ],
+      "validation_last": [
+        -0.04188402,
+        0.08942440
+      ],
+      "validation_best": [
+        0.01666948,
+        0.01350432
+      ],
+      "validation_final_minus_best": [
+        -0.05167489,
+        0.06551223
+      ],
+      "validation_regression_fraction": [
+        -0.04876605,
+        0.05846610
+      ],
+      "validation_slope_per_checkpoint": [
+        -0.02914965,
+        0.01814656
+      ],
+      "stream_warm_loss": [
+        -0.05446388,
+        0.03853203
+      ],
+      "source_loss_cadence_mean": [
+        0.02544889,
+        0.00851299
+      ]
+    }
+  },
+  "paired_3e_minus_4_minus_1e_minus_3": {
+    "adamw": {
+      "validation_last": [
+        -0.14878960,
+        0.15109385
+      ],
+      "validation_best": [
+        -0.03722654,
+        0.02057796
+      ],
+      "validation_final_minus_best": [
+        -0.06386077,
+        0.09347980
+      ],
+      "validation_regression_fraction": [
+        -0.05185478,
+        0.08209490
+      ],
+      "validation_slope_per_checkpoint": [
+        -0.04420856,
+        0.01567989
+      ]
+    },
+    "exact_fixed_prediction_pc": {
+      "validation_last": [
+        -0.18601687,
+        0.04773710
+      ],
+      "validation_best": [
+        0.00973217,
+        0.02700887
+      ],
+      "validation_final_minus_best": [
+        -0.12158082,
+        0.04192124
+      ],
+      "validation_regression_fraction": [
+        -0.11171372,
+        0.04173529
+      ],
+      "validation_slope_per_checkpoint": [
+        -0.08186392,
+        0.01520803
+      ]
+    }
+  },
+  "systems_at_3e_minus_4": {
+    "adamw": {
+      "gpu_utilization_mean_percent": 79.203,
+      "gpu_utilization_median_percent": 88.4,
+      "gpu_power_mean_watts": 40.328,
+      "gpu_power_median_watts": 41.144
+    },
+    "exact_fixed_prediction_pc": {
+      "gpu_utilization_mean_percent": 81.840,
+      "gpu_utilization_median_percent": 89.0,
+      "gpu_power_mean_watts": 37.908,
+      "gpu_power_median_watts": 38.528
+    }
+  },
+  "provenance": {
+    "git_sha": "7952f4edd7c73a88e1d42c236c2e7812482ea548",
+    "git_dirty": false,
+    "train_binary_sha256": "32d63f2e84706ff20b6b436c5a0d73b6561cd7893eb101ee00c5488b25eddb82",
+    "runner_sha256": "055aa157dfe90fe7091d73d7a062de45846ab4c3090a6e56cc4131f0b109b49b",
+    "all_trial_statuses": "wall_clock_complete",
+    "elapsed_seconds_range": [
+      186,
+      188
+    ],
+    "peak_used_memory_mb_range": [
+      12422,
+      13136
+    ]
+  },
+  "interpretation": {
+    "stability": "At 3e-4 both learners have negative validation slopes. Exact PC improves its endpoint, final-minus-best drift, regression fraction, and slope significantly relative to its 1e-3 trajectory.",
+    "pc_vs_adamw": "PC has a significantly more negative validation slope but a slightly worse best checkpoint and source-cadence loss. Endpoint and final-minus-best differences are not statistically resolved.",
+    "promotion": "Use 3e-4 as the bounded one-million-parameter Ruliad experiment default. This is a learning-rate promotion, not a PC-over-AdamW or SotA promotion.",
+    "remaining_gate": "The timed run excludes verifier probes and retains a difficulty-distribution mismatch. Distribution-aligned and reasoning-quality repetitions remain required."
+  },
+  "raw_artifacts": [
+    "target/pc-paper/clean-wall180-lr3e4-screen-7952f4e",
+    "target/pc-paper/clean-wall180-lr3e4-seeds11-14-7952f4e",
+    "target/pc-paper/clean-wall180-lr3e4-5seed-7952f4e-analysis"
+  ]
+}

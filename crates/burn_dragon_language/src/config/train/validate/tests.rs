@@ -4732,6 +4732,31 @@ fn ruliad_source_feedback_override_validates_for_ruliad_dataset() {
 }
 
 #[test]
+fn ruliad_cold_start_override_requires_ruliad_dataset() {
+    let mut config = parse_config("");
+    config.dataset.ruliad_source_selection_cold_start_enabled = Some(false);
+    let err = config
+        .validate()
+        .expect_err("cold-start override should reject non-ruliad datasets");
+    assert!(
+        err.to_string().contains("universality_ruliad"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn ruliad_cold_start_override_validates_for_ruliad_dataset() {
+    let mut config = parse_config("");
+    config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+        config: "target/test-ruliad.toml".into(),
+    };
+    config.dataset.ruliad_source_selection_cold_start_enabled = Some(false);
+    config
+        .validate()
+        .expect("ruliad cold-start override should validate");
+}
+
+#[test]
 fn ruliad_answer_completion_rejects_pure_eggroll_dense_ce_path() {
     let mut config = parse_config("");
     config.dataset.source = DatasetSourceConfig::UniversalityRuliad {

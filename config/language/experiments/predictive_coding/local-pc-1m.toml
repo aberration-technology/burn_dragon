@@ -78,7 +78,7 @@ enabled = false
 
 [optimizer]
 name = "adamw"
-learning_rate = 0.001
+learning_rate = 0.0003
 weight_decay = 0.01
 grad_clip_norm = 1.0
 

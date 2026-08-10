@@ -765,16 +765,28 @@ fn ruliad_parity_corpus_config_toml(
     toml::to_string_pretty(&config).expect("ruliad parity corpus config")
 }
 
-fn ruliad_parity_training_config_toml(
-    cache_dir: &Path,
-    ruliad_config_path: &Path,
+struct RuliadParityTrainingConfigOptions<'a> {
+    cache_dir: &'a Path,
+    ruliad_config_path: &'a Path,
     seed: u64,
     max_iters: usize,
     batch_size: usize,
     gradient_accumulation_steps: usize,
     random_scaffold: bool,
     training_algorithm: RuliadParityTrainingAlgorithm,
-) -> String {
+}
+
+fn ruliad_parity_training_config_toml(options: RuliadParityTrainingConfigOptions<'_>) -> String {
+    let RuliadParityTrainingConfigOptions {
+        cache_dir,
+        ruliad_config_path,
+        seed,
+        max_iters,
+        batch_size,
+        gradient_accumulation_steps,
+        random_scaffold,
+        training_algorithm,
+    } = options;
     let spec = RULIAD_PARITY_1M_SPEC;
     let random_scaffold_config = if random_scaffold {
         format!(
@@ -903,16 +915,16 @@ fn write_ruliad_parity_training_config(
     );
     write(
         &training_config_path,
-        &ruliad_parity_training_config_toml(
-            &root.join("ruliad-parity-cache"),
-            &ruliad_config_path,
+        &ruliad_parity_training_config_toml(RuliadParityTrainingConfigOptions {
+            cache_dir: &root.join("ruliad-parity-cache"),
+            ruliad_config_path: &ruliad_config_path,
             seed,
             max_iters,
-            RULIAD_PARITY_1M_SPEC.batch_size,
-            1,
+            batch_size: RULIAD_PARITY_1M_SPEC.batch_size,
+            gradient_accumulation_steps: 1,
             random_scaffold,
             training_algorithm,
-        ),
+        }),
     );
     training_config_path
 }
@@ -928,30 +940,30 @@ fn write_ruliad_synchronized_reference_config(
     let training_config_path = root.join("ruliad-synchronized-reference-training.toml");
     write(
         &training_config_path,
-        &ruliad_parity_training_config_toml(
-            &root.join("ruliad-synchronized-reference-cache"),
-            &ruliad_config_path,
+        &ruliad_parity_training_config_toml(RuliadParityTrainingConfigOptions {
+            cache_dir: &root.join("ruliad-synchronized-reference-cache"),
+            ruliad_config_path: &ruliad_config_path,
             seed,
-            match training_algorithm {
+            max_iters: match training_algorithm {
                 RuliadParityTrainingAlgorithm::Backpropagation => peer_local_steps
                     .checked_mul(3)
                     .expect("synchronized backprop batch count"),
                 RuliadParityTrainingAlgorithm::PredictiveCoding => peer_local_steps,
             },
-            match training_algorithm {
+            batch_size: match training_algorithm {
                 RuliadParityTrainingAlgorithm::Backpropagation => RULIAD_PARITY_1M_SPEC.batch_size,
                 RuliadParityTrainingAlgorithm::PredictiveCoding => RULIAD_PARITY_1M_SPEC
                     .batch_size
                     .checked_mul(3)
                     .expect("synchronized predictive-coding batch size"),
             },
-            match training_algorithm {
+            gradient_accumulation_steps: match training_algorithm {
                 RuliadParityTrainingAlgorithm::Backpropagation => 3,
                 RuliadParityTrainingAlgorithm::PredictiveCoding => 1,
             },
             random_scaffold,
             training_algorithm,
-        ),
+        }),
     );
     training_config_path
 }

@@ -82,32 +82,6 @@ fn emit_validation_supervision_metrics(
     }
 }
 
-#[cfg(test)]
-mod validation_accounting_tests {
-    use super::SupervisedValidationLoss;
-
-    #[test]
-    fn masked_validation_ignores_empty_batches_and_weights_by_supervised_tokens() {
-        let mut summary = SupervisedValidationLoss::default();
-        summary.observe(0.0, 0);
-        summary.observe(2.0, 2);
-        summary.observe(1.0, 6);
-
-        assert_eq!(summary.supervised_tokens, 8);
-        assert_eq!(summary.supervised_batches, 2);
-        assert_eq!(summary.empty_batches, 1);
-        assert_eq!(summary.mean(), Some(1.25));
-    }
-
-    #[test]
-    fn empty_masked_validation_has_no_loss_measurement() {
-        let mut summary = SupervisedValidationLoss::default();
-        summary.observe(0.0, 0);
-
-        assert_eq!(summary.mean(), None);
-    }
-}
-
 pub(super) fn build_dynamic_train_loader<B>(
     env: &TrainEnvironment<'_, B>,
     batch_size: usize,
@@ -1570,4 +1544,30 @@ where
         ruliad_eval_report,
         ruliad_policy_rollout,
     })
+}
+
+#[cfg(test)]
+mod validation_accounting_tests {
+    use super::SupervisedValidationLoss;
+
+    #[test]
+    fn masked_validation_ignores_empty_batches_and_weights_by_supervised_tokens() {
+        let mut summary = SupervisedValidationLoss::default();
+        summary.observe(0.0, 0);
+        summary.observe(2.0, 2);
+        summary.observe(1.0, 6);
+
+        assert_eq!(summary.supervised_tokens, 8);
+        assert_eq!(summary.supervised_batches, 2);
+        assert_eq!(summary.empty_batches, 1);
+        assert_eq!(summary.mean(), Some(1.25));
+    }
+
+    #[test]
+    fn empty_masked_validation_has_no_loss_measurement() {
+        let mut summary = SupervisedValidationLoss::default();
+        summary.observe(0.0, 0);
+
+        assert_eq!(summary.mean(), None);
+    }
 }

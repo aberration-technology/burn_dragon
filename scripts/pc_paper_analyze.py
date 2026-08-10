@@ -53,6 +53,7 @@ SUMMARY_COLUMNS = [
     "wall_clock_seconds",
     "ruliad_policy_probe_every_epochs",
     "source_selection_feedback_updates_enabled",
+    "ruliad_source_selection_cold_start_enabled",
     "proof_policy_mode",
     "wall_s",
     "tok_s",
@@ -243,6 +244,7 @@ EVENT_SUMMARY_COLUMNS = [
     "backend",
     "profile",
     "source_selection_feedback_updates_enabled",
+    "ruliad_source_selection_cold_start_enabled",
     "proof_policy_mode",
     "training_wall_seconds",
     "train_tokens",
@@ -508,6 +510,7 @@ MANIFEST_COLUMNS = [
     "sequence_state_probe",
     "sequence_state_probe_paired_batches",
     "source_selection_feedback_updates_enabled",
+    "ruliad_source_selection_cold_start_enabled",
     "validation_objective",
     "validation_sampling",
     "ruliad_panel_base_difficulty_levels",
@@ -610,6 +613,7 @@ EXPERIMENT_CONTEXT_FIELDS = (
     "wall_clock_seconds",
     "ruliad_policy_probe_every_epochs",
     "source_selection_feedback_updates_enabled",
+    "ruliad_source_selection_cold_start_enabled",
     "proof_policy_mode",
 )
 
@@ -633,6 +637,7 @@ def experiment_context_sort_key(context: tuple[Any, ...]) -> tuple[Any, ...]:
         wall_clock_seconds,
         policy_probe_cadence,
         source_feedback,
+        cold_start_enabled,
         policy_mode,
     ) = context
     return (
@@ -645,6 +650,7 @@ def experiment_context_sort_key(context: tuple[Any, ...]) -> tuple[Any, ...]:
         as_int(wall_clock_seconds) or 0,
         as_int(policy_probe_cadence) or -1,
         str(source_feedback or ""),
+        str(cold_start_enabled or ""),
         str(policy_mode or ""),
     )
 
@@ -827,6 +833,9 @@ def normalize_summary_row(row: dict[str, str]) -> dict[str, Any]:
         row.get("ruliad_policy_probe_every_epochs")
     )
     normalized["source_selection_feedback_updates_enabled"] = source_feedback
+    normalized["ruliad_source_selection_cold_start_enabled"] = row.get(
+        "ruliad_source_selection_cold_start_enabled", ""
+    )
     normalized["proof_policy_mode"] = row.get("proof_policy_mode", "") or infer_proof_policy_mode(
         normalized["arm"]
     )
@@ -1555,6 +1564,7 @@ def collect_event_summaries(
                 "validation_sampling",
                 "ruliad_panel_base_difficulty_levels",
                 "source_selection_feedback_updates_enabled",
+                "ruliad_source_selection_cold_start_enabled",
                 "proof_policy_mode",
             ):
                 summary[key] = manifest.get(key, "")
@@ -1641,6 +1651,9 @@ def normalize_event_summaries(rows: Iterable[dict[str, Any]]) -> list[dict[str, 
                 ),
                 "source_selection_feedback_updates_enabled": event.get(
                     "source_selection_feedback_updates_enabled", ""
+                ),
+                "ruliad_source_selection_cold_start_enabled": event.get(
+                    "ruliad_source_selection_cold_start_enabled", ""
                 ),
                 "proof_policy_mode": event.get("proof_policy_mode", "")
                 or infer_proof_policy_mode(str(event.get("arm") or "")),
@@ -2142,14 +2155,14 @@ def write_markdown(
     lines.append("## Run Summary")
     lines.append("")
     lines.append(
-        "| Matrix | Backend | Profile | Iters | Wall budget | Completed updates | Batch | Ckpt | Policy probe | Feedback | Policy mode | Arm | Runs | Seeds | Cold valid | Cold supervised tokens | Stream warm | Validation objective | Best objective | Final-best | Regression | Val slope | Source cadence | Free verifier acc | Action top-1 | Decode gap | Action NLL | Context swap | Counterfactual gain | Policy solve | Goal completion | Valid action | Partial progress | Wall tok/s | Model tok/s | Duty | PC ms |"
+        "| Matrix | Backend | Profile | Iters | Wall budget | Completed updates | Batch | Ckpt | Policy probe | Feedback | Cold start | Policy mode | Arm | Runs | Seeds | Cold valid | Cold supervised tokens | Stream warm | Validation objective | Best objective | Final-best | Regression | Val slope | Source cadence | Free verifier acc | Action top-1 | Decode gap | Action NLL | Context swap | Counterfactual gain | Policy solve | Goal completion | Valid action | Partial progress | Wall tok/s | Model tok/s | Duty | PC ms |"
     )
     lines.append(
-        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
     )
     for row in summary_rows:
         lines.append(
-            "| {matrix} | {backend} | {profile} | {iters} | {wall_clock_seconds} | {completed_updates} | {batch_size} | {checkpoint_interval} | {policy_probe_cadence} | {source_feedback} | {policy_mode} | {arm} | {runs} | {seeds} | {valid} | {cold_tokens} | {warm} | {objective} | {best_objective} | {final_minus_best} | {regression} | {slope} | {source} | {verifier} | {action_top1} | {decode_gap} | {action_nll} | {context_swap} | {counterfactual_gain} | {policy_solve} | {goal_completion} | {valid_action} | {partial} | {tok} | {model_tok} | {duty} | {pc} |".format(
+            "| {matrix} | {backend} | {profile} | {iters} | {wall_clock_seconds} | {completed_updates} | {batch_size} | {checkpoint_interval} | {policy_probe_cadence} | {source_feedback} | {cold_start} | {policy_mode} | {arm} | {runs} | {seeds} | {valid} | {cold_tokens} | {warm} | {objective} | {best_objective} | {final_minus_best} | {regression} | {slope} | {source} | {verifier} | {action_top1} | {decode_gap} | {action_nll} | {context_swap} | {counterfactual_gain} | {policy_solve} | {goal_completion} | {valid_action} | {partial} | {tok} | {model_tok} | {duty} | {pc} |".format(
                 matrix=row.get("matrix", ""),
                 backend=row.get("backend", ""),
                 profile=Path(str(row.get("profile") or "")).name,
@@ -2165,6 +2178,9 @@ def write_markdown(
                 ),
                 source_feedback=row.get(
                     "source_selection_feedback_updates_enabled", ""
+                ),
+                cold_start=row.get(
+                    "ruliad_source_selection_cold_start_enabled", ""
                 ),
                 policy_mode=row.get("proof_policy_mode", ""),
                 arm=row.get("arm", ""),
@@ -2213,12 +2229,12 @@ def write_markdown(
     lines.append("## Paired Deltas")
     lines.append("")
     lines.append(
-        "| Matrix | Backend | Profile | Iters | Batch | Ckpt | Policy probe | Feedback | Policy mode | Comparison | Metric | Pairs | Delta |"
+        "| Matrix | Backend | Profile | Iters | Batch | Ckpt | Policy probe | Feedback | Cold start | Policy mode | Comparison | Metric | Pairs | Delta |"
     )
-    lines.append("| --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- | ---: | ---: |")
+    lines.append("| --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- | --- | ---: | ---: |")
     for row in paired_rows:
         lines.append(
-            "| {matrix} | {backend} | {profile} | {iters} | {batch_size} | {checkpoint_interval} | {policy_probe_cadence} | {source_feedback} | {policy_mode} | {comparison} | {metric} | {pairs} | {delta} |".format(
+            "| {matrix} | {backend} | {profile} | {iters} | {batch_size} | {checkpoint_interval} | {policy_probe_cadence} | {source_feedback} | {cold_start} | {policy_mode} | {comparison} | {metric} | {pairs} | {delta} |".format(
                 matrix=row.get("matrix", ""),
                 backend=row.get("backend", ""),
                 profile=Path(str(row.get("profile") or "")).name,
@@ -2230,6 +2246,9 @@ def write_markdown(
                 ),
                 source_feedback=row.get(
                     "source_selection_feedback_updates_enabled", ""
+                ),
+                cold_start=row.get(
+                    "ruliad_source_selection_cold_start_enabled", ""
                 ),
                 policy_mode=row.get("proof_policy_mode", ""),
                 comparison=row.get("comparison", ""),
@@ -2873,6 +2892,7 @@ def self_test() -> None:
                     "checkpoint_interval_iters": 2,
                     "wall_clock_seconds": 60,
                     "ruliad_policy_probe_every_epochs": 1,
+                    "ruliad_source_selection_cold_start_enabled": False,
                     "validation_objective": "source_weighted",
                     "validation_sampling": "fixed_holdout",
                     "backend": "cpu",
@@ -2902,6 +2922,7 @@ def self_test() -> None:
         event_rows = list(csv.DictReader((out / "event_run_summary.csv").open()))
         assert event_rows[0]["trial_key"] == "pc-smoke-run-a"
         assert event_rows[0]["arm"] == "adamwpc"
+        assert event_rows[0]["ruliad_source_selection_cold_start_enabled"] == "False"
         assert event_rows[0]["wall_tokens_per_second"] == "512.0"
         assert event_rows[0]["model_tokens_per_second"] == "640.0"
         assert event_rows[0]["model_duty_fraction"] == "0.8"
@@ -2995,6 +3016,7 @@ def self_test() -> None:
         assert event_normalized["batch_size"] == "8"
         assert event_normalized["checkpoint_interval_iters"] == "2"
         assert event_normalized["ruliad_policy_probe_every_epochs"] == "1"
+        assert event_normalized["ruliad_source_selection_cold_start_enabled"] == "False"
         assert event_normalized["tok_s"] == "512.0"
         assert event_normalized["model_tok_s"] == "640.0"
         assert event_normalized["model_duty_fraction"] == "0.8"
@@ -3072,6 +3094,7 @@ def self_test() -> None:
                 "iters": 4,
                 "batch_size": 8,
                 "source_selection_feedback_updates_enabled": False,
+                "ruliad_source_selection_cold_start_enabled": False,
                 "proof_policy_mode": "static_expert",
             }
         ) != experiment_context(
@@ -3082,6 +3105,7 @@ def self_test() -> None:
                 "iters": 4,
                 "batch_size": 8,
                 "source_selection_feedback_updates_enabled": False,
+                "ruliad_source_selection_cold_start_enabled": True,
                 "proof_policy_mode": "dagger",
             }
         )

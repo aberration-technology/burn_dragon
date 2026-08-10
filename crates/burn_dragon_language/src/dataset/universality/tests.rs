@@ -791,18 +791,19 @@ fn live_ruliad_source_selection_cold_start_mastery_gate_blocks_blind_release() {
 fn live_ruliad_mastery_release_is_monotonic_and_checkpointed() {
     let mut candidates = (0..=2).map(source_selection_candidate).collect::<Vec<_>>();
     mark_source_selection_candidate_mastered(&mut candidates[0]);
-    let mut source_selection = burn_dragon_universality::RuliadSourceSelectionConfig::default();
-    source_selection.enabled = true;
-    source_selection.difficulty_levels =
-        burn_dragon_universality::UsizeRangeConfig { min: 0, max: 2 };
-    source_selection.cold_start = burn_dragon_universality::RuliadSourceSelectionColdStartConfig {
+    let source_selection = burn_dragon_universality::RuliadSourceSelectionConfig {
         enabled: true,
-        max_difficulty_level: 0,
-        hold_steps: 0,
-        ramp_steps: 1,
-        release_requires_mastery: true,
-        mastery_min_feedback_count: 1,
-        monotonic_mastery_release: true,
+        difficulty_levels: burn_dragon_universality::UsizeRangeConfig { min: 0, max: 2 },
+        cold_start: burn_dragon_universality::RuliadSourceSelectionColdStartConfig {
+            enabled: true,
+            max_difficulty_level: 0,
+            hold_steps: 0,
+            ramp_steps: 1,
+            release_requires_mastery: true,
+            mastery_min_feedback_count: 1,
+            monotonic_mastery_release: true,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let mut corpus = live_ruliad_runtime_config();
@@ -1822,6 +1823,55 @@ fn static_live_ruliad_source_selection_ignores_training_feedback() {
         fingerprints.len() >= 24,
         "open-loop stream should remain diverse across steps: unique={}",
         fingerprints.len()
+    );
+}
+
+#[test]
+fn ruliad_cold_start_override_exposes_the_materialized_open_loop_frontier() {
+    let dir = tempdir().expect("tempdir");
+    let config_path = dir.path().join("ruliad-cold-start-override.toml");
+    let mut config = live_ruliad_runtime_config();
+    config.source_selection.difficulty_levels =
+        burn_dragon_universality::UsizeRangeConfig { min: 0, max: 4 };
+    config.source_selection.cold_start =
+        burn_dragon_universality::RuliadSourceSelectionColdStartConfig {
+            enabled: true,
+            max_difficulty_level: 1,
+            hold_steps: 1_000_000,
+            ramp_steps: 1_000_000,
+            ..Default::default()
+        };
+    fs::write(&config_path, toml::to_string_pretty(&config).expect("toml")).expect("write config");
+
+    let capped =
+        UniversalityDataset::new_ruliad_on_the_fly(&config_path, 32, 2, &pretokenized_tokenizer())
+            .expect("load capped ruliad dataset");
+    let aligned = UniversalityDataset::new_ruliad_on_the_fly_with_overrides(
+        &config_path,
+        32,
+        2,
+        &pretokenized_tokenizer(),
+        RuliadSourceSelectionOverrides {
+            cold_start_enabled: Some(false),
+        },
+    )
+    .expect("load aligned ruliad dataset");
+
+    assert_eq!(capped.source_selection_cold_start_enabled(), Some(true));
+    assert_eq!(aligned.source_selection_cold_start_enabled(), Some(false));
+    assert_eq!(
+        capped
+            .source_selection_snapshot_at_step(0)
+            .expect("capped source snapshot")
+            .active_max_difficulty_level,
+        1
+    );
+    assert_eq!(
+        aligned
+            .source_selection_snapshot_at_step(0)
+            .expect("aligned source snapshot")
+            .active_max_difficulty_level,
+        4
     );
 }
 

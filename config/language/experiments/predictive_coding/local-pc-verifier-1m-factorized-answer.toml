@@ -1,0 +1,12 @@
+extends = "local-pc-verifier-1m.toml"
+
+# Balanced structural decoder contract. Each update optimizes one normalized
+# primary factor: schema/termination on even steps, prompt-conditioned values
+# on odd steps. Validation covers the complete answer token sequence.
+[training.ruliad_supervision]
+mode = "factorized_answer"
+answer_close_marker_stride = 1
+answer_close_marker_weight = 1
+answer_schema_token_weight = 1
+answer_schema_start_token_weight = 1
+answer_value_token_weight = 1

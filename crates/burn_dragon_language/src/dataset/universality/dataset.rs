@@ -354,19 +354,11 @@ impl UniversalityDataset {
         epoch_index: usize,
         absolute_step: usize,
     ) -> RuliadSupervisionConfig {
-        let mut supervision = self.ruliad_supervision;
-        if matches!(supervision.mode, RuliadSupervisionMode::Mixed) {
-            supervision.mode = if self.ruliad_supervision.prefer_answer_window(
-                matches!(split, DatasetSplit::Val),
-                epoch_index,
-                absolute_step,
-            ) {
-                RuliadSupervisionMode::AnswerCompletion
-            } else {
-                RuliadSupervisionMode::FullDocument
-            };
-        }
-        supervision
+        self.ruliad_supervision.effective_for(
+            matches!(split, DatasetSplit::Val),
+            epoch_index,
+            absolute_step,
+        )
     }
 
     pub(super) fn ruliad_answer_completion_active(

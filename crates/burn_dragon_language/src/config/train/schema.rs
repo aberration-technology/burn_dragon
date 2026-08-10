@@ -1841,7 +1841,9 @@ pub enum RuliadSupervisionMode {
     FullDocument,
     AnswerWindow,
     AnswerCompletion,
+    AnswerStructure,
     AnswerValues,
+    FactorizedAnswer,
     TraceAndAnswer,
     Mixed,
 }
@@ -1850,7 +1852,12 @@ impl RuliadSupervisionMode {
     pub fn uses_answer_target_mask(self) -> bool {
         matches!(
             self,
-            Self::AnswerCompletion | Self::AnswerValues | Self::TraceAndAnswer | Self::Mixed
+            Self::AnswerCompletion
+                | Self::AnswerStructure
+                | Self::AnswerValues
+                | Self::FactorizedAnswer
+                | Self::TraceAndAnswer
+                | Self::Mixed
         )
     }
 
@@ -1868,7 +1875,9 @@ impl RuliadSupervisionMode {
             Self::FullDocument => false,
             Self::AnswerWindow => true,
             Self::AnswerCompletion => true,
+            Self::AnswerStructure => true,
             Self::AnswerValues => true,
+            Self::FactorizedAnswer => true,
             Self::TraceAndAnswer => false,
             Self::Mixed => validation || (epoch_index.wrapping_add(absolute_step) & 1) == 0,
         }
@@ -1992,6 +2001,32 @@ impl RuliadPolicyBatchCadences {
 }
 
 impl RuliadSupervisionConfig {
+    pub fn effective_for(self, validation: bool, epoch_index: usize, absolute_step: usize) -> Self {
+        let mode = match self.mode {
+            RuliadSupervisionMode::Mixed => {
+                if self
+                    .mode
+                    .prefer_answer_window(validation, epoch_index, absolute_step)
+                {
+                    RuliadSupervisionMode::AnswerCompletion
+                } else {
+                    RuliadSupervisionMode::FullDocument
+                }
+            }
+            RuliadSupervisionMode::FactorizedAnswer => {
+                if validation {
+                    RuliadSupervisionMode::AnswerCompletion
+                } else if absolute_step & 1 == 0 {
+                    RuliadSupervisionMode::AnswerStructure
+                } else {
+                    RuliadSupervisionMode::AnswerValues
+                }
+            }
+            mode => mode,
+        };
+        Self { mode, ..self }
+    }
+
     pub fn proof_policy_for_step(self, absolute_step: usize) -> RuliadProofPolicyTrainingConfig {
         let mut policy = self.proof_policy;
         if self
@@ -2071,7 +2106,9 @@ impl RuliadSupervisionConfig {
             RuliadSupervisionMode::FullDocument => PortableMode::FullDocument,
             RuliadSupervisionMode::AnswerWindow => PortableMode::AnswerWindow,
             RuliadSupervisionMode::AnswerCompletion => PortableMode::AnswerCompletion,
+            RuliadSupervisionMode::AnswerStructure => PortableMode::AnswerStructure,
             RuliadSupervisionMode::AnswerValues => PortableMode::AnswerValues,
+            RuliadSupervisionMode::FactorizedAnswer => PortableMode::FactorizedAnswer,
             RuliadSupervisionMode::TraceAndAnswer => PortableMode::TraceAndAnswer,
             RuliadSupervisionMode::Mixed => PortableMode::Mixed,
         };

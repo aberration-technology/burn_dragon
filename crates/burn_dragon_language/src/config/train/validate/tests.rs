@@ -3789,6 +3789,35 @@ fn local_pc_answer_completion_profile_changes_target_selection_without_weighting
 }
 
 #[test]
+fn local_pc_factorized_answer_profile_balances_structure_and_value_updates() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let profile = workspace.join(
+        "config/language/experiments/predictive_coding/local-pc-verifier-1m-factorized-answer.toml",
+    );
+    let config = load_training_config(std::slice::from_ref(&profile))
+        .unwrap_or_else(|error| panic!("load {}: {error}", profile.display()));
+    config
+        .validate()
+        .unwrap_or_else(|error| panic!("validate {}: {error}", profile.display()));
+    let supervision = config.training.ruliad_supervision;
+    assert_eq!(supervision.mode, RuliadSupervisionMode::FactorizedAnswer);
+    assert_eq!(
+        supervision.effective_for(false, 0, 0).mode,
+        RuliadSupervisionMode::AnswerStructure
+    );
+    assert_eq!(
+        supervision.effective_for(false, 99, 1).mode,
+        RuliadSupervisionMode::AnswerValues
+    );
+    assert_eq!(
+        supervision.effective_for(true, 99, 1).mode,
+        RuliadSupervisionMode::AnswerCompletion
+    );
+    assert!(!supervision.answer_contract.enabled);
+    assert!(config.training.ruliad_policy_probe.enabled);
+}
+
+#[test]
 fn local_pc_closed_loop_profile_composes_an_accelerated_mastery_gated_corpus() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let profile = workspace.join(

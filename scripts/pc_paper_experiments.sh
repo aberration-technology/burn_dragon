@@ -29,6 +29,10 @@ RULIAD_DAGGER_START_AFTER_STEPS="${BURN_DRAGON_PC_PAPER_RULIAD_DAGGER_START_AFTE
 PC_AMORTIZATION_TOLERANCE="${BURN_DRAGON_PC_PAPER_AMORTIZATION_TOLERANCE:-0.05}"
 TIMEOUT_SECONDS="${BURN_DRAGON_PC_PAPER_TIMEOUT_SECONDS:-0}"
 WALL_CLOCK_SECONDS="${BURN_DRAGON_PC_PAPER_WALL_CLOCK_SECONDS:-0}"
+TIMEOUT_EXPLICIT=0
+if [[ -n "${BURN_DRAGON_PC_PAPER_TIMEOUT_SECONDS:-}" ]]; then
+  TIMEOUT_EXPLICIT=1
+fi
 DEFER_EXPENSIVE_RULIAD_PROBES="${BURN_DRAGON_PC_PAPER_DEFER_EXPENSIVE_RULIAD_PROBES:-0}"
 MAX_SYSTEM_MEMORY_FRACTION="${BURN_DRAGON_PC_PAPER_MAX_SYSTEM_MEMORY_FRACTION:-0.90}"
 MIN_AVAILABLE_MB="${BURN_DRAGON_PC_PAPER_MIN_AVAILABLE_MB:-12288}"
@@ -158,11 +162,13 @@ while [[ $# -gt 0 ]]; do
       ;;
     --timeout-seconds)
       TIMEOUT_SECONDS="$2"
+      TIMEOUT_EXPLICIT=1
       shift 2
       ;;
     --wall-clock-seconds)
       WALL_CLOCK_SECONDS="$2"
       TIMEOUT_SECONDS="$2"
+      TIMEOUT_EXPLICIT=1
       shift 2
       ;;
     --dry-run)
@@ -184,6 +190,13 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# Environment and CLI wall-clock contracts must be equivalent. Matrix defaults
+# may otherwise replace an environment-only wall budget with their longer hard
+# timeout, silently changing a bounded comparison into a full training run.
+if (( WALL_CLOCK_SECONDS > 0 && TIMEOUT_EXPLICIT == 0 )); then
+  TIMEOUT_SECONDS="$WALL_CLOCK_SECONDS"
+fi
 
 if [[ "$DRY_RUN" != "0" && "$DRY_RUN" != "1" ]]; then
   echo "BURN_DRAGON_PC_PAPER_DRY_RUN must be 0 or 1; got $DRY_RUN" >&2

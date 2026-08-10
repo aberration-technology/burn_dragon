@@ -1135,6 +1135,8 @@ pub struct LanguageTrainModel<B: BackendTrait> {
     #[module(skip)]
     ruliad_answer_contract_telemetry_path: Option<Arc<PathBuf>>,
     #[module(skip)]
+    ruliad_prompt_value_binding_telemetry_path: Option<Arc<PathBuf>>,
+    #[module(skip)]
     ruliad_structured_contrast_telemetry_path: Option<Arc<PathBuf>>,
     #[module(skip)]
     ruliad_field_binding_contrast_telemetry_path: Option<Arc<PathBuf>>,
@@ -1243,6 +1245,29 @@ struct RuliadAnswerContractTelemetry {
     max_completion_tokens: usize,
     max_rows_per_step: usize,
     prompt_schema_max_rows_per_step: usize,
+}
+
+struct PreparedRuliadPromptValueBindingBatch<B: Backend> {
+    inputs: Tensor<B, 2, Int>,
+    targets: Tensor<B, 2, Int>,
+    loss_mask: Tensor<B, 2, Int>,
+    sample_groups: usize,
+    rows: usize,
+    active_tokens: usize,
+    padded_tokens: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RuliadPromptValueBindingTelemetry {
+    version: u32,
+    step_index: usize,
+    algorithm: &'static str,
+    skip_reason: Option<&'static str>,
+    sample_groups: usize,
+    rows: usize,
+    active_tokens: usize,
+    padded_tokens: usize,
+    global_backward_calls: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2408,6 +2433,7 @@ mod latent_objectives;
 mod local_pc;
 mod loss_objectives;
 mod model;
+mod prompt_value_binding;
 mod ruliad_contract;
 mod ruliad_training;
 mod train_step;

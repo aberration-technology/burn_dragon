@@ -1556,6 +1556,11 @@ fn ruliad_policy_batch_is_required_only_by_active_auxiliary_consumers() {
     supervision.answer_contract.enabled = true;
     supervision.answer_contract.weight = 0.25;
     assert!(supervision.needs_ruliad_policy_batch());
+
+    supervision.answer_contract.enabled = false;
+    supervision.answer_contract.weight = 0.0;
+    supervision.prompt_value_binding.enabled = true;
+    assert!(supervision.needs_ruliad_policy_batch());
 }
 
 #[test]
@@ -1582,6 +1587,20 @@ fn ruliad_policy_batch_schedule_matches_active_auxiliary_cadence() {
     assert!(!supervision.needs_ruliad_policy_batch_at_step(3));
     assert!(supervision.needs_ruliad_policy_batch_at_step(4));
     assert!(supervision.needs_ruliad_policy_batch_at_step(8));
+
+    supervision.verifier_reward.enabled = false;
+    supervision.proof_policy.enabled = false;
+    supervision.prompt_value_binding.enabled = true;
+    supervision.prompt_value_binding.every_steps = 4;
+    supervision.prompt_value_binding.phase_steps = 1;
+    supervision.prompt_value_binding.start_after_steps = 3;
+    for step in 0..10 {
+        assert_eq!(
+            supervision.needs_ruliad_policy_batch_at_step(step),
+            matches!(step, 5 | 9),
+            "phase-aware step={step}"
+        );
+    }
 }
 
 #[test]
@@ -3815,6 +3834,78 @@ fn local_pc_factorized_answer_profile_balances_structure_and_value_updates() {
     );
     assert!(!supervision.answer_contract.enabled);
     assert!(config.training.ruliad_policy_probe.enabled);
+}
+
+#[test]
+fn local_pc_prompt_binding_profile_uses_disjoint_primary_objective_phases() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let profile = workspace.join(
+        "config/language/experiments/predictive_coding/local-pc-verifier-1m-prompt-binding.toml",
+    );
+    let config = load_training_config(std::slice::from_ref(&profile))
+        .unwrap_or_else(|error| panic!("load {}: {error}", profile.display()));
+    config
+        .validate()
+        .unwrap_or_else(|error| panic!("validate {}: {error}", profile.display()));
+    let supervision = config.training.ruliad_supervision;
+    let binding = supervision.prompt_value_binding;
+    assert_eq!(supervision.mode, RuliadSupervisionMode::AnswerCompletion);
+    assert!(binding.enabled);
+    assert!(!binding.active_at_step(0));
+    assert!(binding.active_at_step(1));
+    assert!(!binding.active_at_step(2));
+    assert!(binding.active_at_step(3));
+    assert!(!supervision.proof_policy.enabled);
+    assert!(!supervision.needs_ruliad_policy_batch_at_step(0));
+    assert!(supervision.needs_ruliad_policy_batch_at_step(1));
+    assert!(!supervision.needs_ruliad_policy_batch_at_step(2));
+    assert!(supervision.needs_ruliad_policy_batch_at_step(3));
+}
+
+#[test]
+fn prompt_value_binding_rejects_ambiguous_or_empty_schedule_contracts() {
+    let mut config = parse_config("");
+    config.training.ruliad_supervision.mode = RuliadSupervisionMode::AnswerCompletion;
+    config
+        .training
+        .ruliad_supervision
+        .prompt_value_binding
+        .enabled = true;
+
+    config
+        .training
+        .ruliad_supervision
+        .prompt_value_binding
+        .every_steps = 0;
+    assert!(
+        config
+            .validate()
+            .expect_err("zero cadence must fail")
+            .to_string()
+            .contains("every_steps")
+    );
+
+    let binding = &mut config.training.ruliad_supervision.prompt_value_binding;
+    binding.every_steps = 2;
+    binding.phase_steps = 2;
+    assert!(
+        config
+            .validate()
+            .expect_err("out-of-range phase must fail")
+            .to_string()
+            .contains("phase_steps")
+    );
+
+    let binding = &mut config.training.ruliad_supervision.prompt_value_binding;
+    binding.phase_steps = 1;
+    binding.max_rows_per_step = 0;
+    assert!(
+        config
+            .validate()
+            .expect_err("empty row budget must fail")
+            .to_string()
+            .contains("max_rows_per_step")
+    );
 }
 
 #[test]

@@ -40,6 +40,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             ruliad_policy_telemetry_path: None,
             ruliad_structured_recovery_telemetry_path: None,
             ruliad_answer_contract_telemetry_path: None,
+            ruliad_prompt_value_binding_telemetry_path: None,
             ruliad_structured_contrast_telemetry_path: None,
             ruliad_field_binding_contrast_telemetry_path: None,
             ruliad_field_binding_replay: Arc::new(Mutex::new(VecDeque::new())),
@@ -270,6 +271,14 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
 
     pub fn with_ruliad_answer_contract_telemetry_path(mut self, path: Option<PathBuf>) -> Self {
         self.ruliad_answer_contract_telemetry_path = path.map(Arc::new);
+        self
+    }
+
+    pub fn with_ruliad_prompt_value_binding_telemetry_path(
+        mut self,
+        path: Option<PathBuf>,
+    ) -> Self {
+        self.ruliad_prompt_value_binding_telemetry_path = path.map(Arc::new);
         self
     }
 

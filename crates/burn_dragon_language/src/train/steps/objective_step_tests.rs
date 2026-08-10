@@ -3686,6 +3686,107 @@ fn ruliad_prompt_schema_value_rows_train_semantic_proof_step_fields() {
 }
 
 #[test]
+fn prompt_value_binding_primary_step_uses_local_pc_without_global_backward() {
+    let device = burn::tensor::Device::<TestBackend>::default();
+    TestBackend::seed(&device, 41);
+    let tokenizer = burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+        &burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+            vocab_size: 257,
+            eos_id: None,
+        },
+    )
+    .expect("tokenizer");
+    let item = burn_dragon_universality::RuliadEvalItem {
+        oracle_hash: "binding-test".to_string(),
+        sample_index: 1,
+        split: burn_dragon_universality::SampleSplit::Train,
+        family: "formal_proof".to_string(),
+        task_kind: "select_proof_action".to_string(),
+        math_domains: vec!["formal_proof".to_string()],
+        reasoning_modes: vec!["equational".to_string()],
+        prompt: "?:select;g=3;dst=x;at=1.1\n!:".to_string(),
+        expected_answer: "g3|a:r0|f|1.1".to_string(),
+        difficulty_level: Some(0),
+        spec: None,
+    };
+    let policy_batch = Arc::new(crate::dataset::RuliadPolicyBatch {
+        samples: vec![crate::dataset::RuliadPolicySample {
+            prompt_tokens: tokenizer
+                .encode_payload(&item.prompt)
+                .into_iter()
+                .map(i64::from)
+                .collect(),
+            item,
+        }],
+        tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+            vocab_size: 257,
+            eos_id: None,
+        },
+        stop_token_id: None,
+    });
+    let dir = tempfile::tempdir().expect("tempdir");
+    let telemetry_path = dir.path().join("prompt_value_binding.jsonl");
+    let mut model_config = tiny_model_config();
+    model_config.vocab_size = 257;
+    model_config.sequence_kernel =
+        burn_dragon_core::SequenceKernelConfig::dense_score_short_context();
+    model_config.fused_kernels.rotary_embedding = burn_dragon_core::RotaryEmbedding::Alibi;
+    let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(model_config, &device))
+        .with_training_algorithm(TrainingAlgorithm::PredictiveCoding)
+        .with_local_predictive_coding(LocalPredictiveCodingConfig {
+            solver: LocalPredictiveCodingSolver::FixedPrediction,
+            ..Default::default()
+        })
+        .with_ruliad_supervision(RuliadSupervisionConfig {
+            mode: RuliadSupervisionMode::AnswerCompletion,
+            prompt_value_binding: crate::config::RuliadPromptValueBindingConfig {
+                enabled: true,
+                every_steps: 2,
+                phase_steps: 1,
+                max_rows_per_step: 8,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .with_ruliad_prompt_value_binding_telemetry_path(Some(telemetry_path.clone()));
+    let profile = model.local_predictive_coding_profile();
+    let train_batch = SequenceBatch::new(
+        Tensor::from_data(
+            TensorData::new(vec![1_i64, 2, 3, 4, 5, 6, 7, 8], [1, 8]),
+            &device,
+        ),
+        Tensor::from_data(
+            TensorData::new(vec![2_i64, 3, 4, 5, 6, 7, 8, 9], [1, 8]),
+            &device,
+        ),
+        None,
+    )
+    .with_ruliad_policy_batch(Some(policy_batch))
+    .with_absolute_step(1);
+
+    let output = burn_train::TrainStep::step(&model, train_batch);
+    assert!(!output.grads.is_empty());
+    let loss: LossValue<TestInnerBackend> = output.item.sync().adapt();
+    let loss = loss
+        .value()
+        .to_data()
+        .convert::<f32>()
+        .into_vec::<f32>()
+        .expect("loss")[0];
+    assert!(loss.is_finite());
+    let snapshot = profile.snapshot();
+    assert_eq!(snapshot.global_backward_calls, 0);
+    assert_eq!(snapshot.steps, 1);
+    let line = std::fs::read_to_string(telemetry_path).expect("binding telemetry");
+    let event: serde_json::Value =
+        serde_json::from_str(line.lines().next().expect("telemetry line")).expect("json");
+    assert_eq!(event["algorithm"], "predictive_coding");
+    assert_eq!(event["global_backward_calls"], 0);
+    assert_eq!(event["rows"], 4);
+    assert!(event["active_tokens"].as_u64().unwrap_or_default() > 0);
+}
+
+#[test]
 fn prompt_schema_row_budget_is_spread_across_samples_first() {
     let groups = vec![vec!["a0", "a1"], vec!["b0", "b1"], vec!["c0", "c1"]];
 

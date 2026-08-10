@@ -1899,6 +1899,9 @@ pub struct RuliadSupervisionConfig {
     pub answer_ranking: RuliadAnswerRankingConfig,
     pub answer_denoising: RuliadAnswerDenoisingConfig,
     pub answer_contract: RuliadAnswerContractConfig,
+    /// Scheduled primary rows that provide the answer schema and supervise the
+    /// prompt-conditioned field value. Active rows replace the ordinary loss.
+    pub prompt_value_binding: RuliadPromptValueBindingConfig,
     pub verifier_reward: RuliadVerifierRewardConfig,
     pub proof_policy: RuliadProofPolicyTrainingConfig,
     /// Sparse semantic-energy replacements for primary proof-policy terminals.
@@ -1922,6 +1925,7 @@ impl Default for RuliadSupervisionConfig {
             answer_ranking: RuliadAnswerRankingConfig::default(),
             answer_denoising: RuliadAnswerDenoisingConfig::default(),
             answer_contract: RuliadAnswerContractConfig::default(),
+            prompt_value_binding: RuliadPromptValueBindingConfig::default(),
             verifier_reward: RuliadVerifierRewardConfig::default(),
             proof_policy: RuliadProofPolicyTrainingConfig::default(),
             proof_policy_semantic_refresh: RuliadProofPolicySemanticRefreshConfig::default(),
@@ -1962,14 +1966,26 @@ impl RuliadProofPolicySemanticRefreshConfig {
 pub(crate) struct RuliadPolicyBatchCadence {
     every_steps: usize,
     start_after_steps: usize,
+    phase_steps: usize,
 }
 
 impl RuliadPolicyBatchCadence {
     fn new(enabled: bool, weight: f32, every_steps: usize, start_after_steps: usize) -> Self {
+        Self::new_with_phase(enabled, weight, every_steps, start_after_steps, 0)
+    }
+
+    fn new_with_phase(
+        enabled: bool,
+        weight: f32,
+        every_steps: usize,
+        start_after_steps: usize,
+        phase_steps: usize,
+    ) -> Self {
         if enabled && weight > 0.0 && every_steps > 0 {
             Self {
                 every_steps,
                 start_after_steps,
+                phase_steps,
             }
         } else {
             Self::default()
@@ -1979,13 +1995,13 @@ impl RuliadPolicyBatchCadence {
     fn includes(self, absolute_step: usize) -> bool {
         self.every_steps > 0
             && absolute_step >= self.start_after_steps
-            && absolute_step.is_multiple_of(self.every_steps)
+            && absolute_step % self.every_steps == self.phase_steps
     }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct RuliadPolicyBatchCadences {
-    values: [RuliadPolicyBatchCadence; 7],
+    values: [RuliadPolicyBatchCadence; 8],
 }
 
 impl RuliadPolicyBatchCadences {
@@ -2046,6 +2062,7 @@ impl RuliadSupervisionConfig {
         let verifier = self.verifier_reward;
         let denoising = self.answer_denoising;
         let contract = self.answer_contract;
+        let prompt_value_binding = self.prompt_value_binding;
         let proof_policy = self.proof_policy;
         RuliadPolicyBatchCadences {
             values: [
@@ -2086,6 +2103,13 @@ impl RuliadSupervisionConfig {
                     contract.weight,
                     contract.every_steps,
                     contract.start_after_steps,
+                ),
+                RuliadPolicyBatchCadence::new_with_phase(
+                    prompt_value_binding.enabled,
+                    1.0,
+                    prompt_value_binding.every_steps,
+                    prompt_value_binding.start_after_steps,
+                    prompt_value_binding.phase_steps,
                 ),
                 RuliadPolicyBatchCadence::new(
                     proof_policy.enabled,
@@ -2431,6 +2455,41 @@ impl Default for RuliadAnswerContractConfig {
             other_token_weight: 1.0,
             prompt_schema_value_weight: 0.0,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RuliadPromptValueBindingConfig {
+    pub enabled: bool,
+    pub every_steps: usize,
+    /// Residue within `every_steps`, used to keep primary objectives disjoint.
+    pub phase_steps: usize,
+    pub start_after_steps: usize,
+    pub max_completion_tokens: usize,
+    pub max_rows_per_step: usize,
+}
+
+impl Default for RuliadPromptValueBindingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            every_steps: 2,
+            phase_steps: 1,
+            start_after_steps: 0,
+            max_completion_tokens: 64,
+            max_rows_per_step: 32,
+        }
+    }
+}
+
+impl RuliadPromptValueBindingConfig {
+    pub fn active_at_step(self, absolute_step: usize) -> bool {
+        self.enabled
+            && self.every_steps > 0
+            && self.phase_steps < self.every_steps
+            && absolute_step >= self.start_after_steps
+            && absolute_step % self.every_steps == self.phase_steps
     }
 }
 

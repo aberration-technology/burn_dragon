@@ -119,6 +119,51 @@ impl TrainingConfig {
                 }
             }
         }
+        let prompt_value_binding = self.training.ruliad_supervision.prompt_value_binding;
+        if prompt_value_binding.enabled {
+            if prompt_value_binding.every_steps == 0 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.prompt_value_binding.every_steps must be positive when enabled"
+                ));
+            }
+            if prompt_value_binding.phase_steps >= prompt_value_binding.every_steps {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.prompt_value_binding.phase_steps must be less than every_steps"
+                ));
+            }
+            if prompt_value_binding.max_completion_tokens == 0 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.prompt_value_binding.max_completion_tokens must be positive when enabled"
+                ));
+            }
+            if prompt_value_binding.max_rows_per_step == 0 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.prompt_value_binding.max_rows_per_step must be positive when enabled"
+                ));
+            }
+            if !self.training.ruliad_supervision.uses_answer_target_mask() {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.prompt_value_binding.enabled requires an answer-target supervision mode"
+                ));
+            }
+            if self.parallel.pipeline.enabled {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.prompt_value_binding.enabled does not yet support parallel.pipeline.enabled"
+                ));
+            }
+            if self.training.ruliad_supervision.answer_contract.enabled
+                && self
+                    .training
+                    .ruliad_supervision
+                    .answer_contract
+                    .prompt_schema_value_weight
+                    > f32::EPSILON
+            {
+                return Err(anyhow!(
+                    "prompt_value_binding and answer_contract.prompt_schema_value_weight are mutually exclusive primary and auxiliary value-binding contracts"
+                ));
+            }
+        }
         if self.training.ruliad_supervision.answer_denoising.enabled {
             let denoising = self.training.ruliad_supervision.answer_denoising;
             if !denoising.weight.is_finite() || denoising.weight < 0.0 {

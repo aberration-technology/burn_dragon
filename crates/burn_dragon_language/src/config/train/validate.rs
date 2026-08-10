@@ -50,6 +50,20 @@ impl TrainingConfig {
 
     fn validate_training_algorithm(&self) -> Result<()> {
         let algorithm = self.resolved_training_algorithm();
+        if self
+            .training
+            .ruliad_supervision
+            .prompt_value_binding
+            .enabled
+            && !matches!(
+                algorithm,
+                TrainingAlgorithm::Backpropagation | TrainingAlgorithm::PredictiveCoding
+            )
+        {
+            return Err(anyhow!(
+                "ruliad prompt_value_binding requires training.algorithm=backpropagation or predictive_coding"
+            ));
+        }
         let verifier_terminal = matches!(
             self.training.local_predictive_coding.terminal_criterion,
             crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSet

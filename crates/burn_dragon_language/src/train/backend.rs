@@ -1014,6 +1014,15 @@ where
         (training.ruliad_supervision.answer_contract.enabled
             && training.ruliad_supervision.answer_contract.weight > f32::EPSILON)
             .then(|| run_dir.join("events").join("ruliad_answer_contract.jsonl"));
+    let ruliad_prompt_value_binding_telemetry_path = training
+        .ruliad_supervision
+        .prompt_value_binding
+        .enabled
+        .then(|| {
+            run_dir
+                .join("events")
+                .join("ruliad_prompt_value_binding.jsonl")
+        });
     let ruliad_structured_contrast_telemetry_path = training
         .ruliad_supervision
         .verifier_reward
@@ -1052,6 +1061,7 @@ where
         .with_ruliad_policy_telemetry_path(ruliad_policy_telemetry_path)
         .with_ruliad_structured_recovery_telemetry_path(ruliad_structured_recovery_telemetry_path)
         .with_ruliad_answer_contract_telemetry_path(ruliad_answer_contract_telemetry_path)
+        .with_ruliad_prompt_value_binding_telemetry_path(ruliad_prompt_value_binding_telemetry_path)
         .with_ruliad_structured_contrast_telemetry_path(ruliad_structured_contrast_telemetry_path)
         .with_ruliad_field_binding_contrast_telemetry_path(
             ruliad_field_binding_contrast_telemetry_path,
@@ -1653,6 +1663,15 @@ where
         (training.ruliad_supervision.answer_contract.enabled
             && training.ruliad_supervision.answer_contract.weight > f32::EPSILON)
             .then(|| run_dir.join("events").join("ruliad_answer_contract.jsonl"));
+    let ruliad_prompt_value_binding_telemetry_path = training
+        .ruliad_supervision
+        .prompt_value_binding
+        .enabled
+        .then(|| {
+            run_dir
+                .join("events")
+                .join("ruliad_prompt_value_binding.jsonl")
+        });
     let ruliad_structured_contrast_telemetry_path = training
         .ruliad_supervision
         .verifier_reward
@@ -1714,6 +1733,7 @@ where
         .with_ruliad_policy_telemetry_path(ruliad_policy_telemetry_path)
         .with_ruliad_structured_recovery_telemetry_path(ruliad_structured_recovery_telemetry_path)
         .with_ruliad_answer_contract_telemetry_path(ruliad_answer_contract_telemetry_path)
+        .with_ruliad_prompt_value_binding_telemetry_path(ruliad_prompt_value_binding_telemetry_path)
         .with_ruliad_structured_contrast_telemetry_path(ruliad_structured_contrast_telemetry_path)
         .with_ruliad_field_binding_contrast_telemetry_path(
             ruliad_field_binding_contrast_telemetry_path,

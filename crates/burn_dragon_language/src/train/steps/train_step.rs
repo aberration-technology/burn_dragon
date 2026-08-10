@@ -203,6 +203,30 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                     .record_structured_terminal_skip();
             }
         }
+        let verifier_terminal_due = local_predictive_coding::verifier_terminal_due(
+            self.local_predictive_coding.terminal_criterion,
+            self.ruliad_supervision.proof_policy,
+            schedule_step_index,
+        );
+        if self
+            .ruliad_supervision
+            .prompt_value_binding
+            .active_at_step(schedule_step_index)
+            && !verifier_terminal_due
+        {
+            let input = super::prompt_value_binding::RuliadPromptValueBindingStepInput {
+                policy_batch: ruliad_policy_batch.clone(),
+                stream_inputs: clean_inputs.clone(),
+                summary_event_mask: summary_event_mask.clone(),
+                reset_stream_state,
+                block_size,
+                schedule_step_index,
+                profiling: prof_enabled,
+            };
+            if let Some(output) = self.ruliad_prompt_value_binding_step(input) {
+                return output;
+            }
+        }
         if matches!(self.training_algorithm, TrainingAlgorithm::PredictiveCoding) {
             if local_predictive_coding::verifier_terminal_due(
                 self.local_predictive_coding.terminal_criterion,

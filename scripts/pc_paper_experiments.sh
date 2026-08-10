@@ -29,6 +29,7 @@ RULIAD_DAGGER_START_AFTER_STEPS="${BURN_DRAGON_PC_PAPER_RULIAD_DAGGER_START_AFTE
 PC_AMORTIZATION_TOLERANCE="${BURN_DRAGON_PC_PAPER_AMORTIZATION_TOLERANCE:-0.05}"
 TIMEOUT_SECONDS="${BURN_DRAGON_PC_PAPER_TIMEOUT_SECONDS:-0}"
 WALL_CLOCK_SECONDS="${BURN_DRAGON_PC_PAPER_WALL_CLOCK_SECONDS:-0}"
+DEFER_EXPENSIVE_RULIAD_PROBES="${BURN_DRAGON_PC_PAPER_DEFER_EXPENSIVE_RULIAD_PROBES:-0}"
 MAX_SYSTEM_MEMORY_FRACTION="${BURN_DRAGON_PC_PAPER_MAX_SYSTEM_MEMORY_FRACTION:-0.90}"
 MIN_AVAILABLE_MB="${BURN_DRAGON_PC_PAPER_MIN_AVAILABLE_MB:-12288}"
 SAMPLE_INTERVAL_SECONDS="${BURN_DRAGON_PC_PAPER_SAMPLE_INTERVAL_SECONDS:-2}"
@@ -84,6 +85,9 @@ Safety guards:
   BURN_DRAGON_PC_PAPER_MAX_SYSTEM_MEMORY_FRACTION  Default: 0.90
   BURN_DRAGON_PC_PAPER_MIN_AVAILABLE_MB            Default: 12288
   BURN_DRAGON_PC_PAPER_REQUIRE_CLEAN_GIT            1 rejects dirty publication runs
+  BURN_DRAGON_PC_PAPER_DEFER_EXPENSIVE_RULIAD_PROBES
+                                                    1 reserves the timed region for training and
+                                                    fixed holdout validation; requires wall-clock mode
 
 Local-factor controls:
   BURN_DRAGON_PC_PAPER_LOCAL_LEARNING_RATE          Default: 0.001
@@ -694,6 +698,24 @@ matrix_defaults() {
 }
 
 matrix_defaults
+
+if [[ "$DEFER_EXPENSIVE_RULIAD_PROBES" != "0" && "$DEFER_EXPENSIVE_RULIAD_PROBES" != "1" ]]; then
+  echo "BURN_DRAGON_PC_PAPER_DEFER_EXPENSIVE_RULIAD_PROBES must be 0 or 1" >&2
+  exit 2
+fi
+if (( DEFER_EXPENSIVE_RULIAD_PROBES == 1 )); then
+  if (( WALL_CLOCK_SECONDS <= 0 )); then
+    echo "deferred Ruliad probes require --wall-clock-seconds" >&2
+    exit 2
+  fi
+  RULIAD_CORRECTNESS_PROBE_ITEMS=0
+  RULIAD_POLICY_PROBE_EVERY_EPOCHS=""
+  RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS=""
+fi
+DEFER_EXPENSIVE_RULIAD_PROBES_JSON=false
+if (( DEFER_EXPENSIVE_RULIAD_PROBES == 1 )); then
+  DEFER_EXPENSIVE_RULIAD_PROBES_JSON=true
+fi
 
 case "$VALIDATION_OBJECTIVE" in
   fixed_holdout|source_weighted|stream_warm) ;;
@@ -2396,7 +2418,13 @@ counterfactual_targets_per_state = $policy_semantic_refresh_counterfactual_targe
 EOF
   fi
 
-  if [[ -n "$RULIAD_POLICY_PROBE_EVERY_EPOCHS" || -n "$RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS" || -n "$policy_probe_scoring" ]]; then
+  if (( DEFER_EXPENSIVE_RULIAD_PROBES == 1 )); then
+    cat >> "$path" <<'EOF'
+[training.ruliad_policy_probe]
+enabled = false
+
+EOF
+  elif [[ -n "$RULIAD_POLICY_PROBE_EVERY_EPOCHS" || -n "$RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS" || -n "$policy_probe_scoring" ]]; then
     if [[ -n "$RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS" && ! "$RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS" =~ ^[1-9][0-9]*$ ]]; then
       echo "BURN_DRAGON_PC_PAPER_RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS must be a positive integer" >&2
       return 2
@@ -2736,6 +2764,7 @@ write_manifest() {
   "ruliad_correctness_probe_items": $RULIAD_CORRECTNESS_PROBE_ITEMS,
   "ruliad_policy_probe_closed_loop_every_epochs": $closed_loop_cadence_json,
   "ruliad_dagger_start_after_steps": $RULIAD_DAGGER_START_AFTER_STEPS,
+  "defer_expensive_ruliad_probes": $DEFER_EXPENSIVE_RULIAD_PROBES_JSON,
   "backend": $(json_escape "$BACKEND"),
   "features": $(json_escape "$FEATURES"),
   "profile": $(json_escape "$PROFILE"),
@@ -2867,9 +2896,15 @@ echo "sequence_state_probe=$SEQUENCE_STATE_PROBE paired_batches=$SEQUENCE_STATE_
 echo "source_selection_feedback_updates=$SOURCE_SELECTION_FEEDBACK_UPDATES"
 echo "validation_objective=$VALIDATION_OBJECTIVE"
 echo "ruliad_panel_base_difficulty_levels=$RULIAD_PANEL_BASE_DIFFICULTY_LEVELS"
-echo "ruliad_policy_probe_every_epochs=${RULIAD_POLICY_PROBE_EVERY_EPOCHS:-profile}"
-echo "ruliad_policy_probe_closed_loop_every_epochs=${RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS:-profile}"
+if (( DEFER_EXPENSIVE_RULIAD_PROBES == 1 )); then
+  echo "ruliad_policy_probe_every_epochs=disabled"
+  echo "ruliad_policy_probe_closed_loop_every_epochs=disabled"
+else
+  echo "ruliad_policy_probe_every_epochs=${RULIAD_POLICY_PROBE_EVERY_EPOCHS:-profile}"
+  echo "ruliad_policy_probe_closed_loop_every_epochs=${RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS:-profile}"
+fi
 echo "guards: max_system_memory_fraction=$MAX_SYSTEM_MEMORY_FRACTION min_available_mb=$MIN_AVAILABLE_MB timeout_seconds=$TIMEOUT_SECONDS"
+echo "defer_expensive_ruliad_probes=$DEFER_EXPENSIVE_RULIAD_PROBES"
 
 matrix_status=0
 for iters in "${ITERS[@]}"; do

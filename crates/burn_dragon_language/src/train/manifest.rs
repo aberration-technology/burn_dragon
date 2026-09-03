@@ -13,6 +13,7 @@ use crate::TrainingConfig;
 
 pub const EXPERIMENT_MANIFEST_FILE_NAME: &str = "experiment_manifest.json";
 const EXPERIMENT_MANIFEST_SCHEMA_VERSION: u32 = 2;
+const CHECKPOINT_PROGRESS_PREFIX: &str = "training-progress";
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ExperimentGitRevision {
@@ -36,11 +37,32 @@ pub struct ExperimentLaunch {
     pub command: Vec<String>,
     pub effective_config_sha256: String,
     pub training_contract_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub immutable_training_contract_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_max_iters: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub horizon_extension: Option<ExperimentHorizonExtension>,
     pub launch_mode: burn_dragon_train::train::pipeline::TrainingLaunchMode,
     pub resume_checkpoint_epoch: Option<usize>,
     pub checkpoint_artifacts: Vec<ExperimentCheckpointArtifact>,
     pub config_snapshot: PathBuf,
     pub git: ExperimentGitRevision,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExperimentHorizonExtension {
+    pub previous_max_iters: usize,
+    pub requested_max_iters: usize,
+    pub resume_completed_steps: usize,
+    pub checkpoint_epoch: usize,
+    pub schedule_contract: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExperimentCheckpointProgress {
+    pub epoch: usize,
+    pub completed_steps: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -68,6 +90,16 @@ struct ExperimentLaunchConfigSnapshot<'a> {
     model: &'a DragonConfig,
 }
 
+#[derive(Deserialize)]
+struct OwnedExperimentLaunchConfigSnapshot {
+    training: TrainingConfig,
+}
+
+#[derive(Deserialize)]
+struct LegacySourceSelectionProgress {
+    absolute_step_offset: usize,
+}
+
 pub fn write_experiment_manifest(
     config: &TrainingConfig,
     model_config: &DragonConfig,
@@ -78,11 +110,14 @@ pub fn write_experiment_manifest(
     fs::create_dir_all(run_dir)
         .with_context(|| format!("create experiment run directory {}", run_dir.display()))?;
     let path = run_dir.join(EXPERIMENT_MANIFEST_FILE_NAME);
-    let launch = ExperimentLaunch {
+    let mut launch = ExperimentLaunch {
         unix_time_ms: unix_time_ms(),
         command: std::env::args().collect(),
         effective_config_sha256: effective_config_sha256(config)?,
         training_contract_sha256: training_contract_sha256(config)?,
+        immutable_training_contract_sha256: Some(immutable_training_contract_sha256(config)?),
+        planned_max_iters: Some(config.training.max_iters),
+        horizon_extension: None,
         launch_mode: config.training.launch_mode,
         resume_checkpoint_epoch: resolved_resume_checkpoint_epoch(config, run_dir),
         checkpoint_artifacts: resolved_resume_checkpoint_epoch(config, run_dir)
@@ -114,15 +149,19 @@ pub fn write_experiment_manifest(
                 backend
             ));
         }
-        if let Some(first) = existing.launches.first()
-            && first.training_contract_sha256 != launch.training_contract_sha256
-        {
+        let requested_model_spec = super::utils::build_model_spec(model_config);
+        if existing.model_spec != requested_model_spec {
             return Err(anyhow!(
-                "experiment training contract mismatch in {}: existing={}, requested={}",
-                path.display(),
-                first.training_contract_sha256,
-                launch.training_contract_sha256
+                "experiment model contract mismatch in {}",
+                path.display()
             ));
+        }
+        if let Some(previous) = existing.launches.last()
+            && previous.training_contract_sha256 != launch.training_contract_sha256
+        {
+            launch.horizon_extension = Some(validate_horizon_extension(
+                config, run_dir, &existing, previous, &launch,
+            )?);
         }
         existing
     } else {
@@ -138,7 +177,6 @@ pub fn write_experiment_manifest(
             launches: Vec::new(),
         }
     };
-    let mut launch = launch;
     launch.config_snapshot = PathBuf::from("launches")
         .join(format!("launch-{:04}-config.json", manifest.launches.len()));
     let launch_snapshot_path = run_dir.join(&launch.config_snapshot);
@@ -167,8 +205,200 @@ fn training_contract_sha256(config: &TrainingConfig) -> Result<String> {
     contract.training.launch_mode = Default::default();
     contract.training.resume_run_dir = None;
     contract.training.resume_checkpoint_epoch = None;
+    contract.training.resume_horizon_extension = Default::default();
     contract.training.source_selection_state_path = None;
     config_sha256(&contract, "normalized training contract")
+}
+
+fn immutable_training_contract_sha256(config: &TrainingConfig) -> Result<String> {
+    let mut contract = config.clone();
+    contract.training.max_iters = 1;
+    training_contract_sha256(&contract)
+}
+
+fn validate_horizon_extension(
+    config: &TrainingConfig,
+    run_dir: &Path,
+    manifest: &ExperimentManifest,
+    previous: &ExperimentLaunch,
+    requested: &ExperimentLaunch,
+) -> Result<ExperimentHorizonExtension> {
+    if !config.training.resume_horizon_extension.enabled {
+        return Err(anyhow!(
+            "experiment training contract mismatch in {}: existing={}, requested={}; increasing training.max_iters requires training.resume_horizon_extension.enabled=true",
+            run_dir.join(EXPERIMENT_MANIFEST_FILE_NAME).display(),
+            previous.training_contract_sha256,
+            requested.training_contract_sha256
+        ));
+    }
+    if !matches!(
+        config.training.launch_mode,
+        burn_dragon_train::train::pipeline::TrainingLaunchMode::ResumeExactRun
+    ) {
+        return Err(anyhow!(
+            "experiment horizon extension requires launch_mode=resume_exact_run"
+        ));
+    }
+    if config.training.epochs.is_some() {
+        return Err(anyhow!(
+            "experiment horizon extension only supports max_iters-based runs"
+        ));
+    }
+    ensure_horizon_independent_learning_schedule(config)?;
+
+    let previous_snapshot = load_launch_snapshot(run_dir, previous)?;
+    let previous_config = previous_snapshot.training;
+    let previous_immutable = immutable_training_contract_sha256(&previous_config)?;
+    let requested_immutable = immutable_training_contract_sha256(config)?;
+    if previous_immutable != requested_immutable {
+        return Err(anyhow!(
+            "experiment horizon extension changed immutable training semantics in {}: existing={}, requested={}",
+            run_dir.join(EXPERIMENT_MANIFEST_FILE_NAME).display(),
+            previous_immutable,
+            requested_immutable
+        ));
+    }
+    if let Some(first) = manifest.launches.first() {
+        let first_snapshot = load_launch_snapshot(run_dir, first)?;
+        let first_immutable = immutable_training_contract_sha256(&first_snapshot.training)?;
+        if first_immutable != requested_immutable {
+            return Err(anyhow!(
+                "experiment horizon extension no longer matches the original immutable training contract"
+            ));
+        }
+    }
+
+    let previous_max_iters = previous_config.training.max_iters;
+    let requested_max_iters = config.training.max_iters;
+    if requested_max_iters <= previous_max_iters {
+        return Err(anyhow!(
+            "experiment horizon extension must grow monotonically: previous max_iters={previous_max_iters}, requested={requested_max_iters}"
+        ));
+    }
+    let checkpoint_epoch = requested.resume_checkpoint_epoch.ok_or_else(|| {
+        anyhow!("experiment horizon extension requires a resolved resume checkpoint epoch")
+    })?;
+    let resume_completed_steps =
+        checkpoint_completed_steps(run_dir, checkpoint_epoch, &previous_config)?;
+    if requested_max_iters <= resume_completed_steps {
+        return Err(anyhow!(
+            "experiment horizon extension must exceed checkpoint progress: completed_steps={resume_completed_steps}, requested max_iters={requested_max_iters}"
+        ));
+    }
+
+    Ok(ExperimentHorizonExtension {
+        previous_max_iters,
+        requested_max_iters,
+        resume_completed_steps,
+        checkpoint_epoch,
+        schedule_contract: "horizon_independent_v1".to_string(),
+    })
+}
+
+fn ensure_horizon_independent_learning_schedule(config: &TrainingConfig) -> Result<()> {
+    if config
+        .training
+        .module_lr_scales
+        .iter()
+        .any(|entry| entry.schedule.is_some())
+    {
+        return Err(anyhow!(
+            "experiment horizon extension does not support fraction-of-total module LR schedules"
+        ));
+    }
+    let independent = match &config.optimizer.lr_schedule {
+        None
+        | Some(burn_dragon_train::LearningRateScheduleConfig::Constant { .. })
+        | Some(burn_dragon_train::LearningRateScheduleConfig::Exponential { .. }) => true,
+        Some(burn_dragon_train::LearningRateScheduleConfig::Cosine { num_iters, .. })
+        | Some(burn_dragon_train::LearningRateScheduleConfig::Linear { num_iters, .. }) => {
+            num_iters.is_some()
+        }
+        Some(burn_dragon_train::LearningRateScheduleConfig::Step { step_size, .. }) => {
+            step_size.is_some()
+        }
+        Some(burn_dragon_train::LearningRateScheduleConfig::Noam { warmup_steps, .. }) => {
+            warmup_steps.is_some()
+        }
+    };
+    if !independent {
+        return Err(anyhow!(
+            "experiment horizon extension requires an LR schedule independent of max_iters"
+        ));
+    }
+    Ok(())
+}
+
+fn load_launch_snapshot(
+    run_dir: &Path,
+    launch: &ExperimentLaunch,
+) -> Result<OwnedExperimentLaunchConfigSnapshot> {
+    let path = run_dir.join(&launch.config_snapshot);
+    let bytes = fs::read(&path)
+        .with_context(|| format!("read experiment launch snapshot {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse experiment launch snapshot {}", path.display()))
+}
+
+fn checkpoint_completed_steps(
+    run_dir: &Path,
+    epoch: usize,
+    previous_config: &TrainingConfig,
+) -> Result<usize> {
+    let progress_path = experiment_checkpoint_progress_path(run_dir, epoch);
+    if progress_path.is_file() {
+        let progress: ExperimentCheckpointProgress =
+            serde_json::from_slice(&fs::read(&progress_path).with_context(|| {
+                format!("read checkpoint progress {}", progress_path.display())
+            })?)
+            .with_context(|| format!("parse checkpoint progress {}", progress_path.display()))?;
+        if progress.epoch != epoch || progress.completed_steps == 0 {
+            return Err(anyhow!(
+                "invalid checkpoint progress {}: epoch={}, completed_steps={}",
+                progress_path.display(),
+                progress.epoch,
+                progress.completed_steps
+            ));
+        }
+        return Ok(progress.completed_steps);
+    }
+
+    let source_path = run_dir
+        .join("checkpoint")
+        .join(format!("source-selection-state-{epoch}.json"));
+    if source_path.is_file() {
+        let progress: LegacySourceSelectionProgress =
+            serde_json::from_slice(&fs::read(&source_path).with_context(|| {
+                format!("read legacy source progress {}", source_path.display())
+            })?)
+            .with_context(|| format!("parse legacy source progress {}", source_path.display()))?;
+        return Ok(progress.absolute_step_offset.saturating_add(1));
+    }
+
+    Ok(epoch
+        .saturating_mul(previous_config.training.checkpoint_interval_iters.max(1))
+        .min(previous_config.training.max_iters.max(1)))
+}
+
+pub(crate) fn experiment_checkpoint_progress_path(run_dir: &Path, epoch: usize) -> PathBuf {
+    run_dir
+        .join("checkpoint")
+        .join(format!("{CHECKPOINT_PROGRESS_PREFIX}-{epoch}.json"))
+}
+
+pub(crate) fn save_experiment_checkpoint_progress(
+    run_dir: &Path,
+    epoch: usize,
+    completed_steps: usize,
+) -> Result<()> {
+    let path = experiment_checkpoint_progress_path(run_dir, epoch);
+    write_json_atomically(
+        &path,
+        &ExperimentCheckpointProgress {
+            epoch,
+            completed_steps,
+        },
+    )
 }
 
 fn config_sha256(config: &TrainingConfig, label: &str) -> Result<String> {
@@ -368,5 +598,157 @@ mod tests {
         )
         .expect_err("changed training contract must be rejected");
         assert!(error.to_string().contains("training contract mismatch"));
+    }
+
+    #[test]
+    fn exact_resume_horizon_extension_is_monotonic_and_semantics_preserving() {
+        let directory = tempfile::tempdir().expect("temporary run directory");
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let config = load_training_config(&[
+            workspace.join("config/language/experiments/predictive_coding/local-pc-smoke.toml")
+        ])
+        .expect("training config");
+        let tokenizer = config
+            .dataset
+            .tokenizer
+            .load(&workspace)
+            .expect("tokenizer");
+        let model_config = crate::build_model_config_with_tokenizer(
+            &config.model,
+            config.training.block_size,
+            tokenizer.as_ref(),
+        )
+        .expect("model config");
+
+        write_experiment_manifest(
+            &config,
+            &model_config,
+            directory.path(),
+            "horizon-extension-test",
+            "ndarray",
+        )
+        .expect("fresh manifest");
+        fs::create_dir_all(directory.path().join("checkpoint")).expect("checkpoint directory");
+        fs::write(directory.path().join("checkpoint/model-1.bin"), b"model")
+            .expect("checkpoint sentinel");
+        save_experiment_checkpoint_progress(directory.path(), 1, 64).expect("checkpoint progress");
+
+        let mut extension = config.clone();
+        extension.training.launch_mode =
+            burn_dragon_train::train::pipeline::TrainingLaunchMode::ResumeExactRun;
+        extension.training.resume_run_dir = Some(directory.path().to_path_buf());
+        extension.training.resume_checkpoint_epoch = Some(1);
+        extension.training.resume_horizon_extension.enabled = true;
+        extension.training.max_iters = 128;
+        write_experiment_manifest(
+            &extension,
+            &model_config,
+            directory.path(),
+            "horizon-extension-test",
+            "ndarray",
+        )
+        .expect("safe horizon extension");
+
+        let manifest: ExperimentManifest = serde_json::from_slice(
+            &fs::read(directory.path().join(EXPERIMENT_MANIFEST_FILE_NAME)).expect("read manifest"),
+        )
+        .expect("parse manifest");
+        let horizon = manifest.launches[1]
+            .horizon_extension
+            .as_ref()
+            .expect("extension audit record");
+        assert_eq!(horizon.previous_max_iters, 64);
+        assert_eq!(horizon.requested_max_iters, 128);
+        assert_eq!(horizon.resume_completed_steps, 64);
+        assert_eq!(horizon.checkpoint_epoch, 1);
+
+        write_experiment_manifest(
+            &extension,
+            &model_config,
+            directory.path(),
+            "horizon-extension-test",
+            "ndarray",
+        )
+        .expect("same extended horizon remains resumable");
+
+        let mut shrink = extension.clone();
+        shrink.training.max_iters = 96;
+        let error = write_experiment_manifest(
+            &shrink,
+            &model_config,
+            directory.path(),
+            "horizon-extension-test",
+            "ndarray",
+        )
+        .expect_err("horizon shrink must fail closed");
+        assert!(error.to_string().contains("grow monotonically"));
+
+        let mut semantic_drift = extension;
+        semantic_drift.training.max_iters = 192;
+        semantic_drift.training.seed = semantic_drift.training.seed.saturating_add(1);
+        let error = write_experiment_manifest(
+            &semantic_drift,
+            &model_config,
+            directory.path(),
+            "horizon-extension-test",
+            "ndarray",
+        )
+        .expect_err("immutable semantic drift must fail closed");
+        assert!(error.to_string().contains("immutable training semantics"));
+    }
+
+    #[test]
+    fn exact_resume_horizon_extension_rejects_implicit_finite_schedule() {
+        let directory = tempfile::tempdir().expect("temporary run directory");
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut config = load_training_config(&[
+            workspace.join("config/language/experiments/predictive_coding/local-pc-smoke.toml")
+        ])
+        .expect("training config");
+        config.optimizer.lr_schedule =
+            Some(burn_dragon_train::LearningRateScheduleConfig::Cosine {
+                initial_lr: None,
+                min_lr: Some(1.0e-5),
+                warmup_steps: Some(8),
+                num_iters: None,
+            });
+        let tokenizer = config
+            .dataset
+            .tokenizer
+            .load(&workspace)
+            .expect("tokenizer");
+        let model_config = crate::build_model_config_with_tokenizer(
+            &config.model,
+            config.training.block_size,
+            tokenizer.as_ref(),
+        )
+        .expect("model config");
+        write_experiment_manifest(
+            &config,
+            &model_config,
+            directory.path(),
+            "implicit-schedule-test",
+            "ndarray",
+        )
+        .expect("fresh manifest");
+        fs::create_dir_all(directory.path().join("checkpoint")).expect("checkpoint directory");
+        fs::write(directory.path().join("checkpoint/model-1.bin"), b"model")
+            .expect("checkpoint sentinel");
+
+        config.training.launch_mode =
+            burn_dragon_train::train::pipeline::TrainingLaunchMode::ResumeExactRun;
+        config.training.resume_run_dir = Some(directory.path().to_path_buf());
+        config.training.resume_checkpoint_epoch = Some(1);
+        config.training.resume_horizon_extension.enabled = true;
+        config.training.max_iters = 128;
+        let error = write_experiment_manifest(
+            &config,
+            &model_config,
+            directory.path(),
+            "implicit-schedule-test",
+            "ndarray",
+        )
+        .expect_err("implicit finite schedule must fail closed");
+        assert!(error.to_string().contains("independent of max_iters"));
     }
 }

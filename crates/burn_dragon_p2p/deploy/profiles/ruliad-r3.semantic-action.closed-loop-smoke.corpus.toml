@@ -1,0 +1,12 @@
+extends = "ruliad-r3.semantic-action.corpus.toml"
+
+# Experiment-only timing overlay. The semantic source contract, verifier
+# thresholds, and unbounded frontier remain inherited from the production
+# corpus; only the observation horizon is compressed for bounded matrices.
+output_dir = "./generated/ruliad-r3-semantic-action-closed-loop-smoke"
+name = "burn-dragon-ruliad-ir-v3-semantic-action-closed-loop-smoke"
+
+[source_selection.cold_start]
+hold_steps = 64
+ramp_steps = 256
+mastery_min_feedback_count = 4

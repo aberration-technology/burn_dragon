@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use burn_p2p::{
@@ -57,6 +58,16 @@ pub struct VerifyRevisionContractArgs {
     pub trust_bundle: PathBuf,
     #[arg(long)]
     pub artifact_store_root: PathBuf,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct VerifyEdgeRevisionContractArgs {
+    #[arg(long)]
+    pub edge_url: String,
+    #[arg(long)]
+    pub experiment_id: String,
+    #[arg(long)]
+    pub revision_id: String,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -129,6 +140,78 @@ pub fn verify_revision_contract(args: &VerifyRevisionContractArgs) -> Result<()>
             "training_contract_id": bundle.training_contract_id,
             "genesis_artifact_id": bundle.genesis.payload.payload.artifact.artifact_id,
             "signer": bundle.contract_signature.signer,
+        }))?
+    );
+    Ok(())
+}
+
+pub fn verify_edge_revision_contract(args: &VerifyEdgeRevisionContractArgs) -> Result<()> {
+    let url = format!("{}/portal/snapshot", args.edge_url.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("build browser edge verification client")?;
+    let response = client
+        .get(&url)
+        .send()
+        .with_context(|| format!("fetch browser edge snapshot from {url}"))?;
+    let status = response.status();
+    let bytes = response.bytes().context("read browser edge snapshot")?;
+    ensure!(
+        status.is_success(),
+        "browser edge snapshot request failed with HTTP {}: {}",
+        status,
+        String::from_utf8_lossy(&bytes)
+    );
+    let snapshot: burn_p2p::BrowserEdgeSnapshot =
+        serde_json::from_slice(&bytes).context("decode browser edge snapshot")?;
+    let entry = snapshot
+        .directory
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.experiment_id.as_str() == args.experiment_id
+                && entry.current_revision_id.as_str() == args.revision_id
+        })
+        .with_context(|| {
+            format!(
+                "edge directory has no experiment={} revision={}",
+                args.experiment_id, args.revision_id
+            )
+        })?;
+    let contract = snapshot
+        .revision_contracts
+        .iter()
+        .find(|contract| {
+            contract.revision.experiment_id == entry.experiment_id
+                && contract.revision.revision_id == entry.current_revision_id
+                && contract.revision.workload_id == entry.workload_id
+        })
+        .with_context(|| {
+            format!(
+                "edge has no authority-signed contract for experiment={} revision={} workload={}",
+                entry.experiment_id.as_str(),
+                entry.current_revision_id.as_str(),
+                entry.workload_id.as_str()
+            )
+        })?;
+    let trust = snapshot
+        .trust_bundle
+        .as_ref()
+        .context("edge snapshot has no authority trust bundle")?;
+    verify_revision_contract_with_trust_bundle(trust, contract)
+        .context("verify edge revision contract authority signature")?;
+    let contract_id = burn_p2p::ContentId::derive(contract)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "verified": true,
+            "experiment_id": entry.experiment_id,
+            "revision_id": entry.current_revision_id,
+            "workload_id": entry.workload_id,
+            "contract_id": contract_id,
+            "signer": contract.contract_signature.signer,
+            "genesis_artifact_id": contract.genesis.payload.payload.artifact.artifact_id,
         }))?
     );
     Ok(())

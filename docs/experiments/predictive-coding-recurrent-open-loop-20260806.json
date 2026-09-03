@@ -1,0 +1,197 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-06",
+  "status": "superseded_invalid_chunk_weighted_control",
+  "superseded_by": "predictive-coding-recurrent-objective-aligned-20260806.json",
+  "backend": "cuda",
+  "device": "NVIDIA GB10",
+  "confidence_interval": {
+    "kind": "two_sided_student_t_95_percent",
+    "paired_for_deltas": true,
+    "seeds": [20260804, 20260805, 20260806]
+  },
+  "control_contract": {
+    "dataset": "ruliad",
+    "source_selection_feedback_updates_enabled": false,
+    "sequence_batching": "streaming",
+    "tbptt_chunk_size": 8,
+    "tbptt_persist_across_steps": true,
+    "sequence_state_probe": true,
+    "selector_checkpoint_sha256": {
+      "128_updates_all_arms_and_seeds": "82dab4ac65f91cc61ae575fd0df0d0062a66d1395160ae4d323c670d0734dfbe",
+      "512_updates_all_arms_and_seeds": "b9685bdec60a97d23a33ecd1a42d024b3e12a85dccfac02eb9077c3c1b561c08"
+    }
+  },
+  "model": {
+    "parameters": 891266,
+    "shared_layer_uses": 4,
+    "embedding": 96,
+    "heads": 4,
+    "latent_total": 3072,
+    "block_size": 128,
+    "batch_size": 32
+  },
+  "training": {
+    "profile": "config/language/experiments/predictive_coding/local-pc-1m.toml",
+    "optimizer": "adamw",
+    "learning_rate": 0.001,
+    "validation": "fixed_holdout_plus_stream_continuation",
+    "continual_backprop_enabled": false,
+    "neuron_scaling_enabled": false,
+    "dynamics_enabled": false
+  },
+  "implementation": {
+    "optimization": "reuse exact retained post_relu_post_mask x and y projection activations for local VJPs",
+    "avoided_work": "two low-rank projection recomputations per shared Dragon layer use",
+    "mask_contract": "binary, fractional, and signed floating masks; zero masks contribute zero derivative",
+    "global_backward_calls": 0
+  },
+  "single_seed_stateless_screen": {
+    "seed": 20260804,
+    "updates": 512,
+    "before": {
+      "wall_tokens_per_second": 43303.995,
+      "model_tokens_per_second": 49832.390,
+      "local_learning_seconds": 42.084114243
+    },
+    "after": {
+      "wall_tokens_per_second": 43370.913,
+      "model_tokens_per_second": 49992.114,
+      "local_learning_seconds": 41.949655958
+    },
+    "interpretation": "small directionally positive screen, not a resolved multi-seed speedup"
+  },
+  "results": {
+    "128": {
+      "backpropagation": {
+        "cold_validation_mean": 2.294179121653239,
+        "cold_validation_ci95": 0.08657264334457493,
+        "stream_warm_mean": 1.328914316991965,
+        "stream_warm_ci95": 0.07988769891732315,
+        "source_loss_cadence_mean": 2.6548111766666667,
+        "source_loss_cadence_ci95": 0.07330098900574854,
+        "verifier_accuracy_mean": 0.19791666666666666,
+        "verifier_accuracy_ci95": 0.195378564104745,
+        "partial_progress_mean": 0.36284713943799335,
+        "partial_progress_ci95": 0.21509292448445827,
+        "wall_tokens_per_second_mean": 12001.399,
+        "wall_tokens_per_second_ci95": 326.4506828176942,
+        "model_tokens_per_second_mean": 13683.735,
+        "model_tokens_per_second_ci95": 355.22474996370465,
+        "model_duty_fraction_mean": 0.8770526666666667,
+        "model_duty_fraction_ci95": 0.0010928612908544172
+      },
+      "fixed_prediction": {
+        "cold_validation_mean": 2.3425563971201577,
+        "cold_validation_ci95": 0.06554804037023385,
+        "stream_warm_mean": 1.3539394314090412,
+        "stream_warm_ci95": 0.07451621408712296,
+        "source_loss_cadence_mean": 2.873111204166667,
+        "source_loss_cadence_ci95": 0.07911687536530433,
+        "verifier_accuracy_mean": 0.11458333333333333,
+        "verifier_accuracy_ci95": 0.1616113243575161,
+        "partial_progress_mean": 0.41059019168217975,
+        "partial_progress_ci95": 0.07271744292938719,
+        "wall_tokens_per_second_mean": 11458.278,
+        "wall_tokens_per_second_ci95": 367.23104887369396,
+        "model_tokens_per_second_mean": 13222.639,
+        "model_tokens_per_second_ci95": 336.35328031075295,
+        "model_duty_fraction_mean": 0.8665516666666667,
+        "model_duty_fraction_ci95": 0.008315329130861315
+      }
+    },
+    "512": {
+      "backpropagation": {
+        "cold_validation_mean": 2.110740251839161,
+        "cold_validation_ci95": 0.13116105724486352,
+        "stream_warm_mean": 1.111213260019819,
+        "stream_warm_ci95": 0.07776402057702281,
+        "source_loss_cadence_mean": 1.1544002482291666,
+        "source_loss_cadence_ci95": 0.04198114393830681,
+        "verifier_accuracy_mean": 0.3229166666666667,
+        "verifier_accuracy_ci95": 0.044822916666666664,
+        "partial_progress_mean": 0.45052072405815125,
+        "partial_progress_ci95": 0.05527655947589624,
+        "wall_tokens_per_second_mean": 13018.369666666667,
+        "wall_tokens_per_second_ci95": 40.181907545057555,
+        "model_tokens_per_second_mean": 13843.715,
+        "model_tokens_per_second_ci95": 45.96384805955497,
+        "model_duty_fraction_mean": 0.940381,
+        "model_duty_fraction_ci95": 0.0006122721951470869
+      },
+      "fixed_prediction": {
+        "cold_validation_mean": 2.115259307126204,
+        "cold_validation_ci95": 0.09165008390139816,
+        "stream_warm_mean": 1.1090818271040916,
+        "stream_warm_ci95": 0.030927182994719905,
+        "source_loss_cadence_mean": 1.3460664252083334,
+        "source_loss_cadence_ci95": 0.03163871587441978,
+        "verifier_accuracy_mean": 0.2604166666666667,
+        "verifier_accuracy_ci95": 0.23718058107314446,
+        "partial_progress_mean": 0.3810762862364451,
+        "partial_progress_ci95": 0.229861662466542,
+        "wall_tokens_per_second_mean": 12504.643666666667,
+        "wall_tokens_per_second_ci95": 193.79380445066735,
+        "model_tokens_per_second_mean": 13406.458666666666,
+        "model_tokens_per_second_ci95": 240.56676353805332,
+        "model_duty_fraction_mean": 0.9327373333333333,
+        "model_duty_fraction_ci95": 0.002359862825409768
+      },
+      "paired_fixed_minus_backpropagation": {
+        "cold_validation_mean": 0.004519055287043254,
+        "cold_validation_ci95": 0.06357266913508382,
+        "stream_warm_mean": -0.0021314329157272973,
+        "stream_warm_ci95": 0.07296773814030136,
+        "stream_carry_nll_gain_mean": 0.0005596826473871867,
+        "stream_carry_nll_gain_ci95": 0.009264765931654265,
+        "source_loss_cadence_mean": 0.19166617697916669,
+        "source_loss_cadence_ci95": 0.06022311900023541,
+        "train_last_mean": 0.24015522127350172,
+        "train_last_ci95": 0.04768643728432787,
+        "verifier_accuracy_mean": -0.0625,
+        "verifier_accuracy_ci95": 0.2054044084936977,
+        "partial_progress_mean": -0.06944443782170613,
+        "partial_progress_ci95": 0.21548175593024166,
+        "wall_tokens_per_second_mean": -513.726,
+        "wall_tokens_per_second_ci95": 154.31828094693714,
+        "model_tokens_per_second_mean": -437.25633333333343,
+        "model_tokens_per_second_ci95": 194.70220799046317,
+        "wall_throughput_retention_percent_mean": 96.053,
+        "wall_throughput_retention_percent_ci95": 1.198,
+        "model_throughput_retention_percent_mean": 96.841,
+        "model_throughput_retention_percent_ci95": 1.418
+      }
+    }
+  },
+  "gpu_512": {
+    "backpropagation": {
+      "utilization_mean_percent": 77.11934156378601,
+      "utilization_ci95": 0.41863537680584056,
+      "power_mean_watts": 38.21872427983539,
+      "power_ci95": 0.28592135540073305
+    },
+    "fixed_prediction": {
+      "utilization_mean_percent": 71.15737628384687,
+      "utilization_ci95": 0.6512974164780376,
+      "power_mean_watts": 36.09387955182073,
+      "power_ci95": 0.0621902229018466
+    }
+  },
+  "fixed_prediction_fidelity": {
+    "parameters": 937154,
+    "batch_size": 8,
+    "block_size": 32,
+    "loss_absolute_error": 0.0,
+    "global_gradient_cosine": 0.9999999877513812,
+    "gradient_norm_ratio": 0.9999966927990875,
+    "relative_l2_error": 0.00020070181698281838,
+    "local_vjp_calls": 6,
+    "global_backward_calls": 0
+  },
+  "decision": {
+    "default": "backpropagation with AdamW",
+    "fixed_prediction": "retain as an exact no-global-backward research path",
+    "supported": "bounded recurrent held-out and rho-carry parity at approximately 96 percent AdamW throughput",
+    "not_supported": "training-objective parity, verifier advantage, continual-learning advantage, or replacement of AdamW"
+  }
+}

@@ -1,0 +1,29 @@
+# Two-phase direct Kolen-Pollack predictive coding. The preliminary shared-body
+# update is the Euclidean consensus projection of all depth-local updates onto
+# Dragon's tied-weight manifold. AdamW owns forward-parameter decay. This is
+# the selected research control from the 2026-08-07 screen; it failed the local
+# quality/throughput promotion gate and is not a production default.
+[training.local_predictive_coding]
+solver = "direct_kolen_pollack"
+parameterization = "standard"
+prediction_precision = 1.0
+sync_diagnostics = false
+
+[training.local_predictive_coding.inference]
+steps = 1
+step_size = 0.05
+max_grad_norm = 1.0
+gradient_norm_scope = "per_row"
+
+[training.local_predictive_coding.direct_feedback]
+preliminary_step_size = 1.0
+feedback_step_size = 0.0001
+forward_weight_decay = 0.0
+feedback_weight_decay = 0.0001
+signal_scale = 1.0
+initialization = "identity"
+
+[training.local_predictive_coding.tied_consensus]
+damping = 0.001
+min_curvature = 0.000001
+eps = 0.00000001

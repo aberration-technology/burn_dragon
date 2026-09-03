@@ -387,7 +387,6 @@ impl<B: Backend> DragonNorm<B> {
         grad_output: Tensor<B, D>,
     ) -> DragonNormVjp<B, D> {
         let width = input.shape().dims::<D>()[D - 1].max(1);
-        let grad_input = self.vjp_input(input.clone(), grad_output.clone());
         let gamma = self.param_view::<D>(self.gamma.val());
         let grad = grad_output.clone() * gamma;
         let reduce_width = |tensor: Tensor<B, D>| {
@@ -404,39 +403,57 @@ impl<B: Backend> DragonNorm<B> {
         let zero_alpha = self.alpha.val().zeros_like();
         let zero_shift = self.shift.val().zeros_like();
 
-        let (grad_gamma, grad_alpha, grad_shift) = match self.kind {
+        match self.kind {
             DragonNormKind::LayerNorm => {
                 let (variance, mean) = input.clone().var_mean_bias(D - 1);
-                let normalized = (input - mean) * variance.add_scalar(self.eps).sqrt().recip();
-                (
-                    reduce_width(grad_output * normalized),
-                    zero_alpha,
-                    zero_shift,
-                )
+                let inverse_std = variance.add_scalar(self.eps).sqrt().recip();
+                let normalized = (input - mean) * inverse_std.clone();
+                let grad_sum = grad.clone().sum_dim(D - 1);
+                let grad_normalized_sum = (grad.clone() * normalized.clone()).sum_dim(D - 1);
+                let grad_input = (grad.mul_scalar(width as f32)
+                    - grad_sum
+                    - normalized.clone() * grad_normalized_sum)
+                    * inverse_std.mul_scalar(1.0 / width as f32);
+                DragonNormVjp {
+                    grad_input,
+                    grad_gamma: reduce_width(grad_output * normalized),
+                    grad_beta,
+                    grad_alpha: zero_alpha,
+                    grad_shift: zero_shift,
+                }
             }
             DragonNormKind::RmsNorm => {
                 let mean_square = input.clone().square().mean_dim(D - 1);
-                let normalized = input * mean_square.add_scalar(self.eps).sqrt().recip();
-                (
-                    reduce_width(grad_output * normalized),
-                    zero_alpha,
-                    zero_shift,
-                )
+                let inverse_rms = mean_square.add_scalar(self.eps).sqrt().recip();
+                let projected = (grad.clone() * input.clone()).mean_dim(D - 1);
+                let grad_input = grad * inverse_rms.clone()
+                    - input.clone() * projected * inverse_rms.clone().powf_scalar(3.0);
+                DragonNormVjp {
+                    grad_input,
+                    grad_gamma: reduce_width(grad_output * input * inverse_rms),
+                    grad_beta,
+                    grad_alpha: zero_alpha,
+                    grad_shift: zero_shift,
+                }
             }
             DragonNormKind::DynamicTanh => {
                 let alpha = self.scalar_param_view::<D>(self.alpha.val());
                 let activated = (input.clone() * alpha).tanh();
                 let derivative = activated.clone().square().mul_scalar(-1.0).add_scalar(1.0);
-                (
-                    reduce_width(grad_output * activated),
-                    (grad * derivative * input).sum().reshape([1]),
-                    zero_shift,
-                )
+                DragonNormVjp {
+                    grad_input: grad.clone()
+                        * self.scalar_param_view::<D>(self.alpha.val())
+                        * derivative.clone(),
+                    grad_gamma: reduce_width(grad_output * activated),
+                    grad_beta,
+                    grad_alpha: (grad * derivative * input).sum().reshape([1]),
+                    grad_shift: zero_shift,
+                }
             }
             DragonNormKind::Derf => {
                 let alpha = self.scalar_param_view::<D>(self.alpha.val());
                 let shift = self.scalar_param_view::<D>(self.shift.val());
-                let preactivation = input.clone() * alpha + shift;
+                let preactivation = input.clone() * alpha.clone() + shift;
                 let activated = preactivation.clone().erf();
                 let grad_preactivation = grad
                     * preactivation
@@ -444,19 +461,14 @@ impl<B: Backend> DragonNorm<B> {
                         .mul_scalar(-1.0)
                         .exp()
                         .mul_scalar(2.0 / std::f32::consts::PI.sqrt());
-                (
-                    reduce_width(grad_output * activated),
-                    (grad_preactivation.clone() * input).sum().reshape([1]),
-                    grad_preactivation.sum().reshape([1]),
-                )
+                DragonNormVjp {
+                    grad_input: grad_preactivation.clone() * alpha,
+                    grad_gamma: reduce_width(grad_output * activated),
+                    grad_beta,
+                    grad_alpha: (grad_preactivation.clone() * input).sum().reshape([1]),
+                    grad_shift: grad_preactivation.sum().reshape([1]),
+                }
             }
-        };
-        DragonNormVjp {
-            grad_input,
-            grad_gamma,
-            grad_beta,
-            grad_alpha,
-            grad_shift,
         }
     }
 

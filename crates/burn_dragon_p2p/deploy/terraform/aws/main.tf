@@ -805,6 +805,7 @@ locals {
     auth_redirect_uri                   = local.auth_redirect_path == null ? "" : "${coalesce(local.auth_redirect_base_url, local.edge_base_url)}${local.auth_redirect_path}"
     authority_key_name                  = local.secret_parameter_names.authority_key
     authority_key_path                  = "${local.bootstrap_auth_root}/bootstrap-authority.key"
+    revision_contract_path              = "${local.bootstrap_head_mirror_storage_root}/revision-contracts/${local.bootstrap_head_mirror_revision_id}.revision-contract.json"
     bootstrap_node_role                 = "primary"
     control_plane_redis_enabled         = local.managed_control_plane_redis_enabled
     control_plane_redis_auth_token_name = local.secret_parameter_names.control_plane_redis_auth_token

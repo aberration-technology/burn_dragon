@@ -1,0 +1,252 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-07",
+  "backend": "cuda",
+  "device": "NVIDIA GB10",
+  "claim_scope": "single-seed implementation, hyperparameter, recurrent-lifecycle, and 512-update promotion gate; not long-horizon continual-learning evidence",
+  "model": {
+    "parameters": 937154,
+    "shared_layer_uses": 4,
+    "embedding": 96,
+    "heads": 4,
+    "latent_total": 3072,
+    "vocabulary_size": 272,
+    "batch_size": 32,
+    "block_size": 128
+  },
+  "execution_contract": {
+    "name": "local_direct_kolen_pollack_v1",
+    "activity_derivatives": "analytic_local",
+    "parameter_derivatives": "analytic_local",
+    "global_parameter_backward_allowed": false,
+    "physical_parameter_updates_per_chunk": 2,
+    "feedback_state_scope": "training run",
+    "feedback_checkpointed": true,
+    "tied_weight_reduction": "damped uniform consensus",
+    "later_tbptt_preliminary_vjp": "prepared after preceding chunk updates",
+    "checkpoint_identity": [
+      "factor_graph",
+      "solver",
+      "learning_schedule",
+      "feedback_initialization",
+      "preliminary_step_size",
+      "feedback_step_size",
+      "forward_weight_decay",
+      "feedback_weight_decay",
+      "signal_scale",
+      "tied_consensus"
+    ]
+  },
+  "gaussian_128_update_screen": [
+    {
+      "arm": "adamw_backpropagation",
+      "validation_mean": 2.082564428448677,
+      "source_cadence_mean": 2.91127675,
+      "verifier_accuracy": 0.0625,
+      "partial_progress": 0.26041659712791443,
+      "wall_tokens_per_second": 57208.398,
+      "model_tokens_per_second": 81523.244,
+      "model_duty_fraction": 0.701743
+    },
+    {
+      "arm": "fixed_prediction",
+      "validation_mean": 2.0577377676963806,
+      "source_cadence_mean": 2.9197599625,
+      "verifier_accuracy": 0.03125,
+      "partial_progress": 0.20833328366279602,
+      "wall_tokens_per_second": 38515.717,
+      "model_tokens_per_second": 50556.312,
+      "model_duty_fraction": 0.761838
+    },
+    {
+      "arm": "dkp_gaussian_preliminary_0.1_feedback_0.001_steps_1",
+      "validation_mean": 3.7641244530677795,
+      "source_cadence_mean": 4.37891155,
+      "verifier_accuracy": 0.0,
+      "partial_progress": 0.0,
+      "wall_tokens_per_second": 14690.287,
+      "model_tokens_per_second": 17007.799,
+      "model_duty_fraction": 0.863738
+    },
+    {
+      "arm": "dkp_gaussian_preliminary_0.25_feedback_0.001_steps_1",
+      "validation_mean": 4.056781589984894,
+      "model_tokens_per_second": 17349.432
+    },
+    {
+      "arm": "dkp_gaussian_preliminary_0.25_feedback_0.01_steps_2",
+      "validation_mean": 3.755521237850189,
+      "model_tokens_per_second": 14139.921
+    }
+  ],
+  "optimizer_transform_screen_64_updates": [
+    {
+      "transform": "sgd",
+      "learning_rate": 0.003,
+      "validation_mean": 5.597987174987793
+    },
+    {
+      "transform": "sgd",
+      "learning_rate": 0.01,
+      "validation_mean": 5.531700372695923
+    },
+    {
+      "transform": "sgd",
+      "learning_rate": 0.03,
+      "validation_mean": 5.111095190048218
+    },
+    {
+      "transform": "sgd",
+      "learning_rate": 0.1,
+      "validation_mean": 4.535145163536072
+    },
+    {
+      "transform": "momentum",
+      "learning_rate": 0.003,
+      "validation_mean": 5.402959227561951
+    },
+    {
+      "transform": "momentum",
+      "learning_rate": 0.01,
+      "validation_mean": 4.972225546836853
+    },
+    {
+      "transform": "momentum",
+      "learning_rate": 0.03,
+      "validation_mean": 5.422532439231873
+    }
+  ],
+  "identity_initialization_screen_64_updates": [
+    {
+      "preliminary_step_size": 0.05,
+      "feedback_step_size": 0.001,
+      "validation_mean": 3.8160018920898438,
+      "last_train_loss": 3.3315412998199463
+    },
+    {
+      "preliminary_step_size": 0.1,
+      "feedback_step_size": 0.001,
+      "validation_mean": 3.993422746658325,
+      "last_train_loss": 3.4763739109039307
+    },
+    {
+      "preliminary_step_size": 0.25,
+      "feedback_step_size": 0.001,
+      "validation_mean": 3.6668163537979126,
+      "last_train_loss": 3.0873944759368896
+    },
+    {
+      "preliminary_step_size": 0.5,
+      "feedback_step_size": 0.001,
+      "validation_mean": 3.427362322807312,
+      "last_train_loss": 2.593269109725952
+    },
+    {
+      "preliminary_step_size": 1.0,
+      "feedback_step_size": 0.0001,
+      "validation_mean": 3.304495632648468,
+      "last_train_loss": 2.400844097137451,
+      "model_tokens_per_second": 16940.577
+    },
+    {
+      "preliminary_step_size": 1.0,
+      "feedback_step_size": 0.01,
+      "validation_mean": 3.327823221683502,
+      "last_train_loss": 2.5079331398010254
+    },
+    {
+      "preliminary_step_size": 2.0,
+      "feedback_step_size": 0.001,
+      "validation_mean": 3.7158990502357483,
+      "last_train_loss": 3.167725086212158
+    },
+    {
+      "preliminary_step_size": 4.0,
+      "feedback_step_size": 0.001,
+      "validation_mean": 3.7654842138290405,
+      "last_train_loss": 3.4287919998168945
+    }
+  ],
+  "selected_512_update_gate": [
+    {
+      "arm": "adamw_backpropagation",
+      "validation_mean": 2.108745478093624,
+      "source_cadence_mean": 1.3747047178125,
+      "verifier_accuracy": 0.09375,
+      "partial_progress": 0.46354156732559204,
+      "wall_tokens_per_second": 66637.197,
+      "model_tokens_per_second": 80083.871,
+      "model_duty_fraction": 0.832093,
+      "gpu_utilization_mean": 80.82352941176471,
+      "gpu_power_watts_mean": 41.87352941176471
+    },
+    {
+      "arm": "fixed_prediction",
+      "validation_mean": 2.078218996524811,
+      "source_cadence_mean": 1.378198968125,
+      "verifier_accuracy": 0.21875,
+      "partial_progress": 0.36979156732559204,
+      "wall_tokens_per_second": 41058.658,
+      "model_tokens_per_second": 48701.498,
+      "model_duty_fraction": 0.843068,
+      "gpu_utilization_mean": 84.5925925925926,
+      "gpu_power_watts_mean": 37.86296296296296
+    },
+    {
+      "arm": "dkp_identity_preliminary_1.0_feedback_0.0001_steps_1",
+      "validation_mean": 2.441899299621582,
+      "source_cadence_mean": 2.377280803125,
+      "verifier_accuracy": 0.03125,
+      "partial_progress": 0.32291656732559204,
+      "wall_tokens_per_second": 15400.874,
+      "model_tokens_per_second": 16812.617,
+      "model_duty_fraction": 0.916031,
+      "gpu_utilization_mean": 89.73529411764706,
+      "gpu_utilization_median": 93.0,
+      "gpu_power_watts_mean": 38.44441176470588,
+      "global_backward_calls": 0,
+      "local_vjp_calls": 5632,
+      "logical_direct_forward_updates": 2048,
+      "feedback_parameter_updates": 2048,
+      "physical_parameter_updates": 1024
+    }
+  ],
+  "selected_minus_adamw_512": {
+    "validation_mean": 0.333153821527958,
+    "source_cadence_mean": 1.0025760853125,
+    "verifier_accuracy": -0.0625,
+    "partial_progress": -0.140625,
+    "model_tokens_per_second": -63271.254,
+    "model_throughput_fraction": 0.2099437339707058
+  },
+  "persistent_tbptt_smoke": {
+    "outer_batches": 16,
+    "batch_size": 8,
+    "block_size": 128,
+    "tbptt_chunk_size": 8,
+    "persistent_rho": true,
+    "status": "ok",
+    "global_backward_calls": 0,
+    "logical_direct_forward_updates": 1024,
+    "feedback_parameter_updates": 1024,
+    "physical_parameter_updates": 512,
+    "local_vjp_calls": 2816,
+    "quality_claim": false
+  },
+  "promotion": {
+    "default": "adamw_backpropagation",
+    "fixed_prediction": "retain as exact no-global-backward control",
+    "direct_kolen_pollack": "retain as mechanically complete research solver; rejected for quality and wall-clock promotion",
+    "p2p": "not propagated because the local promotion gate failed",
+    "next_research_gate": "amortized depth-local adjoint calibrated against analytic local VJPs must improve directional fidelity before another long matrix"
+  },
+  "artifacts": [
+    "target/pc-paper/dkp-cuda-screen-20260807",
+    "target/pc-paper/dkp-transform-screen-20260807",
+    "target/pc-paper/dkp-identity-screen-20260807",
+    "target/pc-paper/dkp-identity-high-screen-20260807",
+    "target/pc-paper/dkp-identity-feedback-screen-20260807",
+    "target/pc-paper/dkp-identity-512-gate-20260807",
+    "target/pc-paper/dkp-identity-tbptt-smoke-20260807"
+  ]
+}

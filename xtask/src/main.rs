@@ -57,6 +57,7 @@ enum CommandKind {
     RunLiveNativeTrainingCanary,
     BuildRevisionContract(revision_contract::BuildRevisionContractArgs),
     VerifyRevisionContract(revision_contract::VerifyRevisionContractArgs),
+    VerifyEdgeRevisionContract(revision_contract::VerifyEdgeRevisionContractArgs),
     RotateRevisionContracts(revision_contract::RotateRevisionContractsArgs),
     RolloutRevisionContracts(revision_contract::RolloutRevisionContractsArgs),
     PublishCrates(workflow_tools::PublishCratesArgs),
@@ -141,6 +142,9 @@ fn main() -> Result<()> {
         }
         CommandKind::VerifyRevisionContract(args) => {
             revision_contract::verify_revision_contract(&args)
+        }
+        CommandKind::VerifyEdgeRevisionContract(args) => {
+            revision_contract::verify_edge_revision_contract(&args)
         }
         CommandKind::RotateRevisionContracts(args) => {
             revision_contract::rotate_revision_contracts(&args)

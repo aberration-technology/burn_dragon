@@ -525,6 +525,7 @@ jobs:
           fi
           seed_tcp="$(terraform -chdir="$TF_ROOT" output -raw seed_node_tcp_multiaddr)"
           seed_quic="$(terraform -chdir="$TF_ROOT" output -raw seed_node_quic_multiaddr)"
+          data_mount_path="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_data_mount_path)"
           redis_endpoint="$(terraform -chdir="$TF_ROOT" output -raw control_plane_redis_primary_endpoint)"
           control_plane_state_backend="$(terraform -chdir="$TF_ROOT" output -raw control_plane_state_backend)"
           bootstrap_state_storage_mode="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_state_storage_mode)"
@@ -558,6 +559,7 @@ jobs:
             echo "instance_id=$instance_id"
             echo "seed_tcp=$seed_tcp"
             echo "seed_quic=$seed_quic"
+            echo "data_mount_path=$data_mount_path"
             echo "redis_endpoint=$redis_endpoint"
             echo "control_plane_state_backend=$control_plane_state_backend"
             echo "bootstrap_state_storage_mode=$bootstrap_state_storage_mode"
@@ -931,6 +933,73 @@ jobs:
           echo "timed out waiting for bootstrap head mirror restart" >&2
           exit 1
 
+      - name: provision authority-signed browser revision contract
+        if: ${{ github.event.inputs.plan_only != 'true' }}
+        shell: bash
+        env:
+          BOOTSTRAP_INSTANCE_ID: ${{ steps.outputs.outputs.instance_id }}
+          BOOTSTRAP_DATA_MOUNT_PATH: ${{ steps.outputs.outputs.data_mount_path }}
+          EDGE_BASE_URL: ${{ steps.outputs.outputs.edge_url }}
+        run: |
+          set -euo pipefail
+          contract_path="$BOOTSTRAP_DATA_MOUNT_PATH/head-mirror/revision-contracts/$BOOTSTRAP_HEAD_MIRROR_REVISION_ID.revision-contract.json"
+          authority_key="$BOOTSTRAP_DATA_MOUNT_PATH/auth/bootstrap-authority.key"
+          printf -v provision_command '%q ' \
+            /usr/local/bin/burn_dragon_p2p_native \
+            admin-provision-revision-contract \
+            --config /etc/burn_dragon_p2p/bootstrap-head-mirror.toml \
+            --experiment-kind nca \
+            --backend cpu \
+            --auth-bundle /var/lib/burn_dragon_p2p/bootstrap-head-mirror-auth-bundle.json \
+            --authority-key "$authority_key" \
+            --contract-out "$contract_path" \
+            --edge-url "$EDGE_BASE_URL" \
+            --wait-timeout-secs 600 \
+            --poll-interval-secs 5 \
+            --output-format json
+          parameters="$(jq -cn --arg command "$provision_command" '{commands:["set -eu", $command, "systemctl restart burn-p2p-bootstrap", "systemctl is-active burn-p2p-bootstrap"]}')"
+          command_id="$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids "$BOOTSTRAP_INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "provision signed Dragon browser revision contract" \
+            --timeout-seconds 900 \
+            --parameters "$parameters" \
+            --query 'Command.CommandId' \
+            --output text)"
+
+          print_invocation() {
+            aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$command_id" \
+              --instance-id "$BOOTSTRAP_INSTANCE_ID" \
+              --output json || true
+          }
+
+          for attempt in $(seq 1 100); do
+            invocation_status="$(aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$command_id" \
+              --instance-id "$BOOTSTRAP_INSTANCE_ID" \
+              --query 'Status' \
+              --output text 2>/dev/null || true)"
+            case "$invocation_status" in
+              Success)
+                print_invocation
+                exit 0
+                ;;
+              Cancelled|TimedOut|Failed|Cancelling)
+                print_invocation
+                exit 1
+                ;;
+            esac
+            sleep 10
+          done
+
+          echo "timed out provisioning signed Dragon browser revision contract" >&2
+          print_invocation
+          exit 1
+
       - name: wait for bootstrap deployment diagnostics to turn ready
         id: deployment_diagnostics
         if: ${{ github.event.inputs.plan_only != 'true' }}
@@ -993,6 +1062,7 @@ jobs:
               --check-artifact-head-view \
               --require-head-published \
               --require-directory-entry-published \
+              --require-revision-contract \
               --require-metrics-catchup \
               --require-artifact-head-view \
               "${auth_flags[@]}" \

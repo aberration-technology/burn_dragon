@@ -64,12 +64,23 @@ pub struct RuliadMetricSnapshot {
     pub target_difficulty_score: f32,
     #[serde(default)]
     pub max_difficulty_level: usize,
+    /// Highest difficulty with non-negligible probability in this effective
+    /// policy snapshot. This can be below the materialized frontier during a
+    /// cold start, hold, or capability gate.
+    #[serde(default)]
+    pub active_max_difficulty_level: usize,
+    /// Highest difficulty permanently released by the mastery-gated
+    /// curriculum. Sampling can move below this edge without revoking it.
+    #[serde(default)]
+    pub curriculum_released_max_difficulty_level: usize,
     #[serde(default)]
     pub mean_difficulty_level: f32,
     #[serde(default)]
     pub normalized_difficulty_score: f32,
     #[serde(default)]
     pub max_difficulty_probability: f32,
+    #[serde(default)]
+    pub active_max_difficulty_probability: f32,
     #[serde(default)]
     pub mastered_probability: f32,
     #[serde(default)]

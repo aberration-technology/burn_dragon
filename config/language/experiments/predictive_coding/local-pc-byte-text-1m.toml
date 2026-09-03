@@ -1,0 +1,88 @@
+[dataset]
+# Materialize an input text file with:
+# python3 scripts/prepare_byte_text_manifest.py INPUT target/datasets/byte-text-fixed-holdout
+cache_dir = "target/datasets/byte-text-fixed-holdout/cache"
+train_split_ratio = 0.9
+type = "universality_manifest"
+manifest = "target/datasets/byte-text-fixed-holdout/manifest.json"
+
+[dataset.tokenizer]
+type = "pretokenized"
+vocab_size = 256
+
+[model]
+n_layer = 4
+n_embd = 96
+n_head = 4
+latent_total = 3072
+tie_input_output_embeddings = false
+dropout = 0.0
+residual_connector = "vanilla"
+rotary_embedding = "alibi"
+sequence_kernel = { memory_system = "linear_attention", executor = "dense_score_short_context" }
+
+[model.language_head]
+type = "standard_token_classification"
+
+[training]
+algorithm = "predictive_coding"
+block_size = 128
+batch_size = 32
+max_iters = 512
+checkpoint_interval_iters = 512
+log_frequency = 16
+seed = 20260804
+
+[training.validation]
+sampling = "fixed_holdout"
+seed = 3509215397
+
+[training.local_predictive_coding]
+learning_schedule = "equilibrium"
+prediction_precision = 1.0
+factor_reduction = "sum"
+sync_diagnostics = false
+
+[training.local_predictive_coding.inference]
+steps = 4
+step_size = 0.05
+latent_decay = 0.0
+max_grad_norm = 1.0
+gradient_norm_scope = "per_row"
+eps = 1e-8
+
+[training.auto_batch_size]
+enabled = false
+
+[training.continual_backprop]
+enabled = false
+
+[training.neuron_scaling]
+enabled = false
+
+[training.events]
+flush_every_steps = 16
+source_selection_every_steps = 16
+continual_backprop_every_steps = 512
+degeneracy_probe_every_epochs = 1
+degeneracy_probe_tokens = 128
+source_weighted_validation_batches = 1
+ruliad_correctness_probe_every_epochs = 1
+ruliad_correctness_probe_items = 16
+ruliad_correctness_probe_tokens = 64
+
+[training.dynamics]
+enabled = false
+
+[training.greedy_rollout_unlikelihood]
+enabled = false
+
+[optimizer]
+name = "adamw"
+learning_rate = 0.001
+weight_decay = 0.01
+grad_clip_norm = 1.0
+
+[generation]
+prompt = ""
+output_format = "decoded_text"

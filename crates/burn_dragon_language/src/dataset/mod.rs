@@ -3,6 +3,7 @@ mod huggingface;
 mod prepared_chunks;
 pub mod scheduler;
 mod universality;
+mod validation_panel;
 
 use crate::tokenizer::SharedTokenizer;
 use burn::tensor::backend::Backend;
@@ -18,6 +19,7 @@ pub use universality::{
     RuliadSourceSelectionStateSnapshot, RuliadValidationProbeItem, RuliadValidationPromptMode,
     UniversalityDataset,
 };
+pub(crate) use validation_panel::resolve_ruliad_validation_panel;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DatasetSplit {
@@ -72,6 +74,13 @@ impl Dataset {
         &self,
     ) -> Option<burn_dragon_universality::RuliadMetricSnapshot> {
         TokenSequenceDataset::source_selection_snapshot(self)
+    }
+
+    pub fn source_selection_snapshot_at_step(
+        &self,
+        absolute_step: usize,
+    ) -> Option<burn_dragon_universality::RuliadMetricSnapshot> {
+        TokenSequenceDataset::source_selection_snapshot_at_step(self, absolute_step)
     }
 
     pub fn record_ruliad_capability_feedback(
@@ -180,6 +189,41 @@ impl Dataset {
                     epoch_index,
                     absolute_step,
                     max_items,
+                ),
+        }
+    }
+
+    pub fn sample_ruliad_validation_probe_items_fixed(
+        &self,
+        panel_seed: u64,
+        max_items: usize,
+        prompt_mode: RuliadValidationPromptMode,
+    ) -> Vec<RuliadValidationProbeItem> {
+        match self {
+            Dataset::HuggingFace(_) => Vec::new(),
+            Dataset::Universality(dataset) => dataset.sample_ruliad_validation_probe_items_fixed(
+                panel_seed,
+                max_items,
+                prompt_mode,
+            ),
+        }
+    }
+
+    pub fn sample_ruliad_validation_probe_items_stratified_fixed(
+        &self,
+        panel_seed: u64,
+        max_items: usize,
+        difficulty_levels: usize,
+        prompt_mode: RuliadValidationPromptMode,
+    ) -> Vec<RuliadValidationProbeItem> {
+        match self {
+            Dataset::HuggingFace(_) => Vec::new(),
+            Dataset::Universality(dataset) => dataset
+                .sample_ruliad_validation_probe_items_stratified_fixed(
+                    panel_seed,
+                    max_items,
+                    difficulty_levels,
+                    prompt_mode,
                 ),
         }
     }
@@ -373,6 +417,29 @@ impl TokenSequenceDataset for Dataset {
         }
     }
 
+    fn fixed_holdout_token_windows_with_loss_masks(
+        &self,
+        epoch_index: usize,
+        absolute_step: usize,
+        batch_size: usize,
+        block_size: usize,
+    ) -> Option<SourceSelectedBatch> {
+        match self {
+            Dataset::HuggingFace(dataset) => dataset.fixed_holdout_token_windows_with_loss_masks(
+                epoch_index,
+                absolute_step,
+                batch_size,
+                block_size,
+            ),
+            Dataset::Universality(dataset) => dataset.fixed_holdout_token_windows_with_loss_masks(
+                epoch_index,
+                absolute_step,
+                batch_size,
+                block_size,
+            ),
+        }
+    }
+
     fn source_selected_ruliad_policy_batch(
         &self,
         split: DatasetSplit,
@@ -478,6 +545,20 @@ impl TokenSequenceDataset for Dataset {
         match self {
             Dataset::HuggingFace(dataset) => dataset.source_selection_snapshot(),
             Dataset::Universality(dataset) => dataset.source_selection_snapshot(),
+        }
+    }
+
+    fn source_selection_snapshot_at_step(
+        &self,
+        absolute_step: usize,
+    ) -> Option<burn_dragon_universality::RuliadMetricSnapshot> {
+        match self {
+            Dataset::HuggingFace(dataset) => {
+                dataset.source_selection_snapshot_at_step(absolute_step)
+            }
+            Dataset::Universality(dataset) => {
+                dataset.source_selection_snapshot_at_step(absolute_step)
+            }
         }
     }
 

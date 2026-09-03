@@ -1,5 +1,5 @@
 use super::*;
-use burn::tensor::{Distribution, Tensor};
+use burn::tensor::{Distribution, Tensor, TensorData};
 use burn_autodiff::Autodiff;
 use burn_cubecl::cubecl::Runtime;
 use burn_wgpu::{CubeBackend, RuntimeOptions, graphics};
@@ -335,6 +335,96 @@ fn fused_recurrent_memory_stays_bounded_across_repeated_calls() {
     );
 }
 
+#[test]
+fn plain_recurrent_input_vjp_matches_context_and_terminal_rho_autodiff() {
+    let device = burn::tensor::Device::<AutodiffBackendImpl>::default();
+    if let Err(reason) = init_runtime(&device) {
+        eprintln!("skipping WGPU test: {reason}");
+        return;
+    }
+
+    let query = Tensor::<AutodiffBackendImpl, 4>::from_data(
+        TensorData::new(
+            (0..24).map(|index| index as f32 * 0.03 - 0.2).collect(),
+            [1, 2, 3, 4],
+        ),
+        &device,
+    )
+    .require_grad();
+    let value = Tensor::<AutodiffBackendImpl, 4>::from_data(
+        TensorData::new(
+            (0..18).map(|index| index as f32 * 0.05 - 0.15).collect(),
+            [1, 1, 3, 6],
+        ),
+        &device,
+    )
+    .require_grad();
+    let initial_rho = Tensor::<AutodiffBackendImpl, 4>::from_data(
+        TensorData::new(
+            (0..48).map(|index| index as f32 * 0.01 - 0.12).collect(),
+            [1, 2, 4, 6],
+        ),
+        &device,
+    )
+    .require_grad();
+    let decay =
+        Tensor::<AutodiffBackendImpl, 1>::from_data(TensorData::new(vec![0.95, 0.9], [2]), &device);
+    let grad_context = Tensor::<AutodiffBackendImpl, 4>::from_data(
+        TensorData::new(
+            (0..36).map(|index| index as f32 * 0.02 - 0.1).collect(),
+            [1, 2, 3, 6],
+        ),
+        &device,
+    );
+    let grad_terminal_rho = Tensor::<AutodiffBackendImpl, 4>::from_data(
+        TensorData::new(
+            (0..48).map(|index| index as f32 * 0.015 - 0.08).collect(),
+            [1, 2, 4, 6],
+        ),
+        &device,
+    );
+
+    let (context, terminal_rho) = reference_recurrent_autodiff(
+        query.clone(),
+        value.clone(),
+        initial_rho.clone(),
+        decay.clone(),
+    );
+    let reference_grads = ((context * grad_context.clone()).sum()
+        + (terminal_rho * grad_terminal_rho.clone()).sum())
+    .backward();
+    let vjp = try_fused_recurrent_attention_input_vjp(
+        grad_context.inner(),
+        query.clone().inner(),
+        value.clone().inner(),
+        Some(initial_rho.clone().inner()),
+        decay.inner(),
+        Some(grad_terminal_rho.inner()),
+    )
+    .expect("fused plain recurrent VJP");
+
+    assert_close_backend(
+        vjp.grad_query,
+        query.grad(&reference_grads).expect("reference query VJP"),
+        3.0e-3,
+        3.0e-3,
+    );
+    assert_close_backend(
+        vjp.grad_value,
+        value.grad(&reference_grads).expect("reference value VJP"),
+        3.0e-3,
+        3.0e-3,
+    );
+    assert_close_backend(
+        vjp.grad_initial_rho.expect("initial rho VJP"),
+        initial_rho
+            .grad(&reference_grads)
+            .expect("reference initial rho VJP"),
+        3.0e-3,
+        3.0e-3,
+    );
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 fn recurrent_attention_supports_cuda_backend_types() {
@@ -368,6 +458,256 @@ fn fused_recurrent_matches_reference_with_decay_on_cuda() {
 
     assert_close_backend(fused.context, reference_context, 2e-2, 2e-2);
     assert_close_backend(fused.rho, reference_rho, 2e-2, 2e-2);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn plain_recurrent_input_vjp_matches_terminal_rho_autodiff_on_cuda() {
+    type CudaBackend = CudaCubeBackend;
+    type CudaAutodiffBackend = Autodiff<CudaBackend>;
+
+    let device = burn::tensor::Device::<CudaAutodiffBackend>::default();
+    let query = Tensor::<CudaAutodiffBackend, 4>::from_data(
+        TensorData::new(
+            (0..24).map(|index| index as f32 * 0.03 - 0.2).collect(),
+            [1, 2, 3, 4],
+        ),
+        &device,
+    )
+    .require_grad();
+    let value = Tensor::<CudaAutodiffBackend, 4>::from_data(
+        TensorData::new(
+            (0..18).map(|index| index as f32 * 0.05 - 0.15).collect(),
+            [1, 1, 3, 6],
+        ),
+        &device,
+    )
+    .require_grad();
+    let initial_rho = Tensor::<CudaAutodiffBackend, 4>::from_data(
+        TensorData::new(
+            (0..48).map(|index| index as f32 * 0.01 - 0.12).collect(),
+            [1, 2, 4, 6],
+        ),
+        &device,
+    )
+    .require_grad();
+    let decay =
+        Tensor::<CudaAutodiffBackend, 1>::from_data(TensorData::new(vec![0.95, 0.9], [2]), &device);
+    let grad_context = Tensor::<CudaAutodiffBackend, 4>::from_data(
+        TensorData::new(
+            (0..36).map(|index| index as f32 * 0.02 - 0.1).collect(),
+            [1, 2, 3, 6],
+        ),
+        &device,
+    );
+    let grad_terminal_rho = Tensor::<CudaAutodiffBackend, 4>::from_data(
+        TensorData::new(
+            (0..48).map(|index| index as f32 * 0.015 - 0.08).collect(),
+            [1, 2, 4, 6],
+        ),
+        &device,
+    );
+
+    let (context, terminal_rho) = reference_recurrent_autodiff(
+        query.clone(),
+        value.clone(),
+        initial_rho.clone(),
+        decay.clone(),
+    );
+    let reference_grads = ((context * grad_context.clone()).sum()
+        + (terminal_rho * grad_terminal_rho.clone()).sum())
+    .backward();
+    let vjp = try_fused_recurrent_attention_input_vjp::<CudaBackend>(
+        grad_context.inner(),
+        query.clone().inner(),
+        value.clone().inner(),
+        Some(initial_rho.clone().inner()),
+        decay.inner(),
+        Some(grad_terminal_rho.inner()),
+    )
+    .expect("CUDA plain recurrent VJP");
+
+    assert_close_backend(
+        vjp.grad_query,
+        query.grad(&reference_grads).expect("reference query VJP"),
+        3.0e-2,
+        3.0e-2,
+    );
+    assert_close_backend(
+        vjp.grad_value,
+        value.grad(&reference_grads).expect("reference value VJP"),
+        3.0e-2,
+        3.0e-2,
+    );
+    assert_close_backend(
+        vjp.grad_initial_rho.expect("initial rho VJP"),
+        initial_rho
+            .grad(&reference_grads)
+            .expect("reference initial rho VJP"),
+        3.0e-2,
+        3.0e-2,
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn streaming_recurrent_input_vjp_matches_autodiff_across_workgroups_on_cuda() {
+    type CudaBackend = CudaCubeBackend;
+    type CudaAutodiffBackend = Autodiff<CudaBackend>;
+
+    let device = burn::tensor::Device::<CudaAutodiffBackend>::default();
+    <CudaAutodiffBackend as BackendTrait>::seed(&device, 20260808);
+    let [batch, heads, time, latent, embd] = [1, 2, 3, 129, 131];
+    let query = Tensor::<CudaAutodiffBackend, 4>::random(
+        [batch, heads, time, latent],
+        Distribution::Uniform(-0.08, 0.08),
+        &device,
+    )
+    .require_grad();
+    let value = Tensor::<CudaAutodiffBackend, 4>::random(
+        [batch, heads, time, embd],
+        Distribution::Uniform(-0.08, 0.08),
+        &device,
+    )
+    .require_grad();
+    let initial_rho = Tensor::<CudaAutodiffBackend, 4>::random(
+        [batch, heads, latent, embd],
+        Distribution::Uniform(-0.04, 0.04),
+        &device,
+    )
+    .require_grad();
+    let decay = Tensor::<CudaAutodiffBackend, 1>::from_data(
+        TensorData::new(vec![0.91, 0.83], [heads]),
+        &device,
+    );
+    let grad_context = Tensor::<CudaAutodiffBackend, 4>::random(
+        [batch, heads, time, embd],
+        Distribution::Uniform(-0.1, 0.1),
+        &device,
+    );
+    let grad_terminal_rho = Tensor::<CudaAutodiffBackend, 4>::random(
+        [batch, heads, latent, embd],
+        Distribution::Uniform(-0.05, 0.05),
+        &device,
+    );
+
+    let (context, terminal_rho) = reference_recurrent_autodiff(
+        query.clone(),
+        value.clone(),
+        initial_rho.clone(),
+        decay.clone(),
+    );
+    let reference_grads = ((context * grad_context.clone()).sum()
+        + (terminal_rho * grad_terminal_rho.clone()).sum())
+    .backward();
+    let vjp = try_fused_recurrent_attention_input_vjp::<CudaBackend>(
+        grad_context.inner(),
+        query.clone().inner(),
+        value.clone().inner(),
+        Some(initial_rho.clone().inner()),
+        decay.inner(),
+        Some(grad_terminal_rho.inner()),
+    )
+    .expect("multi-workgroup CUDA streaming recurrent VJP");
+
+    assert_close_backend(
+        vjp.grad_query,
+        query.grad(&reference_grads).expect("reference query VJP"),
+        1.0e-4,
+        1.0e-4,
+    );
+    assert_close_backend(
+        vjp.grad_value,
+        value.grad(&reference_grads).expect("reference value VJP"),
+        1.0e-4,
+        1.0e-4,
+    );
+    assert_close_backend(
+        vjp.grad_initial_rho.expect("initial rho VJP"),
+        initial_rho
+            .grad(&reference_grads)
+            .expect("reference initial rho VJP"),
+        1.0e-4,
+        1.0e-4,
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn streaming_recurrent_input_vjp_matches_direct_cuda_through_fusion() {
+    type CudaBackend = CudaCubeBackend;
+    type CudaFusionBackend = burn_fusion::Fusion<CudaBackend>;
+
+    let direct_device = burn::tensor::Device::<CudaBackend>::default();
+    let fusion_device = burn::tensor::Device::<CudaFusionBackend>::default();
+    let query_data = TensorData::new(
+        (0..24).map(|index| index as f32 * 0.03 - 0.2).collect(),
+        [1, 2, 3, 4],
+    );
+    let value_data = TensorData::new(
+        (0..18).map(|index| index as f32 * 0.05 - 0.15).collect(),
+        [1, 1, 3, 6],
+    );
+    let initial_data = TensorData::new(
+        (0..48).map(|index| index as f32 * 0.01 - 0.12).collect(),
+        [1, 2, 4, 6],
+    );
+    let grad_context_data = TensorData::new(
+        (0..36).map(|index| index as f32 * 0.02 - 0.1).collect(),
+        [1, 2, 3, 6],
+    );
+    let grad_terminal_data = TensorData::new(
+        (0..48).map(|index| index as f32 * 0.015 - 0.08).collect(),
+        [1, 2, 4, 6],
+    );
+    let decay_data = TensorData::new(vec![0.95, 0.9], [2]);
+
+    let direct = try_fused_recurrent_attention_input_vjp::<CudaBackend>(
+        Tensor::from_data(grad_context_data.clone(), &direct_device),
+        Tensor::from_data(query_data.clone(), &direct_device),
+        Tensor::from_data(value_data.clone(), &direct_device),
+        Some(Tensor::from_data(initial_data.clone(), &direct_device)),
+        Tensor::from_data(decay_data.clone(), &direct_device),
+        Some(Tensor::from_data(
+            grad_terminal_data.clone(),
+            &direct_device,
+        )),
+    )
+    .expect("direct CUDA streaming VJP");
+    let fusion = try_fused_recurrent_attention_input_vjp::<CudaFusionBackend>(
+        Tensor::from_data(grad_context_data, &fusion_device),
+        Tensor::from_data(query_data, &fusion_device),
+        Tensor::from_data(value_data, &fusion_device),
+        Some(Tensor::from_data(initial_data, &fusion_device)),
+        Tensor::from_data(decay_data, &fusion_device),
+        Some(Tensor::from_data(grad_terminal_data, &fusion_device)),
+    )
+    .expect("fusion CUDA streaming VJP");
+
+    assert_close_backend(
+        fusion.grad_query,
+        Tensor::<CudaFusionBackend, 4>::from_data(direct.grad_query.to_data(), &fusion_device),
+        1.0e-5,
+        1.0e-5,
+    );
+    assert_close_backend(
+        fusion.grad_value,
+        Tensor::<CudaFusionBackend, 4>::from_data(direct.grad_value.to_data(), &fusion_device),
+        1.0e-5,
+        1.0e-5,
+    );
+    assert_close_backend(
+        fusion.grad_initial_rho.expect("fusion initial rho VJP"),
+        Tensor::<CudaFusionBackend, 4>::from_data(
+            direct
+                .grad_initial_rho
+                .expect("direct initial rho VJP")
+                .to_data(),
+            &fusion_device,
+        ),
+        1.0e-5,
+        1.0e-5,
+    );
 }
 
 #[cfg(feature = "cuda")]

@@ -39,7 +39,10 @@ pub mod kernels {
     /// Dense causal attention kernels used by the focused linear-attention path.
     pub mod attention {
         pub use crate::dense_causal_attention::{
-            CompiledDenseCausalAttentionPlan, DenseCausalAttentionVjp, dense_causal_attention_vjp,
+            CompiledDenseCausalAttentionPlan, DenseCausalAttentionFinalRhoVjp,
+            DenseCausalAttentionInputVjp, DenseCausalAttentionVjp,
+            dense_causal_attention_final_rho_input_vjp, dense_causal_attention_final_rho_vjp,
+            dense_causal_attention_input_vjp_with_initial_rho, dense_causal_attention_vjp,
             dense_causal_attention_vjp_with_initial_rho, supports_dense_causal_attention_backend,
             try_fused_dense_causal_attention_wgpu, try_fused_dense_causal_attention_wgpu_with_plan,
         };
@@ -48,9 +51,11 @@ pub mod kernels {
     /// Core recurrent attention kernels.
     pub mod recurrent {
         pub use crate::recurrent::{
-            CompiledRecurrentAttentionPlan, RecurrentAttentionOutput, RecurrentProfileSnapshot,
-            recurrent_profile_reset, recurrent_profile_snapshot,
-            supports_backend as supports_recurrent_backend, try_fused_recurrent_attention_wgpu,
+            CompiledRecurrentAttentionPlan, RecurrentAttentionInputVjp, RecurrentAttentionOutput,
+            RecurrentProfileSnapshot, RecurrentVjpRouteProfileSnapshot, recurrent_profile_reset,
+            recurrent_profile_snapshot, recurrent_vjp_route_profile_reset,
+            recurrent_vjp_route_profile_snapshot, supports_backend as supports_recurrent_backend,
+            try_fused_recurrent_attention_input_vjp, try_fused_recurrent_attention_wgpu,
             try_fused_recurrent_attention_wgpu_with_plan,
         };
     }
@@ -63,8 +68,10 @@ pub mod kernels {
             relu_lowrank_forward_profile_snapshot, relu_lowrank_forward_route_profile_reset,
             relu_lowrank_forward_route_profile_snapshot, relu_lowrank_grad_input_profile_reset,
             relu_lowrank_grad_input_profile_snapshot, relu_lowrank_grad_weight_profile_reset,
-            relu_lowrank_grad_weight_profile_snapshot, relu_lowrank_input_vjp, relu_lowrank_vjp,
-            supports_relu_lowrank_projection_backend, try_fused_relu_lowrank_projection_wgpu,
+            relu_lowrank_grad_weight_profile_snapshot, relu_lowrank_input_vjp,
+            relu_lowrank_input_vjp_from_activation, relu_lowrank_vjp,
+            relu_lowrank_vjp_from_activation, supports_relu_lowrank_projection_backend,
+            try_fused_relu_lowrank_projection_wgpu,
             try_fused_relu_lowrank_projection_wgpu_with_executor,
         };
     }

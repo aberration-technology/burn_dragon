@@ -2618,10 +2618,11 @@ fn resolve_browser_revision_contract(
     live: &DragonBrowserLiveParticipantConfig,
 ) -> Result<Option<burn_p2p::RevisionContractBundle>> {
     let embedded = live.revision_contract.as_ref();
-    let published = snapshot
-        .revision_contracts
-        .iter()
-        .find(|contract| contract.revision.revision_id.as_str() == live.revision_id);
+    let published = snapshot.revision_contracts.iter().find(|contract| {
+        contract.revision.experiment_id.as_str() == live.experiment_id
+            && contract.revision.revision_id.as_str() == live.revision_id
+            && contract.revision.workload_id.as_str() == live.workload_id
+    });
     if let (Some(embedded), Some(published)) = (embedded, published)
         && embedded != published
     {

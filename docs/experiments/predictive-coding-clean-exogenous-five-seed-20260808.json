@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-08",
+  "experiment": "predictive_coding_clean_exogenous_five_seed",
+  "decision": "quality_parity_without_promotion",
+  "backend": "cuda",
+  "device": "NVIDIA GB10",
+  "model_parameters": 937154,
+  "updates_per_run": 512,
+  "batch_size": 32,
+  "seeds": [20261010, 20261011, 20261012, 20261013, 20261014],
+  "controls": {
+    "profile": "config/language/experiments/predictive_coding/local-pc-verifier-1m.toml",
+    "source_selection": "static_expert_exogenous",
+    "source_selection_feedback_updates_enabled": false,
+    "validation_objective": "fixed_holdout",
+    "sequence_batching": "streaming",
+    "tbptt_chunk_size": 64,
+    "tbptt_persist_across_steps": true,
+    "ruliad_policy_probe_every_epochs": 4,
+    "ruliad_policy_probe_closed_loop_every_epochs": 4
+  },
+  "provenance": {
+    "git_sha": "1d7c362da8f37ba7b84ce4def3f7d449acdce44c",
+    "git_dirty": false,
+    "clean_git_required": true,
+    "train_binary_sha256": "32d63f2e84706ff20b6b436c5a0d73b6561cd7893eb101ee00c5488b25eddb82",
+    "runner_sha256": "d572a7c35396d2da74cf663d1874d08e43f623008d8b57bde43abfd44a891ffc",
+    "all_trial_statuses": "ok"
+  },
+  "mean_and_ci95": {
+    "adamw": {
+      "cold_validation": [1.08885352, 0.02936023],
+      "stream_warm_loss": [1.01804710, 0.02296489],
+      "constrained_action_top1": [0.71875, 0.0],
+      "policy_solve_rate": [0.4625, 0.01735],
+      "goal_completion_rate": [0.49579832, 0.01223317],
+      "free_verifier_accuracy": [0.0, 0.0],
+      "wall_tokens_per_second": [10601.5136, 189.94598],
+      "model_tokens_per_second": [55309.5496, 554.87622]
+    },
+    "exact_fixed_prediction_pc": {
+      "cold_validation": [1.09621417, 0.02239837],
+      "stream_warm_loss": [1.02412778, 0.03308183],
+      "constrained_action_top1": [0.73125, 0.02124932],
+      "policy_solve_rate": [0.48125, 0.02124932],
+      "goal_completion_rate": [0.52268908, 0.06458454],
+      "free_verifier_accuracy": [0.0, 0.0],
+      "wall_tokens_per_second": [9820.1078, 339.28672],
+      "model_tokens_per_second": [41703.9818, 214.33753]
+    },
+    "paired_exact_pc_minus_adamw": {
+      "cold_validation": [0.00736065, 0.03632752],
+      "stream_warm_loss": [0.00608068, 0.02689860],
+      "constrained_action_top1": [0.0125, 0.02124932],
+      "policy_solve_rate": [0.01875, 0.0347],
+      "goal_completion_rate": [0.02689076, 0.05637401],
+      "free_verifier_accuracy": [0.0, 0.0],
+      "wall_tokens_per_second": [-781.4058, 197.33002],
+      "model_tokens_per_second": [-13605.5678, 556.04618]
+    }
+  },
+  "systems": {
+    "adamw": {
+      "gpu_utilization_mean_percent": 86.6839,
+      "gpu_utilization_median_percent": 95.8,
+      "gpu_power_mean_watts": 60.0842,
+      "gpu_power_median_watts": 68.513,
+      "elapsed_seconds_range": [200, 206],
+      "peak_used_memory_mb_range": [38997, 41753]
+    },
+    "exact_fixed_prediction_pc": {
+      "gpu_utilization_mean_percent": 87.2131,
+      "gpu_utilization_median_percent": 95.8,
+      "gpu_power_mean_watts": 58.2362,
+      "gpu_power_median_watts": 67.906,
+      "elapsed_seconds_range": [214, 228],
+      "peak_used_memory_mb_range": [39613, 40941]
+    }
+  },
+  "interpretation": {
+    "quality": "All paired quality intervals include zero; exact PC does not establish superiority.",
+    "reasoning": "Both learners have zero free-rollout verifier accuracy, so constrained-policy gains are not an executable reasoning result.",
+    "throughput": "Exact PC is 24.6% slower in model-step throughput and 7.4% slower in end-to-end wall throughput.",
+    "device_behavior": "Both learners are GPU-dense; exact PC overhead is additional serial local-VJP work rather than a host-transfer stall.",
+    "promotion": "AdamW remains the production default. Exact PC remains a qualified no-global-backward research alternative."
+  },
+  "raw_artifact": "target/pc-paper/clean-exogenous-5seed-1d7c362"
+}

@@ -7,6 +7,7 @@ type Backend = CubeBackend<WgpuRuntime, f32, i32, u32>;
 type AutodiffBackendImpl = Autodiff<Backend>;
 type FusionBackend = Wgpu<f32>;
 type FusionAutodiffBackendImpl = Autodiff<FusionBackend>;
+type NdBackend = burn_ndarray::NdArray<f32>;
 #[cfg(feature = "cuda")]
 type CudaBackend = CudaCubeBackend;
 #[cfg(feature = "cuda")]
@@ -62,6 +63,95 @@ fn assert_close<const D: usize, B: BackendTrait>(
             "mismatch at {index}: lhs={lhs}, rhs={rhs}, diff={diff}, limit={limit}"
         );
     }
+}
+
+#[test]
+fn retained_activation_vjps_match_projection_recomputation() {
+    let device = burn::tensor::Device::<NdBackend>::default();
+    let input = Tensor::<NdBackend, 4>::from_data(
+        TensorData::new(
+            (0..24)
+                .map(|index| (index as f32 - 11.0) * 0.07)
+                .collect::<Vec<_>>(),
+            [2, 1, 3, 4],
+        ),
+        &device,
+    );
+    let weight = Tensor::<NdBackend, 4>::from_data(
+        TensorData::new(
+            (0..24)
+                .map(|index| ((index * 7 % 19) as f32 - 9.0) * 0.05)
+                .collect::<Vec<_>>(),
+            [1, 2, 4, 3],
+        ),
+        &device,
+    );
+    let sparse_mask = Tensor::<NdBackend, 4>::from_data(
+        TensorData::new(vec![1.0_f32, -0.5, 0.0, -1.0, 0.0, 0.25], [1, 2, 1, 3]),
+        &device,
+    );
+    let grad_output = Tensor::<NdBackend, 4>::from_data(
+        TensorData::new(
+            (0..36)
+                .map(|index| ((index * 5 % 23) as f32 - 11.0) * 0.03)
+                .collect::<Vec<_>>(),
+            [2, 2, 3, 3],
+        ),
+        &device,
+    );
+    let threshold = 0.05;
+    let activation = lowrank_projection_reference_forward(
+        input.clone(),
+        weight.clone(),
+        threshold,
+        Some(sparse_mask.clone()),
+    );
+    assert!(
+        activation
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("activation vec")
+            .into_iter()
+            .any(|value| value < 0.0),
+        "fixture must exercise signed post-mask activations"
+    );
+    let recomputed = relu_lowrank_vjp(
+        input.clone(),
+        weight.clone(),
+        grad_output.clone(),
+        threshold,
+        Some(sparse_mask.clone()),
+        LowrankGradInputExecutor::Auto,
+    )
+    .expect("recomputed VJP");
+    let retained = relu_lowrank_vjp_from_activation(
+        input.clone(),
+        weight.clone(),
+        activation.clone(),
+        grad_output.clone(),
+        Some(sparse_mask.clone()),
+        LowrankGradInputExecutor::Auto,
+    )
+    .expect("retained-activation VJP");
+    let retained_input = relu_lowrank_input_vjp_from_activation(
+        input,
+        weight,
+        activation,
+        grad_output,
+        Some(sparse_mask),
+        LowrankGradInputExecutor::Auto,
+    )
+    .expect("retained-activation input VJP");
+
+    assert_close(
+        retained.grad_input.clone(),
+        recomputed.grad_input,
+        1.0e-6,
+        1.0e-6,
+    );
+    assert_close(retained.grad_weight, recomputed.grad_weight, 1.0e-6, 1.0e-6);
+    assert_close(retained_input, retained.grad_input, 1.0e-6, 1.0e-6);
 }
 
 #[test]

@@ -651,6 +651,19 @@ fn browser_profile_from_native_config(
     revision_id: Option<&str>,
     browser_climbmix_manifest_url: Option<&str>,
 ) -> Result<Option<DragonBrowserExperimentProfile>> {
+    let algorithm_observer_reason = matches!(
+        config.training.algorithm,
+        burn_dragon_language::TrainingAlgorithm::PredictiveCoding
+    )
+    .then(|| {
+        "the signed revision requires Dragon-local predictive coding, which is not implemented by the browser trainer; this peer may observe and verify only".to_string()
+    });
+    let trainer_support = |fallback| match algorithm_observer_reason.as_ref() {
+        Some(reason) => DragonBrowserTrainerSupport::ObserverOnly {
+            reason: reason.clone(),
+        },
+        None => fallback,
+    };
     let optimizer = match config.optimizer.name {
         burn_dragon_train::OptimizerKind::Adamw => DragonBrowserOptimizerConfig::Adamw,
         burn_dragon_train::OptimizerKind::Eggroll => DragonBrowserOptimizerConfig::SeededFitness {
@@ -699,7 +712,7 @@ fn browser_profile_from_native_config(
                 max_train_batches: Some(window_tuning.max_train_batches),
                 max_eval_batches: Some(window_tuning.max_eval_batches),
                 capability_policy,
-                trainer_support: DragonBrowserTrainerSupport::Supported,
+                trainer_support: trainer_support(DragonBrowserTrainerSupport::Supported),
                 train_source: DragonBrowserProfileTokenSource::GeneratedNca {
                     corpus_toml: corpus_toml.clone(),
                     split: DragonBrowserDatasetSplit::Train,
@@ -729,7 +742,7 @@ fn browser_profile_from_native_config(
             max_train_batches: Some(config.training.max_iters.max(1)),
             max_eval_batches: None,
             capability_policy: DragonCapabilityPolicy::default(),
-            trainer_support: DragonBrowserTrainerSupport::Supported,
+            trainer_support: trainer_support(DragonBrowserTrainerSupport::Supported),
             train_source: DragonBrowserProfileTokenSource::ShardManifestHttp {
                 manifest_url: browser_climbmix_manifest_url
                     .map(str::trim)
@@ -784,21 +797,23 @@ fn browser_profile_from_native_config(
                 max_train_batches: Some(window_tuning.max_train_batches),
                 max_eval_batches: Some(window_tuning.max_eval_batches),
                 capability_policy,
-                trainer_support: if config
-                    .training
-                    .ruliad_supervision
-                    .needs_ruliad_policy_batch()
-                {
-                    DragonBrowserTrainerSupport::ObserverOnly {
+                trainer_support: trainer_support(
+                    if config
+                        .training
+                        .ruliad_supervision
+                        .needs_ruliad_policy_batch()
+                    {
+                        DragonBrowserTrainerSupport::ObserverOnly {
                         reason: "the signed Ruliad objective requires verifier or denoising policy batches that are not implemented by the browser trainer".into(),
                     }
-                } else if browser_ruliad_corpus.source_selection.enabled {
-                    DragonBrowserTrainerSupport::ObserverOnly {
+                    } else if browser_ruliad_corpus.source_selection.enabled {
+                        DragonBrowserTrainerSupport::ObserverOnly {
                         reason: "the signed Ruliad revision uses adaptive live source selection whose capability feedback state is not synchronized into browser leases".into(),
                     }
-                } else {
-                    DragonBrowserTrainerSupport::Supported
-                },
+                    } else {
+                        DragonBrowserTrainerSupport::Supported
+                    },
+                ),
                 train_source: DragonBrowserProfileTokenSource::GeneratedRuliad {
                     corpus_toml: corpus_toml.clone(),
                     split: DragonBrowserDatasetSplit::Train,
@@ -1461,7 +1476,7 @@ mod tests {
     #[cfg(feature = "native")]
     #[test]
     fn climbmix_profile_builds_browser_shard_manifest_source() {
-        let config: TrainingConfig = toml::from_str(
+        let mut config: TrainingConfig = toml::from_str(
             r#"
 [dataset]
 cache_dir = "./cache/climbmix-r1"
@@ -1527,6 +1542,20 @@ prompt = "1 2 3"
             }
             other => panic!("expected shard-manifest browser source, got {other:?}"),
         }
+
+        config.training.algorithm = burn_dragon_language::TrainingAlgorithm::PredictiveCoding;
+        let profile = build_profile_from_local_config(
+            &config,
+            DragonExperimentKind::ClimbMixPretraining,
+            Some("climbmix-pc-r1"),
+            None,
+        )
+        .expect("predictive-coding observer profile");
+        assert!(matches!(
+            profile.browser.expect("browser observer profile").trainer_support,
+            DragonBrowserTrainerSupport::ObserverOnly { reason }
+                if reason.contains("predictive coding")
+        ));
     }
 
     #[cfg(feature = "native")]
@@ -1646,6 +1675,25 @@ prompt = "[R2"
         {
             assert_eq!(config, &PathBuf::from(PORTABLE_RULIAD_CORPUS_FILE_NAME));
         }
+
+        let mut predictive_coding_config = config.clone();
+        predictive_coding_config.training.algorithm =
+            burn_dragon_language::TrainingAlgorithm::PredictiveCoding;
+        let predictive_coding_profile = build_profile_from_local_config(
+            &predictive_coding_config,
+            DragonExperimentKind::RuliadPretraining,
+            Some("ruliad-pc-r1"),
+            None,
+        )
+        .expect("predictive-coding observer profile");
+        assert!(matches!(
+            predictive_coding_profile
+                .browser
+                .expect("predictive-coding browser observer profile")
+                .trainer_support,
+            DragonBrowserTrainerSupport::ObserverOnly { reason }
+                if reason.contains("predictive coding")
+        ));
 
         let storage = tempdir().expect("storage");
         let materialized = materialize_native_training_config_for_ids(

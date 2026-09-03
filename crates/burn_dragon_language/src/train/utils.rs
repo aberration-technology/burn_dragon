@@ -98,6 +98,8 @@ fn build_validation_dataset_config(
             .train_split_ratio
             .unwrap_or(dataset_cfg.train_split_ratio),
         validation: None,
+        ruliad_source_selection_feedback_updates_enabled: None,
+        ruliad_source_selection_cold_start_enabled: None,
         source: validation_cfg.source.clone(),
         tokenizer: dataset_cfg.tokenizer.clone(),
     }

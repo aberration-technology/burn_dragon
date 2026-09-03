@@ -224,6 +224,8 @@ pub enum DragonExperimentKind {
 }
 
 pub const DRAGON_RULIAD_SEMANTIC_CONTRACT_EXTENSION: &str = "dragon.ruliad_semantics.v1";
+pub const DRAGON_LOCAL_PC_PROGRAM_CONTRACT_EXTENSION: &str =
+    "dragon.local_predictive_coding.program.v1";
 
 impl DragonExperimentKind {
     pub fn workload_slug(self) -> &'static str {

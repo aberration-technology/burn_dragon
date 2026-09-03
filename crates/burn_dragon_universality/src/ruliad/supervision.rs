@@ -12,7 +12,11 @@ pub enum RuliadTokenSupervisionMode {
     FullDocument,
     AnswerWindow,
     AnswerCompletion,
+    /// Supervise answer schema and termination while masking semantic values.
+    AnswerStructure,
     AnswerValues,
+    /// Alternate unit-normalized structure and value objectives.
+    FactorizedAnswer,
     TraceAndAnswer,
     Mixed,
 }
@@ -57,6 +61,15 @@ impl RuliadTokenSupervisionConfig {
                     RuliadTokenSupervisionMode::FullDocument
                 }
             }
+            RuliadTokenSupervisionMode::FactorizedAnswer => {
+                if validation {
+                    RuliadTokenSupervisionMode::AnswerCompletion
+                } else if progress_index & 1 == 0 {
+                    RuliadTokenSupervisionMode::AnswerStructure
+                } else {
+                    RuliadTokenSupervisionMode::AnswerValues
+                }
+            }
             mode => mode,
         };
         Self { mode, ..self }
@@ -66,7 +79,9 @@ impl RuliadTokenSupervisionConfig {
         matches!(
             self.mode,
             RuliadTokenSupervisionMode::AnswerCompletion
+                | RuliadTokenSupervisionMode::AnswerStructure
                 | RuliadTokenSupervisionMode::AnswerValues
+                | RuliadTokenSupervisionMode::FactorizedAnswer
                 | RuliadTokenSupervisionMode::TraceAndAnswer
                 | RuliadTokenSupervisionMode::Mixed
         )
@@ -118,6 +133,7 @@ fn answer_target_loss_mask(
     base_weight: i64,
 ) -> bool {
     let value_only = supervision.mode == RuliadTokenSupervisionMode::AnswerValues;
+    let structure_only = supervision.mode == RuliadTokenSupervisionMode::AnswerStructure;
     mask.fill(base_weight);
     let mut in_answer = false;
     let mut in_close_marker = false;
@@ -178,7 +194,7 @@ fn answer_target_loss_mask(
                 let schema_start_target = schema_target
                     && schema_key_start_pending
                     && target_byte.is_some_and(is_answer_key_start_byte);
-                let weight = if value_only && !value_target {
+                let weight = if (value_only && !value_target) || (structure_only && value_target) {
                     0
                 } else if close_marker_target {
                     close_weight
@@ -422,6 +438,31 @@ mod tests {
     }
 
     #[test]
+    fn answer_structure_supervision_excludes_semantic_values() {
+        let window = b"[R3 x]\nP:p\n?:root=1\n!:c=2\n[/R3]"
+            .iter()
+            .copied()
+            .map(u32::from)
+            .collect::<Vec<_>>();
+        let mut mask = vec![0; window.len() - 1];
+        assert!(ruliad_token_loss_mask(
+            &window,
+            &mut mask,
+            RuliadTokenSupervisionConfig {
+                mode: RuliadTokenSupervisionMode::AnswerStructure,
+                ..RuliadTokenSupervisionConfig::default()
+            }
+        ));
+        let supervised = window
+            .iter()
+            .skip(1)
+            .zip(&mask)
+            .filter_map(|(token, weight)| (*weight > 0).then_some(*token as u8 as char))
+            .collect::<String>();
+        assert_eq!(supervised, "c=\n[/R3]");
+    }
+
+    #[test]
     fn semantic_proof_action_marks_goal_source_direction_and_path_as_values() {
         let window = b"?:q\n!:g12|a:r3|f|1.1\n[/R3]"
             .iter()
@@ -480,6 +521,26 @@ mod tests {
         );
         assert_eq!(
             mixed.effective_for(true, 1).mode,
+            RuliadTokenSupervisionMode::AnswerCompletion
+        );
+    }
+
+    #[test]
+    fn factorized_answer_balances_structure_and_values_by_step() {
+        let factorized = RuliadTokenSupervisionConfig {
+            mode: RuliadTokenSupervisionMode::FactorizedAnswer,
+            ..RuliadTokenSupervisionConfig::default()
+        };
+        assert_eq!(
+            factorized.effective_for(false, 0).mode,
+            RuliadTokenSupervisionMode::AnswerStructure
+        );
+        assert_eq!(
+            factorized.effective_for(false, 1).mode,
+            RuliadTokenSupervisionMode::AnswerValues
+        );
+        assert_eq!(
+            factorized.effective_for(true, 1).mode,
             RuliadTokenSupervisionMode::AnswerCompletion
         );
     }

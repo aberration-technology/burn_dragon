@@ -1,0 +1,12 @@
+extends = "local-pc-verifier-1m.toml"
+
+# Structural decoder-contract arm. Primary CE observes only the causal answer
+# window and every supervised answer token retains unit weight; verifier action
+# ranking remains the same as the full-document baseline.
+[training.ruliad_supervision]
+mode = "answer_completion"
+answer_close_marker_stride = 1
+answer_close_marker_weight = 1
+answer_schema_token_weight = 1
+answer_schema_start_token_weight = 1
+answer_value_token_weight = 1

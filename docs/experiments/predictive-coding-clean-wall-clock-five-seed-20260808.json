@@ -1,0 +1,173 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-08",
+  "experiment": "predictive_coding_clean_exogenous_fixed_wall_clock_five_seed",
+  "decision": "best_checkpoint_parity_without_continual_stability",
+  "backend": "cuda",
+  "device": "NVIDIA GB10",
+  "model_parameters": 937154,
+  "wall_clock_seconds_per_run": 180,
+  "planned_updates_per_run": 8192,
+  "batch_size": 32,
+  "checkpoint_interval_updates": 256,
+  "seeds": [
+    20261010,
+    20261011,
+    20261012,
+    20261013,
+    20261014
+  ],
+  "controls": {
+    "profile": "config/language/experiments/predictive_coding/local-pc-verifier-1m.toml",
+    "source_selection": "static_expert_exogenous",
+    "source_selection_feedback_updates_enabled": false,
+    "validation_objective": "fixed_holdout",
+    "sequence_batching": "streaming",
+    "tbptt_chunk_size": 64,
+    "tbptt_persist_across_steps": true,
+    "sequence_state_probe_enabled": false,
+    "expensive_ruliad_probes_deferred": true,
+    "learning_rate": 0.001,
+    "learning_rate_schedule": "constant"
+  },
+  "provenance": {
+    "git_sha": "2e813c782e2254cb85259dfb6c5479d604f4be43",
+    "git_dirty": false,
+    "clean_git_required": true,
+    "train_binary_sha256": "32d63f2e84706ff20b6b436c5a0d73b6561cd7893eb101ee00c5488b25eddb82",
+    "runner_sha256": "a29801458429f0e2d3e34442b211167ea16b0b38aa0c0fa91f63bc43961009cd",
+    "all_trial_statuses": "wall_clock_complete",
+    "elapsed_seconds_range": [
+      186,
+      187
+    ],
+    "excluded_predecessor_artifact": "target/pc-paper/clean-exogenous-wall180-5seed-ca7df88",
+    "exclusion_reason": "An epoch-four policy probe consumed the remainder of every timed region, leaving both arms at 512 updates. The corrected runner disables expensive probes inside fixed-wall-clock trials."
+  },
+  "mean_and_ci95": {
+    "adamw": {
+      "completed_checkpointed_updates": [
+        1689.6,
+        174.07445826
+      ],
+      "validation_last": [
+        1.62687535,
+        0.09446278
+      ],
+      "validation_mean": [
+        1.34571883,
+        0.07788088
+      ],
+      "validation_best": [
+        1.12730149,
+        0.01781149
+      ],
+      "validation_final_minus_best": [
+        0.21026067,
+        0.06787743
+      ],
+      "validation_regression_fraction": [
+        0.18613519,
+        0.05801107
+      ],
+      "validation_slope_per_checkpoint": [
+        0.03426341,
+        0.00938762
+      ],
+      "source_loss_cadence_mean": [
+        0.68652672,
+        0.00442404
+      ]
+    },
+    "exact_fixed_prediction_pc": {
+      "completed_checkpointed_updates": [
+        1280.0,
+        0.0
+      ],
+      "validation_last": [
+        1.62221861,
+        0.05414916
+      ],
+      "validation_mean": [
+        1.31331809,
+        0.04517462
+      ],
+      "validation_best": [
+        1.09701226,
+        0.02830174
+      ],
+      "validation_final_minus_best": [
+        0.21630583,
+        0.03413545
+      ],
+      "validation_regression_fraction": [
+        0.19722807,
+        0.03161515
+      ],
+      "validation_slope_per_checkpoint": [
+        0.04276912,
+        0.00937550
+      ],
+      "source_loss_cadence_mean": [
+        0.69369301,
+        0.00368229
+      ]
+    },
+    "paired_exact_pc_minus_adamw": {
+      "completed_checkpointed_updates": [
+        -409.6,
+        174.07445826
+      ],
+      "validation_best": [
+        -0.03028923,
+        0.02754204
+      ],
+      "validation_final_minus_best": [
+        0.00604516,
+        0.05629036
+      ],
+      "validation_regression_fraction": [
+        0.01109289,
+        0.04999544
+      ],
+      "validation_slope_per_checkpoint": [
+        0.00850571,
+        0.01306410
+      ],
+      "source_loss_cadence_mean": [
+        0.00716628,
+        0.00545513
+      ]
+    }
+  },
+  "systems": {
+    "adamw": {
+      "gpu_utilization_mean_percent": 78.621,
+      "gpu_utilization_median_percent": 88.2,
+      "gpu_power_mean_watts": 40.853,
+      "gpu_power_median_watts": 41.561,
+      "peak_used_memory_mb_range": [
+        13109,
+        13210
+      ]
+    },
+    "exact_fixed_prediction_pc": {
+      "gpu_utilization_mean_percent": 81.095,
+      "gpu_utilization_median_percent": 89.0,
+      "gpu_power_mean_watts": 37.981,
+      "gpu_power_median_watts": 38.427,
+      "peak_used_memory_mb_range": [
+        12495,
+        12528
+      ]
+    }
+  },
+  "interpretation": {
+    "wall_clock_efficiency": "Exact PC completed 24.2% fewer checkpointed updates than AdamW in the same wall budget.",
+    "best_checkpoint": "Exact PC reached a 0.03029 +/- 0.02754 lower best fixed-holdout loss; this bounded result does not establish retained endpoint quality or reasoning correctness.",
+    "continual_stability": "Both learners regressed materially after their best checkpoint. Exact PC did not reduce final-minus-best loss, regression fraction, or positive validation slope.",
+    "reasoning": "Reasoning probes were intentionally excluded from the timed region, so this experiment makes no verifier-quality claim.",
+    "promotion": "The fixed-wall-clock replication closes the harness reproducibility gate but fails the continual-retention and throughput promotion gates."
+  },
+  "raw_artifact": "target/pc-paper/clean-wall180-train-5seed-2e813c7"
+}

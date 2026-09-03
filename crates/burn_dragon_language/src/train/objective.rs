@@ -1,4 +1,6 @@
 use crate::config::TrainingObjectiveConfig;
+use burn::tensor::backend::Backend;
+use burn::tensor::{Int, Tensor};
 
 pub use burn_dragon_core::objective::{
     ObjectiveSupport, ObjectiveTrainerKind, SelectedTokenDistillationHiddenBatch,
@@ -26,6 +28,80 @@ pub fn ensure_objective_supported(
     trainer: ObjectiveTrainerKind,
 ) -> anyhow::Result<()> {
     ensure_objective_kind_supported(objective.kind(), trainer).map_err(anyhow::Error::msg)
+}
+
+/// Keeps token-normalized prediction loss separate from time-normalized TBPTT regularizers.
+pub(crate) struct NextTokenLossParts<B: Backend> {
+    primary: Tensor<B, 1>,
+    supervised_tokens: Tensor<B, 1>,
+    auxiliary: Option<Tensor<B, 1>>,
+}
+
+impl<B: Backend> NextTokenLossParts<B> {
+    pub(crate) fn new(primary: Tensor<B, 1>, supervised_tokens: Tensor<B, 1>) -> Self {
+        Self {
+            primary,
+            supervised_tokens,
+            auxiliary: None,
+        }
+    }
+
+    pub(crate) fn add_auxiliary(&mut self, loss: Tensor<B, 1>) {
+        self.auxiliary = Some(match self.auxiliary.take() {
+            Some(accumulated) => accumulated + loss,
+            None => loss,
+        });
+    }
+
+    pub(crate) fn total(mut self) -> Tensor<B, 1> {
+        match self.auxiliary.take() {
+            Some(auxiliary) => self.primary + auxiliary,
+            None => self.primary,
+        }
+    }
+
+    pub(crate) fn tbptt_weighted(
+        mut self,
+        total_supervised_tokens: Tensor<B, 1>,
+        chunk_weight: f32,
+    ) -> Tensor<B, 1> {
+        let primary_weight = self.supervised_tokens / total_supervised_tokens.clamp_min(1.0);
+        let primary = self.primary * primary_weight;
+        match self.auxiliary.take() {
+            Some(auxiliary) => primary + auxiliary.mul_scalar(chunk_weight),
+            None => primary,
+        }
+    }
+}
+
+pub(crate) fn masked_token_mean_with_count<B: Backend>(
+    values: Tensor<B, 2>,
+    mask: Option<Tensor<B, 2, Int>>,
+) -> (Tensor<B, 1>, Tensor<B, 1>) {
+    let [batch, time] = values.shape().dims();
+    if let Some(mask) = mask {
+        let mask = mask.float();
+        let supervised_tokens = mask.clone().sum().reshape([1]);
+        let mean = (values * mask).sum().reshape([1]) / supervised_tokens.clone().clamp_min(1.0);
+        return (mean, supervised_tokens);
+    }
+    let device = values.device();
+    (
+        values.mean().reshape([1]),
+        Tensor::full([1], (batch * time) as f32, &device),
+    )
+}
+
+pub(crate) fn supervised_token_count<B: Backend>(
+    mask: Option<Tensor<B, 2, Int>>,
+    batch: usize,
+    time: usize,
+    device: &B::Device,
+) -> Tensor<B, 1> {
+    match mask {
+        Some(mask) => mask.float().sum().reshape([1]),
+        None => Tensor::full([1], (batch * time) as f32, device),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -102,6 +178,42 @@ mod tests {
             .convert::<f32>()
             .into_vec::<f32>()
             .expect("scalar vec")[0]
+    }
+
+    #[test]
+    fn masked_token_mean_reports_supervised_count() {
+        let values = || {
+            Tensor::from_data(
+                TensorData::new(vec![1.0_f32, 2.0, 3.0, 4.0], [1, 4]),
+                &device(),
+            )
+        };
+        let mask = tensor2(vec![1, 0, 1, 0], [1, 4]);
+        let (masked_mean, masked_count) = masked_token_mean_with_count(values(), Some(mask));
+        assert!((scalar(masked_mean) - 2.0).abs() < 1.0e-6);
+        assert!((scalar(masked_count) - 2.0).abs() < 1.0e-6);
+
+        let zero_mask = Tensor::zeros([1, 4], &device());
+        let (zero_mean, zero_count) = masked_token_mean_with_count(values(), Some(zero_mask));
+        assert!(scalar(zero_mean).abs() < 1.0e-6);
+        assert!(scalar(zero_count).abs() < 1.0e-6);
+
+        let (dense_mean, dense_count) = masked_token_mean_with_count(values(), None);
+        assert!((scalar(dense_mean) - 2.5).abs() < 1.0e-6);
+        assert!((scalar(dense_count) - 4.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn tbptt_loss_parts_use_token_and_time_weighting_contracts() {
+        let tensor = |value| Tensor::full([1], value, &device());
+        let mut sparse = NextTokenLossParts::new(tensor(3.0), tensor(1.0));
+        sparse.add_auxiliary(tensor(4.0));
+        let mut dense = NextTokenLossParts::new(tensor(2.0), tensor(4.0));
+        dense.add_auxiliary(tensor(8.0));
+
+        let loss =
+            sparse.tbptt_weighted(tensor(5.0), 0.25) + dense.tbptt_weighted(tensor(5.0), 0.75);
+        assert!((scalar(loss) - 9.2).abs() < 1.0e-6);
     }
 
     #[test]

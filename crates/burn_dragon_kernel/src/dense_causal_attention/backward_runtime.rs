@@ -13,6 +13,181 @@ pub struct DenseCausalAttentionVjp<B: BackendTrait> {
     pub grad_initial_rho: Option<BurnTensor<B, 4>>,
 }
 
+/// Input/state VJP for callers whose decay schedule is fixed rather than a
+/// trainable parameter. This avoids materializing an otherwise discarded
+/// decay derivative.
+#[derive(Debug, Clone)]
+pub struct DenseCausalAttentionInputVjp<B: BackendTrait> {
+    pub grad_query: BurnTensor<B, 4>,
+    pub grad_value: BurnTensor<B, 4>,
+    pub grad_initial_rho: Option<BurnTensor<B, 4>>,
+}
+
+/// Plain-backend VJP of the recurrent state retained after a dense causal
+/// attention chunk.
+///
+/// The terminal state follows `rho_T = d^T rho_0 + sum_t d^(T-t) q_t^T v_t`.
+/// Keeping this derivative separate from [`DenseCausalAttentionVjp`] lets a
+/// truncated learner inject a future state adjoint without fabricating an
+/// attention-output derivative for the current chunk.
+#[derive(Debug, Clone)]
+pub struct DenseCausalAttentionFinalRhoVjp<B: BackendTrait> {
+    pub grad_query: BurnTensor<B, 4>,
+    pub grad_value: BurnTensor<B, 4>,
+    pub grad_decay: BurnTensor<B, 1>,
+    pub grad_initial_rho: Option<BurnTensor<B, 4>>,
+}
+
+/// VJP from Dragon's terminal recurrent state to the current chunk inputs.
+///
+/// This implementation is backend-resident and handles both one shared value
+/// stream and one value stream per attention head. It performs no host
+/// synchronization and is suitable for exact TBPTT controls as well as
+/// factored temporal-credit implementations.
+pub fn dense_causal_attention_final_rho_vjp<B: BackendTrait>(
+    grad_final_rho: BurnTensor<B, 4>,
+    query: BurnTensor<B, 4>,
+    value: BurnTensor<B, 4>,
+    decay: BurnTensor<B, 1>,
+    initial_rho: Option<BurnTensor<B, 4>>,
+) -> DenseCausalAttentionFinalRhoVjp<B>
+where
+    B::FloatTensorPrimitive: 'static,
+{
+    let (vjp, grad_decay) = dense_causal_attention_final_rho_vjp_impl(
+        grad_final_rho,
+        query,
+        value,
+        decay,
+        initial_rho,
+        true,
+    );
+    DenseCausalAttentionFinalRhoVjp {
+        grad_query: vjp.grad_query,
+        grad_value: vjp.grad_value,
+        grad_decay: grad_decay.expect("requested terminal-rho decay VJP"),
+        grad_initial_rho: vjp.grad_initial_rho,
+    }
+}
+
+pub fn dense_causal_attention_final_rho_input_vjp<B: BackendTrait>(
+    grad_final_rho: BurnTensor<B, 4>,
+    query: BurnTensor<B, 4>,
+    value: BurnTensor<B, 4>,
+    decay: BurnTensor<B, 1>,
+    initial_rho: Option<BurnTensor<B, 4>>,
+) -> DenseCausalAttentionInputVjp<B>
+where
+    B::FloatTensorPrimitive: 'static,
+{
+    dense_causal_attention_final_rho_vjp_impl(
+        grad_final_rho,
+        query,
+        value,
+        decay,
+        initial_rho,
+        false,
+    )
+    .0
+}
+
+fn dense_causal_attention_final_rho_vjp_impl<B: BackendTrait>(
+    grad_final_rho: BurnTensor<B, 4>,
+    query: BurnTensor<B, 4>,
+    value: BurnTensor<B, 4>,
+    decay: BurnTensor<B, 1>,
+    initial_rho: Option<BurnTensor<B, 4>>,
+    compute_decay_vjp: bool,
+) -> (DenseCausalAttentionInputVjp<B>, Option<BurnTensor<B, 1>>)
+where
+    B::FloatTensorPrimitive: 'static,
+{
+    let [batch, heads, time, latent] = query.shape().dims::<4>();
+    let value_heads = value.shape().dims::<4>()[1];
+    let value_dim = value.shape().dims::<4>()[3];
+    assert_eq!(
+        grad_final_rho.shape().dims::<4>(),
+        [batch, heads, latent, value_dim],
+        "dense causal attention terminal-rho gradient shape mismatch"
+    );
+    assert!(
+        value_heads == 1 || value_heads == heads,
+        "dense causal attention values must have one stream or one stream per head"
+    );
+
+    let value_per_head = if value_heads == heads {
+        value.clone()
+    } else {
+        value.clone().repeat_dim(1, heads)
+    };
+    let positions = BurnTensor::<B, 1, Int>::arange(0..time as i64, &query.device())
+        .float()
+        .reshape([1, 1, time, 1]);
+    let exponents = positions
+        .mul_scalar(-1.0)
+        .add_scalar(time as f32)
+        .repeat_dim(1, heads);
+    let decay_heads = decay.clone().reshape([1, heads, 1, 1]);
+    let decay_weights = decay_heads
+        .clone()
+        .repeat_dim(2, time)
+        .powf(exponents.clone());
+
+    let grad_query = value_per_head
+        .clone()
+        .matmul(grad_final_rho.clone().swap_dims(2, 3))
+        * decay_weights.clone();
+    let grad_value_heads = query.clone().matmul(grad_final_rho.clone()) * decay_weights.clone();
+    let grad_value = if value_heads == heads {
+        grad_value_heads
+    } else {
+        grad_value_heads
+            .sum_dim(1)
+            .reshape([batch, 1, time, value_dim])
+    };
+
+    let safe_decay = decay_heads.clone().add_scalar(1.0e-12);
+    let mut grad_decay = compute_decay_vjp.then(|| {
+        let derivative_weights = decay_weights * exponents / safe_decay.clone();
+        let token_decay_derivative = (query * derivative_weights)
+            .swap_dims(2, 3)
+            .matmul(value_per_head);
+        (token_decay_derivative * grad_final_rho.clone())
+            .sum_dim(0)
+            .sum_dim(2)
+            .sum_dim(3)
+            .reshape([heads])
+    });
+
+    let grad_initial_rho = initial_rho.map(|rho| {
+        assert_eq!(
+            rho.shape().dims::<4>(),
+            [batch, heads, latent, value_dim],
+            "dense causal attention initial rho shape mismatch"
+        );
+        let state_weight = decay_heads.clone().powf_scalar(time as f32);
+        let state_derivative = state_weight.clone().mul_scalar(time as f32) / safe_decay;
+        if let Some(current) = grad_decay.as_mut() {
+            *current = current.clone()
+                + (rho * state_derivative * grad_final_rho.clone())
+                    .sum_dim(0)
+                    .sum_dim(2)
+                    .sum_dim(3)
+                    .reshape([heads]);
+        }
+        grad_final_rho.clone() * state_weight
+    });
+
+    (
+        DenseCausalAttentionInputVjp {
+            grad_query,
+            grad_value,
+            grad_initial_rho,
+        },
+        grad_decay,
+    )
+}
+
 pub fn dense_causal_attention_vjp<B: BackendTrait>(
     grad_output: BurnTensor<B, 4>,
     query: BurnTensor<B, 4>,
@@ -40,6 +215,40 @@ pub fn dense_causal_attention_vjp_with_initial_rho<B: BackendTrait>(
     decay: BurnTensor<B, 1>,
     initial_rho: Option<BurnTensor<B, 4>>,
 ) -> DenseCausalAttentionVjp<B>
+where
+    B::FloatTensorPrimitive: 'static,
+{
+    let (vjp, grad_decay) =
+        dense_causal_attention_vjp_impl(grad_output, query, value, decay, initial_rho, true);
+    DenseCausalAttentionVjp {
+        grad_query: vjp.grad_query,
+        grad_value: vjp.grad_value,
+        grad_decay: grad_decay.expect("requested dense-attention decay VJP"),
+        grad_initial_rho: vjp.grad_initial_rho,
+    }
+}
+
+pub fn dense_causal_attention_input_vjp_with_initial_rho<B: BackendTrait>(
+    grad_output: BurnTensor<B, 4>,
+    query: BurnTensor<B, 4>,
+    value: BurnTensor<B, 4>,
+    decay: BurnTensor<B, 1>,
+    initial_rho: Option<BurnTensor<B, 4>>,
+) -> DenseCausalAttentionInputVjp<B>
+where
+    B::FloatTensorPrimitive: 'static,
+{
+    dense_causal_attention_vjp_impl(grad_output, query, value, decay, initial_rho, false).0
+}
+
+fn dense_causal_attention_vjp_impl<B: BackendTrait>(
+    grad_output: BurnTensor<B, 4>,
+    query: BurnTensor<B, 4>,
+    value: BurnTensor<B, 4>,
+    decay: BurnTensor<B, 1>,
+    initial_rho: Option<BurnTensor<B, 4>>,
+    compute_decay_vjp: bool,
+) -> (DenseCausalAttentionInputVjp<B>, Option<BurnTensor<B, 1>>)
 where
     B::FloatTensorPrimitive: 'static,
 {
@@ -102,12 +311,14 @@ where
         .reshape([batch, heads, time, latent]);
 
     let safe_decay = decay.clone().add_scalar(1.0e-12).reshape([1, heads, 1, 1]);
-    let mut grad_decay = ((grad_scores * gap) * scores)
-        .div(safe_decay)
-        .sum_dim(0)
-        .sum_dim(2)
-        .sum_dim(3)
-        .reshape([heads]);
+    let mut grad_decay = compute_decay_vjp.then(|| {
+        ((grad_scores * gap) * scores)
+            .div(safe_decay)
+            .sum_dim(0)
+            .sum_dim(2)
+            .sum_dim(3)
+            .reshape([heads])
+    });
 
     let grad_initial_rho = initial_rho.map(|rho| {
         assert_eq!(
@@ -128,23 +339,27 @@ where
 
         grad_query =
             grad_query.clone() + grad_output.clone().matmul(rho.swap_dims(2, 3)) * state_decay;
-        grad_decay = grad_decay.clone()
-            + (grad_output.clone() * initial_context * positions)
-                .div(decay.clone().add_scalar(1.0e-12).reshape([1, heads, 1, 1]))
-                .sum_dim(0)
-                .sum_dim(2)
-                .sum_dim(3)
-                .reshape([heads]);
+        if let Some(current) = grad_decay.as_mut() {
+            *current = current.clone()
+                + (grad_output.clone() * initial_context * positions)
+                    .div(decay.clone().add_scalar(1.0e-12).reshape([1, heads, 1, 1]))
+                    .sum_dim(0)
+                    .sum_dim(2)
+                    .sum_dim(3)
+                    .reshape([heads]);
+        }
 
         state_query.swap_dims(2, 3).matmul(grad_output)
     });
 
-    DenseCausalAttentionVjp {
-        grad_query,
-        grad_value,
+    (
+        DenseCausalAttentionInputVjp {
+            grad_query,
+            grad_value,
+            grad_initial_rho,
+        },
         grad_decay,
-        grad_initial_rho,
-    }
+    )
 }
 
 fn dense_causal_attention_backward_impl<B: BackendTrait>(

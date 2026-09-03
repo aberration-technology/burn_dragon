@@ -1,0 +1,25 @@
+extends = "local-pc-1m.toml"
+
+# The verifier-terminal experiments require source buckets whose target is an
+# executable proof action. Keep that corpus contract explicit instead of
+# silently falling back to unrelated Ruliad tasks.
+[dataset]
+cache_dir = "target/datasets/local-pc-verifier-ruliad-smoke"
+config = "crates/burn_dragon_p2p/deploy/profiles/ruliad-r3.semantic-action.corpus.toml"
+
+[training.ruliad_policy_probe]
+enabled = true
+normalization = "prefix_conditional"
+candidate_symmetry = "cyclic_orbit_average"
+every_epochs = 1
+# The matrix measures one-step constrained action quality. Closed-loop proof
+# search is a separate, substantially more expensive promotion gate.
+closed_loop_every_epochs = 1000000
+items = 32
+max_steps = 16
+candidates = 4
+beam_width = 1
+scoring_batch_rows = 32
+scoring_token_budget = 32768
+scoring_pipeline_depth = 2
+stratified_difficulty_levels = 4

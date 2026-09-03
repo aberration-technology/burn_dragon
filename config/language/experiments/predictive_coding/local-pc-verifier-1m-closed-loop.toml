@@ -1,0 +1,23 @@
+extends = "local-pc-verifier-1m.toml"
+
+[dataset]
+cache_dir = "target/datasets/local-pc-verifier-ruliad-closed-loop"
+config = "crates/burn_dragon_p2p/deploy/profiles/ruliad-r3.semantic-action.closed-loop-smoke.corpus.toml"
+
+[training.ruliad_policy_probe]
+# Source capability feedback for semantic proof actions is verifier-backed by
+# this closed-loop rollout, not by teacher-conditioned training rows.
+closed_loop_every_epochs = 1
+checkpoint_capability_contract = "closed_loop_policy"
+
+[training.ruliad_policy_probe.promotion_gate]
+# Small-model ablation eligibility floor. Both optimizer arms must clear the same
+# predeclared policy gate before lexicographic checkpoint comparison is allowed.
+enabled = true
+minimum_items = 32
+minimum_solve_rate = 0.25
+minimum_goal_completion_rate = 0.40
+minimum_valid_action_rate = 0.95
+maximum_invalid_action_rate = 0.05
+maximum_repeated_state_rate = 0.50
+maximum_backtrack_rate = 0.50

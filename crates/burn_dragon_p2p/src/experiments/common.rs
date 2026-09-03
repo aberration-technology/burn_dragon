@@ -529,6 +529,10 @@ impl TokenWindowBatcher {
             }),
             summary_event_mask,
             ruliad_policy_batch: None,
+            // Sharded P2P windows are scheduled by the learner/lease runtime,
+            // not by Dragon's generated-data clock. The training backend uses
+            // its run-local update counter for scheduled objectives here.
+            absolute_step: None,
             reset_stream_state,
         }
     }
@@ -615,6 +619,8 @@ fn validation_dataset_config_for(
             .train_split_ratio
             .unwrap_or(dataset_cfg.train_split_ratio),
         validation: None,
+        ruliad_source_selection_feedback_updates_enabled: None,
+        ruliad_source_selection_cold_start_enabled: None,
         source: validation_cfg.source.clone(),
         tokenizer: dataset_cfg.tokenizer.clone(),
     }
@@ -838,6 +844,10 @@ fn insert_ruliad_source_selection_metrics(
         MetricValue::Integer(snapshot.max_difficulty_level as i64),
     );
     metrics.insert(
+        "ruliad_source_selection_active_max_difficulty_level".into(),
+        MetricValue::Integer(snapshot.active_max_difficulty_level as i64),
+    );
+    metrics.insert(
         "ruliad_source_selection_mean_difficulty_level".into(),
         MetricValue::Float(snapshot.mean_difficulty_level as f64),
     );
@@ -848,6 +858,10 @@ fn insert_ruliad_source_selection_metrics(
     metrics.insert(
         "ruliad_source_selection_max_difficulty_probability".into(),
         MetricValue::Float(snapshot.max_difficulty_probability as f64),
+    );
+    metrics.insert(
+        "ruliad_source_selection_active_max_difficulty_probability".into(),
+        MetricValue::Float(snapshot.active_max_difficulty_probability as f64),
     );
     metrics.insert(
         "ruliad_source_selection_mastered_probability".into(),

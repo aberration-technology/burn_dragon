@@ -1,22 +1,679 @@
 # Predictive Coding in Dragon Training
 
-Date: 2026-08-05
+Date: 2026-08-08
 
 ## Status
 
-This document records two separate mechanisms: canonical layer-local predictive coding and the
-older recurrent-state correction auxiliary. AdamW remains the default training algorithm. Plain
-prospective layer-local PC still trails AdamW quality and throughput; fixed prediction reaches
-backpropagation-equivalent convergence without a global backward call but is slower. Exact local
-factors now accept detached recurrent rho state and run through the production TBPTT state path.
+This document records canonical local predictive-coding solvers and the older recurrent-state
+correction auxiliary as separate mechanisms. AdamW backpropagation remains the default training
+algorithm. Fixed prediction reaches bounded held-out parity without a global backward call. It
+matches three-seed text and Ruliad terminal cross entropy under both stateless and
+document-contiguous recurrent training, but remains slower: about 62% of AdamW throughput when
+stateless and 96% in the matched open-loop matrix when eight-token recurrent factors amortize the
+local VJPs. The recurrent control also exposes a higher observed-stream training loss despite
+held-out parity, so this is not optimization-trajectory parity.
+The previously reported stateless Ruliad selector-feedback loss difference came from a closed-loop
+curriculum and did not isolate the learner. The matched stateless open-loop matrix removes that
+difference but still establishes only held-out parity, not a general quality promotion. The
+depth-batched
+layer-local prediction solver is substantially more sample efficient on a bounded modular stream,
+but its direct intermediate token supervision does not transfer to text or Ruliad. It remains an
+experimental routed-recurrence result, not a general pretraining candidate.
 
-The current positive continual-learning result belongs to a complementary system, not the PC
-derivative alone. Task-ID-free context selection, balanced sparse routing, and context-scoped
-optimizer state nearly eliminate forgetting for both backpropagation and fixed-prediction PC. That
-controlled result is recorded below; production and Ruliad promotion remain open.
-The family-aware selector used by the original result has now been replaced in the follow-up
-benchmark by causal predictive-loss discovery with sequential novelty confirmation. That result is
-also controlled benchmark evidence, not yet an automatic production Ruliad router.
+The optimizer-owning incremental schedule is now implemented as a canonical no-global-backward
+research path, including recurrent TBPTT, persistent rho, checkpoint-compatible optimizer state,
+and explicit inner-update telemetry. It did not pass the quality or throughput gate. On the matched
+byte-text control, its best screened setting was materially worse than both AdamW and exact fixed
+prediction after 128 and 512 updates. This closes an implementation gap; it does not change the
+promotion decision.
+
+Dragon also exposes a tied-weight direct Kolen-Pollack (DKP) schedule. It owns a run-local learned
+feedback bank, performs a preliminary direct-feedback update before re-evaluating the model, and
+then applies the inferred local derivative and Kolen-Pollack feedback update. Identity feedback is
+substantially better than Gaussian feedback for Dragon's shared embedding basis, but the final
+512-update CUDA gate remains worse than AdamW in validation, verifier accuracy, and throughput.
+DKP is therefore an executable research control rather than a promoted learner.
+
+The continual-learning result remains a complementary-system result. Task-ID-free context
+selection, balanced sparse routing, and context-scoped optimizer state are responsible for
+retention; layer-local prediction improves acquisition inside that system. A dense shared-state
+control forgets more under the same local derivative. AdamW remains the production default because
+neither local solver has established a quality or long-horizon continual-learning advantage.
+
+## 2026-08-08 capability and promotion contract
+
+The current evidence supports a narrower and more useful claim than "SotA." Exact fixed-prediction
+PC is a numerically faithful, no-global-backward alternative execution contract for Dragon. It has
+short-horizon quality parity with AdamW and passes native three-peer convergence contracts. It does
+not exceed AdamW in verified reasoning quality, throughput, or long-horizon continual retention.
+AdamW therefore remains the production default; exact PC is a qualified research alternative.
+
+The authoritative short-horizon comparison is now a clean-tree, five-seed CUDA replication at
+commit `1d7c362`. It used a 937,154-parameter Dragon, batch 32, 512 updates, streaming sequence
+batching, persistent rho, 64-token TBPTT, fixed holdout validation, and a static expert source
+policy. Source-selection feedback was disabled, so the learner could not change its own
+curriculum. Every trial completed under the same release-binary hash and a 75% system-memory hard
+guard. The earlier three-seed source-frozen and exogenous matrices remain useful exploratory
+controls but are no longer the provenance authority.
+
+| Matrix | Learner | Cold valid | Stream warm | Action top-1 | Solve | Goal | Free verifier | Model tok/s |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Source-frozen, 640 x 3 | AdamW | 1.122 | 0.8300 | **0.8333** | **0.5312** | **0.5196** | 0 | **20,110** |
+| Source-frozen, 640 x 3 | Exact PC | **1.106** | **0.8291** | 0.7396 | 0.4583 | 0.4692 | 0 | 14,410 |
+| Exogenous, 512 x 3 | AdamW | 1.113 | **1.015** | 0.7188 | 0.4688 | 0.4930 | 0 | **55,770** |
+| Exogenous, 512 x 3 | Exact PC | **1.085** | 1.026 | 0.7188 | 0.4688 | **0.4972** | 0 | 42,830 |
+| Exogenous, 512 x 3 | ePC | 1.113 | 1.012 | 0.7188 | 0.4479 | 0.5168 | 0 | 23,010 |
+| Clean exogenous, 512 x 5 | AdamW | **1.0889** | **1.0180** | 0.7188 | 0.4625 | 0.4958 | 0 | **55,310** |
+| Clean exogenous, 512 x 5 | Exact PC | 1.0962 | 1.0241 | **0.7313** | **0.4813** | **0.5227** | 0 | 41,704 |
+
+In the clean replication, exact-PC-minus-AdamW cold validation is
+`+0.00736 +/- 0.03633`, constrained action top-1 is `+0.0125 +/- 0.02125`, solve rate is
+`+0.01875 +/- 0.03470`, and goal completion is `+0.02689 +/- 0.05637`. Every interval includes
+zero. Both arms have zero free-rollout verifier accuracy. Exact PC is 24.6% slower in model-step
+throughput (`41,704` versus `55,310 tok/s`) and 7.4% slower end to end because identical verifier
+work dilutes the learner cost. Mean GPU utilization is 87.2% for PC and 86.7% for AdamW, with a
+95.8% median for both, which localizes the deficit to serial local-VJP work rather than CPU transfer
+or launch starvation. The earlier three-seed matrices showed the same 23% to 28% model-throughput
+deficit.
+
+A second clean-tree replication held wall time fixed at 180 seconds per arm and deferred policy,
+correctness, and sequence-state probes until after the timed region. This corrects an excluded
+predecessor run in which an epoch-four policy probe consumed the remaining budget and left every
+arm at 512 updates. The corrected matrix used the same five seeds, model, batch, stream, holdout,
+and source-policy controls, with checkpoints every 256 updates and a planned horizon of 8,192
+updates.
+
+| Fixed wall clock | Completed updates | Best holdout | Final-best | Regression | Val slope | Mean GPU util | Median GPU util |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| AdamW | **1,689.6 +/- 174.1** | 1.1273 +/- 0.0178 | **0.2103 +/- 0.0679** | **0.1861 +/- 0.0580** | **0.03426 +/- 0.00939** | 78.6% | 88.2% |
+| Exact PC | 1,280.0 | **1.0970 +/- 0.0283** | 0.2163 +/- 0.0341 | 0.1972 +/- 0.0316 | 0.04277 +/- 0.00938 | **81.1%** | **89.0%** |
+
+Exact PC reaches a lower best holdout loss in this budget: paired PC-minus-AdamW is
+`-0.03029 +/- 0.02754`. It also completes `409.6 +/- 174.1` fewer checkpointed updates. That
+best-checkpoint result is not retained. AdamW and PC end about 19% and 20% above their respective
+best losses, and both have significantly positive validation slopes. PC-minus-AdamW final-best is
+`+0.00605 +/- 0.05629`; PC therefore provides no observed stability benefit. Reasoning probes were
+deliberately excluded from the timed region, so this matrix makes no verifier-quality claim. It
+closes the clean fixed-wall-clock reproducibility gate while failing the continual-retention and
+throughput gates.
+
+The apparent fixed-wall-clock collapse is strongly learning-rate dependent. A clean paired
+five-seed repetition at `3e-4`, with every other timed control unchanged, reverses the validation
+slope for both learners:
+
+| Learning rate `3e-4` | Completed updates | Best holdout | Final-best | Regression | Val slope | Source cadence |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| AdamW | **1,740.8 +/- 142.1** | **1.0901 +/- 0.0098** | 0.1464 +/- 0.0328 | 0.1343 +/- 0.0299 | -0.00995 +/- 0.00753 | **0.6715 +/- 0.0098** |
+| Exact PC | 1,280.0 | 1.1067 +/- 0.0150 | **0.0947 +/- 0.0389** | **0.0855 +/- 0.0346** | **-0.03909 +/- 0.01123** | 0.6970 +/- 0.0064 |
+
+Relative to PC at `1e-3`, the lower rate changes endpoint holdout by
+`-0.1860 +/- 0.0477`, final-minus-best by `-0.1216 +/- 0.0419`, regression fraction by
+`-0.1117 +/- 0.0417`, and slope by `-0.08186 +/- 0.01521`. These are retained-stability gains,
+not merely a shifted optimum. In the matched `3e-4` comparison, PC-minus-AdamW slope is
+`-0.02915 +/- 0.01815`, while best loss is `+0.01667 +/- 0.01350` and source-cadence loss is
+`+0.02545 +/- 0.00851`. PC is still improving more quickly at the timed boundary, but reaches a
+slightly worse best checkpoint and learns the observed source stream less well. Endpoint loss and
+final-best differences remain statistically unresolved.
+
+The `3e-4` rate is therefore promoted as the one-million-parameter Ruliad experiment default, not
+as evidence that PC exceeds AdamW. The source contract also matters: these runs freeze capability
+feedback while retaining the corpus cold start, so training stays at difficulty 0 while the fixed
+holdout covers materialized difficulties 0 and 1. The runner now records an explicit cold-start
+override, and the next control disables the cap so train and holdout cover the same materialized
+frontier. The machine-readable rate ablation is
+`docs/experiments/predictive-coding-stability-learning-rate-ablation-20260808.json`.
+
+Native decentralization is mechanically stronger. A release three-peer, three-round, signed
+full-head run passed canonical-genesis load, exact candidate/canonical tensor parity, validation
+parity, disjoint leases, merge receipts, and a process-restart drill for all three seeds. Its
+synchronized progress ratios are `0.9035`, `0.9399`, and `0.9513` against a hard `0.90` gate. A
+six-round blockwise-INT8 DiLoCo matrix passed the same convergence threshold with endpoint ratios
+`0.9048`, `0.9299`, and `0.9413`; encoded update payloads are 25.6% of FP32. The latter test does
+not require signed peer payloads and uses tiny one-step CPU rounds, so it is protocol and
+convergence evidence, not a heterogeneous GPU throughput or Byzantine-resilience result.
+
+Browser PC revisions fail closed to observer-only because the WebGPU browser trainer does not yet
+implement the local-PC program. The remaining hard blockers are nonzero free-rollout verifier
+accuracy, retained quality beyond AdamW, AdamW throughput parity, the observed post-best validation
+regression, multi-hour retention, larger-scale replication, heterogeneous GPU-peer convergence,
+and browser WebGPU PC. Both clean five-seed fixed-token and fixed-wall-clock repetitions are
+complete. Until the remaining gates pass, neither "beyond AdamW" nor "SotA" is a supported claim.
+
+The complete machine-readable record, including provenance limitations and every promotion gate,
+is `docs/experiments/predictive-coding-capability-contract-20260808.json`; the compact clean-run
+records are `docs/experiments/predictive-coding-clean-exogenous-five-seed-20260808.json` and
+`docs/experiments/predictive-coding-clean-wall-clock-five-seed-20260808.json`.
+
+## 2026-08-08 rejected parallel-credit controls
+
+Two mechanisms that could have changed exact fixed-prediction PC beyond global-gradient parity
+were implemented, numerically tested, and rejected rather than retained as dormant configuration.
+
+The state-conditioned projected-adjoint control transported terminal credit through rank-one to
+rank-four bases built from terminal gradients, activities, terminal displacement, and residuals.
+On the 937,154-parameter four-use CUDA diagnostic, ranks one through four reached global gradient
+cosines of only `0.680`, `0.680`, `0.685`, and `0.689`; relative L2 error remained above `0.725`.
+The corresponding one-seed, 128-update verifier screen produced no free-rollout verifier solves.
+Rank one retained only 38% of AdamW model throughput and higher ranks were slower. The static basis
+therefore neither approximated the tied-depth adjoint sufficiently nor provided an efficiency win.
+
+The second control applied a backend-resident symmetric PCGrad-style reduction to conflicting
+logical-depth gradients of Dragon's shared parameters. It was inactive at initialization because
+the measured depth-factor pairs did not conflict. In a three-seed, four-task dense lifelong stream,
+it changed final accuracy by `+0.00517 +/- 0.04853` and backward transfer by
+`+0.00689 +/- 0.06471` versus exact fixed prediction, while reducing throughput by about 17.6%.
+The signs varied by seed and catastrophic forgetting remained near `0.80` for every learner.
+
+**Decision:** both controls fail their promotion gates and have been removed from the public solver
+and experiment surfaces. The retained negative-control record is
+`docs/experiments/predictive-coding-parallel-credit-negative-controls-20260808.json`. Exact fixed
+prediction remains the sole gradient-equivalent no-global-backward control; the next promotion gate
+must test sustained recurrent stability, not another short proxy.
+
+## 2026-08-07 error-coordinate PC and executable contracts
+
+`solver = "error_equilibrium"` implements error-coordinate predictive coding (ePC) as a strict
+local program. It initializes every error coordinate at zero, reconstructs activities as the
+current local prediction plus error, transports the terminal token derivative through analytic
+adjacent-layer VJPs, relaxes errors, and computes parameter derivatives from the resulting local
+factor states. The first inference step reuses the ordinary feed-forward activities, traces, and
+terminal derivative. Dragon records an execution-contract version and separate activity and
+parameter derivative mechanisms on every event; the current ePC integration declares both as
+`analytic_local` and rejects any reported global parameter backward call.
+
+Exact resume now binds a stable factor-graph fingerprint and the complete executable program:
+solver, learning schedule, parameterization, tied-weight reduction, factor reduction, inference
+steps and step size, clipping geometry, epsilon, prediction precision, and incremental update
+scale. A mismatched or missing sidecar fails an exact resume. The standard learner and Dragon's
+streaming event scheduler both write the same immutable sidecar beside every model checkpoint, and
+the run root publishes the active program identity for observers.
+
+The final release-CUDA gate used a 937,154-parameter, four-use shared Dragon, embedding 96, four
+heads, latent width 3,072, batch 32, block 128, and three paired Ruliad seeds. Source-selection
+feedback was left on for this early-optimization screen, so comparisons are paired by seed but are
+not an open-loop curriculum proof.
+
+| Updates | Learner | Validation | Source cadence | Verifier | Partial | Wall tok/s | Model tok/s | Duty |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 | AdamW | 2.083 +/- 0.129 | 2.927 +/- 0.0233 | 0.0625 +/- 0.134 | 0.248 +/- 0.302 | **57,070** | **82,520** | 0.692 |
+| 128 | Fixed prediction | **2.049 +/- 0.0473** | 2.925 +/- 0.0297 | 0.0417 +/- 0.0896 | 0.219 +/- 0.104 | 38,060 | 51,320 | 0.742 |
+| 128 | ePC, 1 x 0.1, precision 10 | 2.101 +/- 0.0944 | **2.917 +/- 0.0227** | 0.0625 +/- 0.0776 | **0.261 +/- 0.215** | 21,510 | 27,690 | 0.777 |
+| 512 | AdamW | **2.025 +/- 0.0751** | 1.380 +/- 0.0211 | 0.1875 +/- 0.0776 | 0.378 +/- 0.0514 | **67,050** | **80,600** | 0.832 |
+| 512 | Fixed prediction | 2.053 +/- 0.0638 | 1.381 +/- 0.0116 | 0.1979 +/- 0.119 | 0.377 +/- 0.0421 | 41,670 | 49,530 | **0.841** |
+| 512 | ePC, 1 x 0.1, precision 10 | 2.063 +/- 0.0393 | **1.378 +/- 0.0150** | **0.2188 +/- 0.0776** | **0.395 +/- 0.190** | 23,110 | 27,730 | 0.834 |
+
+At 512 updates, paired ePC-minus-AdamW deltas are `+0.03760 +/- 0.04341` validation,
+`-0.00184 +/- 0.01068` cadence source loss, `+0.03125 +/- 0.13447` verifier accuracy, and
+`+0.01736 +/- 0.17910` partial progress. None establishes a quality advantage. ePC retains 34.4%
+of AdamW model throughput and 56.0% of fixed-prediction throughput. Median CUDA utilization is
+92%, so this is dense serial device work rather than host starvation. Reusing the initial
+feed-forward state improved ePC model throughput by 14.4% over the first implementation, but did
+not change the promotion result.
+
+The full-size CUDA derivative diagnostic separates mechanics from learning outcome. Fixed
+prediction reaches global cosine `0.99999994`, norm ratio `0.99999988`, and relative L2
+`2.05e-4`. ePC reaches cosine `0.99960748`, norm ratio `1.000516`, relative L2 `0.02803`, and
+99.48% elementwise sign agreement while lowering its measured energy from `5.62201` to `5.61413`.
+Both make zero global backward calls. A tiny WGPU fixed-prediction diagnostic reaches cosine
+`0.99999998`; a real WGPU train step produced a complete checkpoint and an exact resume restored
+it successfully. These are portability and lifecycle checks, not WGPU throughput claims.
+
+The `mu_pc` option is a tied-weight depth-scaling research approximation: it applies explicit
+depth-aware initialization and shared-reuse derivative reduction, but does not turn Dragon into the
+full architecture and optimizer parameterization evaluated by the muPC work. Its one-million-class
+fidelity screen reduced global cosine to about `0.958` and was therefore rejected before the final
+matrix. `burn_pc` contains and tests the generic DKP-PC phase order, direct-feedback tensors,
+Kolen-Pollack updates, and tied-consensus reduction. Dragon now exposes that path using a single
+consensus update on the physical shared weights rather than pretending that each logical depth owns
+independent parameters. Its separate quality gate is recorded below.
+
+**Decision:** AdamW remains the default. Fixed prediction remains the exact no-global-backward
+control. ePC, muPC scaling, and DKP remain explicit research capabilities and do not propagate to
+P2P optimization because the local promotion gate failed. This is an intentional promotion
+boundary, not missing distributed plumbing. The machine-readable record is
+`docs/experiments/predictive-coding-error-equilibrium-20260807.json`; raw artifacts are under
+`target/pc-paper/epc-optimized-128-20260807/`,
+`target/pc-paper/epc-optimized-512-20260807/`, and
+`target/pc-wgpu-checkpoint-20260807-v5/`.
+
+## 2026-08-07 tied direct Kolen-Pollack gate
+
+`solver = "direct_kolen_pollack"` is an optimizer-owning, two-phase local program. For each factor
+chunk it:
+
+1. projects the terminal token derivative through one learned feedback matrix per logical depth;
+2. reduces the resulting logical forward-factor derivatives through damped tied consensus and
+   applies one preliminary optimizer update to Dragon's physical shared weights;
+3. re-evaluates the chunk with the updated model, performs local activity inference, and applies
+   the final analytic local parameter derivative; and
+4. updates all feedback matrices with one batched Kolen-Pollack operation.
+
+The schedule performs two physical parameter updates per chunk but no global backward call. Later
+TBPTT chunks are observed without constructing a preliminary body VJP that would be stale after an
+earlier chunk updates the shared weights; their complete DKP preparation occurs immediately before
+their optimizer boundary. Feedback is run-local training state, is included in exact checkpoints,
+and is rejected on resume if the requested solver or geometry differs. The executable checkpoint
+identity binds initialization, direct and feedback step sizes, decay, signal scale, and tied
+consensus settings.
+
+The release-CUDA screens used the same 937,154-parameter, four-use shared Dragon as the ePC matrix,
+with batch 32 and block 128. Gaussian feedback was not viable: the best tested 128-update arm
+reached validation `3.756`, compared with `2.083` for AdamW, while retaining only 17% to 21% of
+AdamW model throughput. Replacing the random feedback basis with repeated identity matrices is
+appropriate for Dragon's tied residual factors because every factor uses the same embedding
+coordinates. It materially improved the 64-update screen; the best preliminary scale was 1.0:
+
+| Initialization / transform | Preliminary scale | Feedback scale | Updates | Validation | Last train | Model tok/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Gaussian / AdamW | 0.10 | 0.001 | 128 | 3.764 | 3.709 | 17,008 |
+| Gaussian / AdamW | 0.25 | 0.010 | 128 | 3.756 | 3.669 | 14,140 |
+| Gaussian / SGD | 0.25 | 0.001 | 64 | 4.535 | 4.442 | 16,709 |
+| Gaussian / momentum | 0.25 | 0.001 | 64 | 4.972 | 4.906 | 18,682 |
+| Identity / AdamW | 0.50 | 0.001 | 64 | 3.427 | 2.593 | 17,067 |
+| Identity / AdamW | **1.00** | 0.0001 | 64 | **3.304** | **2.401** | 16,941 |
+| Identity / AdamW | 2.00 | 0.001 | 64 | 3.716 | 3.168 | 16,809 |
+
+Changing the optimizer transform does not repair the direct signal. Identity initialization is the
+dominant improvement; changing the feedback rate from `0.0001` to `0.01` changes 64-update
+validation by only `0.0233`. The selected identity setting then ran the fixed 512-update gate:
+
+| Learner | Validation | Source cadence | Verifier | Partial | Wall tok/s | Model tok/s | Duty | Mean GPU util |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| AdamW backprop | **2.109** | **1.375** | 0.0938 | **0.464** | **66,637** | **80,084** | 0.832 | 80.8% |
+| Fixed prediction | 2.078 | 1.378 | **0.2188** | 0.370 | 41,059 | 48,701 | 0.843 | 84.6% |
+| Identity DKP | 2.442 | 2.377 | 0.0313 | 0.323 | 15,401 | 16,813 | **0.916** | **89.7%** |
+
+DKP is `+0.3332` validation loss behind AdamW and retains 21.0% of AdamW model throughput. Its
+median GPU utilization is 93%, so the loss is not caused by host transfer or idle launch gaps. The
+program executes more serial useful work: the run emitted 5,632 local VJPs, 2,048 logical direct
+updates, 2,048 feedback updates, and 1,024 physical parameter applications, with zero global
+backward calls. The higher duty cycle therefore does not imply competitive examples per second.
+
+A persistent-rho recurrent smoke used batch 8, block 128, TBPTT 8, and 16 outer batches. It
+completed 1,024 direct updates, 1,024 feedback updates, and 512 physical parameter applications
+with zero global backward calls. This verifies recurrent scheduling and accounting; its short-run
+loss is not promotion evidence.
+
+**Decision:** retain tied DKP as a mechanically complete, exact-resume research solver and reject
+promotion. The scalar schedule, feedback rate, Gaussian/identity initialization, and optimizer
+transform screens do not close the directional or throughput gap. The next credible research arm
+must improve the teaching signal itself, for example by calibrating an amortized depth-local
+adjoint against periodic analytic local VJPs; another scalar sweep is not justified. DKP is not
+propagated to decentralized optimization until it passes a local multi-seed quality and wall-clock
+gate.
+
+The machine-readable record is
+`docs/experiments/predictive-coding-direct-kolen-pollack-20260807.json`. Raw artifacts are under
+`target/pc-paper/dkp-cuda-screen-20260807/`,
+`target/pc-paper/dkp-transform-screen-20260807/`,
+`target/pc-paper/dkp-identity-screen-20260807/`,
+`target/pc-paper/dkp-identity-high-screen-20260807/`,
+`target/pc-paper/dkp-identity-feedback-screen-20260807/`,
+`target/pc-paper/dkp-identity-512-gate-20260807/`, and
+`target/pc-paper/dkp-identity-tbptt-smoke-20260807/`.
+
+## 2026-08-07 optimizer-owning incremental schedule
+
+`learning_schedule = "incremental"` now performs the complete interleaved contract inside the
+optimizer boundary. One outer batch stages its ordinary feed-forward token loss, then each
+inference phase relaxes plain-backend activities, computes local parameter VJPs, and immediately
+applies the configured optimizer transform. No global autodiff graph is retained and no global
+backward call occurs. The first prepared factor chunk is retained across the `TrainStep` boundary
+instead of being recomputed. Later TBPTT chunks are initialized after preceding parameter updates,
+so this optimization does not stale the recurrent schedule.
+
+The mode is intentionally constrained to synchronous-equilibrium and reverse-Gauss-Seidel activity
+solvers. Fixed prediction and layer-local prediction do not have an inferred-activity schedule;
+predictive-context routing has context-scoped optimizer ownership and therefore rejects incremental
+updates until that lifecycle has an explicit interleaving contract. The per-phase learning-rate
+multiplier is explicit as `incremental_parameter_step_scale`. AdamW is the default transform over
+the supplied local derivatives. SGD, momentum, and diagonal-natural transforms remain available
+for controlled local-derivative experiments without reviving the retired
+`optimizer.name = "predictive_coding"` spelling.
+All local-PC schedules require one microbatch per optimizer boundary. Static validation enforces
+that rule, and the post-autotune backend guard rechecks it after target-effective-batch resolution
+so startup calibration cannot silently introduce gradient accumulation into an optimizer-owning
+schedule.
+`config/language/experiments/predictive_coding/pc-incremental-rgs-research.overlay.toml` reproduces
+the selected research setting and is labeled with the failed promotion decision.
+
+The release-CUDA screen uses a 934,082-parameter byte-text Dragon, four shared layer uses,
+embedding 96, four heads, latent width 3,072, batch 32, block 128, seed 20260807, AdamW at `1e-3`,
+and the same fixed holdout. The 128-update activity-step sweep uses one reverse-Gauss-Seidel
+inference phase and prediction precision 1.0:
+
+| Activity step | Mean validation | Last train | Wall tok/s |
+| ---: | ---: | ---: | ---: |
+| AdamW backprop | **1.907900** | 1.773869 | **68,110** |
+| Fixed prediction | 1.906472 | **1.770997** | 40,049 |
+| 0.05 | 2.230353 | 2.211642 | 20,381 |
+| 0.10 | 2.175545 | 2.145799 | 19,886 |
+| 0.15 | 2.141109 | 2.101535 | 19,720 |
+| 0.20 | **2.118712** | **2.069632** | **20,103** |
+| 0.30 | 2.315949 | 2.310610 | 19,581 |
+| 0.40 | 2.477698 | 2.473005 | 19,673 |
+| 0.50 | 2.819739 | 2.836612 | 19,265 |
+
+The stable optimum is near 0.2, but it remains `+0.21081` validation loss behind AdamW. The
+selected setting was then repeated with the final first-chunk reuse and corrected profiling
+implementation. The 512-update gate uses those final-executable measurements:
+
+| Learner | Mean validation | Last train | Wall tok/s | Mean GPU util | Mean power |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| AdamW backprop | 1.625484 | 1.455252 | **71,321** | 78.8% | 42.4 W |
+| Fixed prediction | **1.625285** | **1.441956** | 44,445 | 83.9% | 39.7 W |
+| Incremental RGS, 1 x 0.2 | 1.907750 | 1.749204 | 23,445 | 88.2% | 39.9 W |
+
+Incremental PC is `+0.28227` validation loss behind AdamW and retains 32.9% of its wall throughput.
+First-chunk reuse improves its measured wall throughput by about 20% over the initial 19.5k-token/s
+implementation, without approaching parity.
+The high GPU utilization is not evidence of useful-work parity: the schedule serializes local
+activity transport, parameter VJPs, and an optimizer update. Fixed prediction retains 62.3% of
+AdamW throughput and preserves convergence parity, consistent with the earlier matrices.
+
+The full 937,154-parameter gradient-fidelity diagnostic explains the failure. The language-head
+derivative is nearly exact immediately, while credit reaching the shared body is attenuated and
+then changes direction as the activity step grows:
+
+| Activity step | Global cosine | Norm ratio | Shared encoder cosine | Shared value cosine | Head cosine |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.30 | **0.3582** | 0.2024 | **0.4218** | **0.4108** | 0.9998 |
+| 0.40 | 0.3467 | 0.2252 | 0.2436 | 0.2254 | 0.9996 |
+| 0.50 | 0.2743 | 0.2783 | 0.0776 | 0.0543 | 0.9994 |
+| 0.60 | 0.1684 | 0.3849 | -0.0414 | -0.0679 | 0.9991 |
+
+This is a depth-credit problem, not a bad terminal derivative or a missing AdamW moment transform.
+Prediction-precision and outer-learning-rate screens did not repair it. A diagonal-natural
+transform over exact fixed-prediction derivatives also failed: its best 128-update setting used
+learning rate 0.003 and reached validation `2.25799`, versus `1.90647` for fixed-PC AdamW, at
+essentially the same 41k token/s local-VJP throughput. Those transforms are retained as explicit
+research controls, not defaults.
+
+Telemetry now distinguishes outer optimizer steps from actual parameter applications. A recurrent
+CUDA smoke with batch 4, block 128, TBPTT 8, two inference phases, and persistent rho emitted 16
+chunks and 32 parameter updates per outer step, with zero global backward calls. Its corrected
+stage profile reports four outer train steps, 2,048 tokens, separate local-learning and optimizer
+time, and `accounted_fraction = 0.9859`; the former chunk-multiplied token count and overlapping
+timers are fixed. Legacy ECS events deserialize the new count as zero, and dashboards and the paper
+analyzer expose it directly.
+The exact fixed-PC and masked-TBPTT numerical tests use host-generated deterministic matrix
+fixtures while preserving Burn parameter IDs and gradient flags at a fixed nondegenerate scale. This
+removes interference from NdArray's process-global seed during parallel tests without weakening
+their original loss or gradient tolerances; the complete 607-test language suite passes under the
+normal parallel test runner.
+
+**Decision:** retain incremental PC as a mechanically complete research mode and reject it for
+promotion. AdamW remains the production default. Fixed prediction remains the exact no-global-
+backward control. The current evidence does not support a claim that PC is beyond AdamW; it rules
+out interleaving, scalar precision changes, and diagonal preconditioning as sufficient fixes. A
+future candidate must first pass a shared-body gradient-fidelity gate without a serial full-depth
+reverse wave, then beat the fixed holdout and throughput gates before any long-run claim is made.
+
+The machine-readable record is
+`docs/experiments/predictive-coding-incremental-20260807.json`. Raw artifacts are under
+`target/pc-incremental-byte-128-*-20260807/`,
+`target/pc-incremental-byte-512-gate-20260807/`,
+`target/pc-incremental-byte-final-gate-20260807/`,
+`target/pc-fixed-diagonal-natural-128-screen-20260807/`, and
+`target/pc-incremental-accounting-smoke-20260807/`.
+
+## 2026-08-06 stateless open-loop solver control
+
+The live Ruliad selector is intentionally a closed-loop controller: losses and verifier feedback
+change subsequent source probabilities. That is useful for training, but it invalidates a paired
+solver comparison once the learners produce different feedback. `dataset.ruliad_source_selection_feedback_updates_enabled = false`
+now freezes those updates while preserving deterministic source selection and unbounded source
+generation. The run manifest records the override explicitly. A conformance test constructs two
+independent datasets, applies opposing losses for 32 steps, and requires identical token-and-mask
+fingerprints at every step, unchanged selector snapshots, and at least 24 distinct batches.
+Fingerprints also cover streamed document boundaries and are computed only on request, outside the
+loader hot path. All six completed checkpoints at each budget also have one byte-identical
+source-selector state digest across learners and seeds.
+
+The release-CUDA matrix uses the canonical 891,266-parameter Ruliad model, four shared layer uses,
+embedding 96, four heads, latent width 3,072, batch 32, block 128, seeds 20260804/5/6, AdamW at
+`1e-3`, and the fixed holdout. Intervals are two-sided 95% Student-t intervals; deltas are paired by
+seed. Every arm consumes the same open-loop stream for its seed.
+
+| Updates | Learner | Validation objective | Last validation | Source loss | Verifier accuracy | Tokens/s |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 128 | AdamW backprop | 1.9990 +/- 0.0632 | 2.0142 +/- 0.0977 | 0.9209 +/- 0.0677 | 0.1562 +/- 0.3558 | 57,002 +/- 1,288 |
+| 128 | Fixed prediction | 1.9982 +/- 0.0387 | 2.0179 +/- 0.0272 | 0.9276 +/- 0.0839 | 0.0833 +/- 0.2241 | 38,000 +/- 756 |
+| 512 | AdamW backprop | 2.0307 +/- 0.0734 | 1.8777 +/- 0.0409 | 0.2343 +/- 0.0077 | 0.2396 +/- 0.2726 | 69,100 +/- 3,851 |
+| 512 | Fixed prediction | 2.0561 +/- 0.0628 | 1.8892 +/- 0.1024 | 0.2364 +/- 0.0327 | 0.2604 +/- 0.0448 | 42,643 +/- 1,425 |
+
+At 512 updates, fixed prediction minus backpropagation is `+0.02541 +/- 0.12423` validation
+objective, `+0.00209 +/- 0.02503` source loss, `+0.02083 +/- 0.27265` verifier accuracy, and
+`+0.00260 +/- 0.22383` partial progress. None resolves a quality difference. This corrects the old
+closed-loop selector-loss interpretation: there is no evidence that fixed prediction intrinsically
+worsens source loss. Fixed prediction retains 61.7% of AdamW token throughput in this stateless
+geometry. Its median GPU utilization remains 90-91%, but it executes a serial reverse wave of local
+VJPs; higher utilization therefore does not imply equivalent useful work.
+
+The 937,154-parameter CUDA fidelity control reports zero terminal-loss error, gradient cosine
+`0.999999988`, norm ratio `0.9999967`, relative L2 error `2.01e-4`, six local VJP calls, and zero
+global backward calls. A 16-update serialized-model test also keeps fixed prediction within
+`2e-4` loss of backpropagation after every optimizer step. This supports numerical and bounded
+convergence parity, but not bitwise trajectory identity.
+
+One prospective precision-balancing candidate was rejected before inclusion in the training
+matrix. Inverse residual-variance weighting reduced eight-step CUDA gradient cosine from `0.4321`
+to `0.2202` on the 937,154-parameter synchronous-equilibrium diagnostic and suppressed internal
+gradient norms. The implementation and config surface were removed rather than retained as an
+unpromoted mode.
+
+The machine-readable record is
+`docs/experiments/predictive-coding-open-loop-20260806.json`. Raw artifacts are under
+`target/pc-local-solver-open-loop-20260806/`. Reproduce with:
+
+```bash
+scripts/pc_paper_experiments.sh --matrix local-solver-open-loop
+```
+
+## 2026-08-06 trace-aware recurrent open-loop control
+
+The fixed-prediction reverse wave now consumes the exact post-threshold, post-ReLU, post-mask
+projection activations retained in each Dragon layer trace. It no longer recomputes the x and y
+low-rank projections merely to recover derivative support. The kernel API preserves the existing
+single-weight-batch restriction and remains equivalent for binary, fractional, and signed masks;
+an NdArray test compares both input and weight VJPs against projection recomputation. On the
+937,154-parameter release-CUDA fidelity geometry, the optimized path is unchanged: loss error is
+zero, global gradient cosine is `0.9999999878`, norm ratio is `0.99999669`, relative L2 error is
+`2.007e-4`, and the solver makes zero global backward calls.
+
+A same-seed 512-update stateless A/B screen moved wall throughput from 43,304 to 43,371 tokens/s
+and model-compute throughput from 49,832 to 49,992 tokens/s (`+0.15%` and `+0.32%`). Local-learning
+time fell from 42.084 s to 41.950 s. This single-seed change is directionally consistent with
+removing redundant projections, but is too small to resolve from run variance by itself.
+
+The first recurrent matrix exposed an objective mismatch rather than a learner difference. AdamW
+formed a masked mean inside each TBPTT chunk and then weighted that mean by raw chunk length. Fixed
+prediction weighted by the number of supervised tokens. Sparse Ruliad masks therefore let a chunk
+with one target contribute as much as a chunk with many targets in the AdamW path. A one-seed
+block-backward control, which computes the globally masked objective, matched fixed prediction:
+source loss `2.8914` versus `2.8950`, cold validation `2.3727` versus `2.3702`, and stream-warm
+validation `1.3823` versus `1.3812`. The old chunked AdamW source loss was `2.6302`; its apparent
+fitting advantage was not comparable.
+
+Chunked AdamW now treats token cross entropy and time-local regularizers separately. Cross entropy
+is weighted by supervised-token count over the complete block, while auxiliary objectives retain
+their prior raw-time weighting. This remains memory-bounded TBPTT and adds no host synchronization.
+An exact NdArray regression compares the chunked loss and every active parameter-gradient family
+against a globally masked objective with detached recurrent boundaries, including chunks with zero
+supervised tokens.
+
+The objective-aligned recurrent matrix uses the same 891,266-parameter model as the stateless
+control, batch 32, block 128, streaming document batches, persistent detached rho, and eight-token
+TBPTT factors. AdamW and fixed prediction run for 128 and 512 updates over seeds 20260804/5/6.
+Source selection feedback, continual backpropagation, neuron scaling, and dynamics controllers are
+disabled. The source-selector checkpoint digest is byte-identical across all six trials at each
+budget (`82dab4ac...dfbe` at 128 and `b9685bde...1c08` at 512), establishing the same open-loop
+curriculum state.
+
+| Updates | Learner | Cold validation | Stream warm | Source cadence loss | Verifier | Partial progress | Wall tok/s | Model tok/s | Duty |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 | AdamW backprop | 2.366 +/- 0.0247 | 1.364 +/- 0.0399 | 2.875 +/- 0.0716 | 0.1146 +/- 0.0448 | 0.4392 +/- 0.0149 | 11,624 +/- 774 | 13,309 +/- 811 | 0.8734 +/- 0.0061 |
+| 128 | Fixed prediction | 2.344 +/- 0.0681 | 1.354 +/- 0.0745 | 2.873 +/- 0.0793 | 0.1146 +/- 0.1616 | 0.4028 +/- 0.0862 | 10,946 +/- 595 | 12,709 +/- 630 | 0.8612 +/- 0.0047 |
+| 512 | AdamW backprop | 2.113 +/- 0.0843 | 1.111 +/- 0.0449 | 1.349 +/- 0.0133 | 0.2500 +/- 0.2054 | 0.3767 +/- 0.1950 | 12,275 +/- 177 | 13,035 +/- 183 | 0.9417 +/- 0.0021 |
+| 512 | Fixed prediction | 2.133 +/- 0.0812 | 1.123 +/- 0.0414 | 1.343 +/- 0.0303 | 0.2188 +/- 0.2054 | 0.3464 +/- 0.1822 | 11,672 +/- 56 | 12,573 +/- 68 | 0.9283 +/- 0.0027 |
+
+At 512 updates, fixed prediction minus AdamW is `+0.02056 +/- 0.07188` fixed-holdout validation,
+`+0.01298 +/- 0.03372` stream-warm validation, `+0.00262 +/- 0.00427` rho-carry NLL gain,
+`-0.03125 +/- 0.35577` verifier accuracy, and `-0.03038 +/- 0.31472` partial progress. These
+intervals cross zero. The paired first-pass streaming loss is a small exception: fixed prediction
+is worse by `+0.02284 +/- 0.01355`. Three seeds are too few to promote that into a broad quality
+claim, but it is a real bounded disadvantage to track in longer studies.
+
+The sampled-stream objective is aligned: cadence-mean source loss differs by
+`-0.00555 +/- 0.02313` and final train loss by `-0.01022 +/- 0.03399`. Fixed prediction retains
+`95.09% +/- 1.74%` wall throughput and `96.46% +/- 1.63%` model-compute throughput. Its mean GPU
+utilization and power are 72.8% and 35.1 W versus AdamW's 77.8% and 37.4 W on this GB10. The
+defensible result is objective and most held-out metrics at near-throughput parity, with a small
+cold-stream caveat, not a stronger optimizer. AdamW remains the default.
+
+The objective-aligned machine-readable record is
+`docs/experiments/predictive-coding-recurrent-objective-aligned-20260806.json`. The original
+record is retained as diagnosis of the invalid chunk-weighted control. Raw corrected artifacts are
+under `target/pc-recurrent-objective-aligned-20260806/`. Reproduce with:
+
+```bash
+scripts/pc_paper_experiments.sh --matrix local-solver-recurrent-open-loop
+```
+
+## 2026-08-06 depth-batched layer-local prediction
+
+`solver = "layer_local_prediction"` attaches a next-token factor to every shared Dragon layer use.
+Intermediate activities are detached. Layer depth is folded into the batch axis, producing one
+batched head VJP, one batched shared-body VJP, and one embedding VJP per update. Shared-body credit
+is summed over the physical uses of Dragon's shared weights; the shared readout is averaged over
+the auxiliary local readouts. The terminal loss and supervised-token count remain exactly the
+ordinary masked terminal cross entropy. Recurrent rho continuation is the ordinary feed-forward
+terminal state, so TBPTT does not carry transient inferred activities.
+
+The full 891,266-parameter CUDA geometry reports terminal-loss error below `5e-7`, gradient norm
+ratio `1.012`, and global cosine `0.6222` against terminal backpropagation. The modest cosine is
+expected: this is a layer-local semi-gradient with direct supervised factors, not an approximation
+to the terminal derivative. A small CPU geometry reaches cosine `0.9531`, showing that similarity
+depends on depth and operating point. The implementation makes zero global backward calls.
+
+The release-CUDA continual matrix uses four shared layer uses, embedding 96, four heads, latent
+width 3,072, batch 16, block 16, modulus 32, four sequential recurrence tasks, four holdout batches,
+and paired seeds 17/29/43/59/71. Train and holdout initial conditions are disjoint. Both learners use
+learning rate `0.003`, the same model initialization, token stream, sparse masks, and context-scoped
+optimizer lifecycle. Intervals are two-sided paired or per-arm 95% Student-t intervals.
+
+| Updates/task | Learner | Acq | Final accuracy | Mean forgetting | Tokens/s |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 128 | AdamW backprop | 5/5 | 0.4952 +/- 0.1037 | 0.0198 +/- 0.0225 | 23,843 +/- 590 |
+| 128 | Layer-local PC | 5/5 | **0.7692 +/- 0.0626** | 0.0175 +/- 0.0232 | 22,758 +/- 275 |
+| 256 | AdamW backprop | 5/5 | 0.7241 +/- 0.1348 | 0.0102 +/- 0.0159 | 23,242 +/- 485 |
+| 256 | Layer-local PC | 5/5 | **0.9876 +/- 0.0107** | 0.0043 +/- 0.0038 | 22,495 +/- 691 |
+
+At 128 updates, the paired layer-local accuracy delta is `+0.2740 +/- 0.0627`; at 256 it is
+`+0.2635 +/- 0.1363`. Every paired seed has the same positive direction. Forgetting differences
+cross zero at both budgets. Layer-local PC retains 95.5% and 96.8% of backpropagation throughput,
+respectively, while making three local VJP launches per update and no global backward call.
+
+The dense shared-state control prevents an intrinsic-PC claim. At 128 updates, dense AdamW and
+dense layer-local PC reach `0.2786` and `0.2956` accuracy, a paired delta of only
+`+0.0170 +/- 0.0603`. Layer-local mean forgetting is worse (`0.9296` versus `0.5318`). Sparse
+context isolation is therefore part of the successful training system rather than an optional
+evaluation convenience.
+
+Long-budget testing exposed and resolved a selector failure. A fixed sequential novelty threshold
+eventually treated a stationary hard sample as a new task; conservative calibration avoided that
+false positive but under-discovered contexts at the shorter budget. The router now evaluates one
+deterministic unallocated reserve subnetwork only after every existing expert rejects a prefix. A
+new context is confirmed only if that reserve is within the best expert's calibrated loss scale.
+With the responsive calibration, both 128- and 256-update five-seed matrices discover exactly four
+contexts with selector accuracy 1.0 and no duplicate allocation. Rejected reserve tests update the
+selected expert's calibration, and the production probe does not materialize checkpoint state.
+Automatic least-recently-used replacement is no longer the default because a full bank has no true
+unallocated control.
+
+The machine-readable result is
+`docs/experiments/predictive-coding-layer-local-20260806.json`. Raw reports are under
+`target/pc-layer-local-20260806/`. This is strong bounded structured-recurrence evidence, not a
+state-of-the-art claim. Longer context churn, larger models, longer horizons, and decentralized
+synchronization remain required promotion gates.
+The text/Ruliad and bounded TBPTT gates below reject general promotion of this layer-local objective.
+
+## 2026-08-06 fixed-holdout and recurrent promotion gate
+
+This gate tests whether the structured-recurrence result transfers to ordinary autoregressive text
+and live Ruliad data. Every arm uses the same 891,266-parameter shared-layer Dragon, embedding 96,
+four heads, latent width 3,072, batch 32, block 128, three paired seeds, and a fixed validation
+holdout. Intervals are two-sided 95% Student-t intervals. The byte-text corpus contains 1,114,624
+raw-byte tokens from pinned Tiny Shakespeare, split into 1,960 train and 217 validation documents
+of 512 tokens. Ruliad uses the production live source selector, but 512 updates remain inside its
+difficulty-0 cold start; these runs test acquisition and solver correctness, not curriculum scaling.
+
+Stateless 512-update results:
+
+| Dataset | Learner | Cold validation | Tokens/s |
+| --- | --- | ---: | ---: |
+| Ruliad | AdamW backprop | 2.0849 +/- 0.0494 | 64,572 +/- 2,528 |
+| Ruliad | Fixed-prediction local VJP | 2.0652 +/- 0.0760 | 40,401 +/- 2,037 |
+| Ruliad | Layer-local prediction | 2.1293 +/- 0.0438 | 33,552 +/- 607 |
+| Byte text | AdamW backprop | 1.6300 +/- 0.0272 | 67,394 +/- 1,137 |
+| Byte text | Fixed-prediction local VJP | 1.6234 +/- 0.0115 | 41,618 +/- 1,644 |
+| Byte text | Layer-local prediction | 1.7613 +/- 0.0402 | 34,600 +/- 847 |
+
+Fixed prediction is statistically at parity with AdamW on both holdouts, but retains only 61.8-62.6%
+of throughput. Layer-local prediction is materially worse on text and offers no Ruliad advantage;
+the same intermediate token target that helps the modular stream is therefore not a general local
+credit-assignment objective. A learning-rate screen from `3e-4` through `1e-2` and a terminal-head
+negative control did not remove the text regression.
+
+The recurrent gate uses eight-token factors, retains detached rho across contiguous 512-token
+documents, resets at document boundaries, and evaluates both random-cold and stream-warm holdouts.
+The loader now masks the final partial next-token pair instead of crossing into the next document.
+
+| Dataset | Learner | Cold validation | Stream warm | Tokens/s |
+| --- | --- | ---: | ---: | ---: |
+| Ruliad | AdamW backprop | 2.1009 +/- 0.0929 | 1.0885 +/- 0.0314 | 12,779 +/- 424 |
+| Ruliad | Fixed-prediction local VJP | 2.0979 +/- 0.0785 | 1.0913 +/- 0.0508 | 11,969 +/- 136 |
+| Byte text | AdamW backprop | 1.6287 +/- 0.0169 | 1.6118 +/- 0.0209 | 12,509 +/- 242 |
+| Byte text | Fixed-prediction local VJP | 1.6260 +/- 0.0034 | 1.6092 +/- 0.0096 | 11,804 +/- 22 |
+
+On byte text, fixed prediction minus AdamW is `-0.0027 +/- 0.0170` cold NLL and
+`-0.0025 +/- 0.0129` stream-warm NLL. It reaches 94.4% of AdamW throughput with zero global
+backward calls. Matched continuation probes show positive rho carry for both learners: AdamW gains
+`0.01734 +/- 0.00166` NLL (`1.066% +/- 0.099%`) and fixed prediction gains
+`0.01735 +/- 0.00287` (`1.068% +/- 0.183%`). On Ruliad, AdamW gains
+`0.02320 +/- 0.01092` NLL and fixed prediction gains `0.02527 +/- 0.01829`; the paired carry-gain
+delta is `+0.00207 +/- 0.01063`. Fixed prediction is therefore at parity on both the warm objective
+and measured benefit from carried rho, while retaining 93.7% of AdamW throughput.
+
+The Ruliad recurrent arms tie on cold/warm loss and carry. Verifier and partial-progress deltas are
+too noisy to resolve with three seeds. Fixed prediction has materially higher latest
+cadence-aligned loss fed to live source selection:
+`0.5271 +/- 0.1412` versus `0.1401 +/- 0.0128`, with paired delta
+`+0.3870 +/- 0.1539`. This top-level event field is the sampled training loss supplied to the
+selector, not a bucket EMA or a verifier score. Because that experiment let feedback alter later
+training samples, the delta does not identify a solver effect; the open-loop control above removes
+it. No bounded result here shows better
+long-horizon retention, verifier correctness, or wall-clock quality than AdamW.
+
+The machine-readable record is
+`docs/experiments/predictive-coding-generalization-20260806.json`. Raw local artifacts are under
+`target/pc-fixed-stateless-*`, `target/pc-fixed-recurrent-ruliad-maskfix-*-20260806`, and
+`target/pc-fixed-recurrent-byte-text-512-20260806`. The decision is to keep AdamW as default,
+retain fixed prediction as the exact no-global-backward research path, and keep layer-local
+prediction out of general language/Ruliad profiles.
+
+Reproduce the canonical matrices with:
+
+```bash
+scripts/pc_paper_experiments.sh --matrix local-solver-promotion
+scripts/pc_paper_experiments.sh --matrix local-solver-recurrent
+scripts/pc_paper_experiments.sh \
+  --matrix local-solver-recurrent \
+  --profile config/language/experiments/predictive_coding/local-pc-byte-text-1m.toml
+```
+
+`local-solver-recurrent` explicitly records streaming batching, persistent state, chunk size, and
+matched carry-probe settings in each trial manifest.
 
 ## 2026-08-04 Lifelong Context-Routing Result
 
@@ -133,10 +790,10 @@ The first context-selector follow-up also failed: a generic token-transition has
 provide a stable novelty margin. That negative result is retained as evidence against fixed random
 descriptors, but it has been superseded by the causal predictive-loss selector described below.
 
-**Decision:** the supported local-PC solver surface remains synchronous equilibrium,
-reverse-Gauss-Seidel, and fixed prediction. Fixed prediction is the numerical/convergence control;
-the other two are research controls. No tested PC derivative beats matched backpropagation on both
-quality and throughput, and there is no state-of-the-art claim.
+**Decision at the time of this screen:** the supported local-PC solver surface was synchronous
+equilibrium, reverse-Gauss-Seidel, and fixed prediction. Fixed prediction was the
+numerical/convergence control; the other two were research controls. The 2026-08-06 section records
+the later layer-local solver and supersedes this historical surface decision.
 
 Raw feedback-screen reports are under `target/pc-feedback-screen-20260805/`.
 
@@ -928,8 +1585,9 @@ scripts/pc_paper_analyze.py \
 The analyzer writes:
 
 - `normalized_summary.csv`: normalized legacy summary rows
-- `summary_by_arm.csv`: mean and 95% CI by iteration count and arm
-- `paired_deltas.csv`: paired seed deltas for AdamW+PC minus AdamW
+- `summary_by_arm.csv`: mean and 95% CI by matrix, backend, profile, iteration count, batch size,
+  and arm
+- `paired_deltas.csv`: paired seed deltas only across exactly matched experimental contexts
 - `event_run_summary.csv`: final event-stream metrics per generated run
 - `source_bucket_summary.csv`: final source-selection bucket telemetry when present
 - `gpu_summary.csv`: GPU utilization and power summaries
@@ -938,7 +1596,7 @@ The analyzer writes:
 
 Primary outcome metrics:
 
-- validation loss at fixed tokens
+- random-cold, stream-warm, and matched carry validation loss at fixed tokens
 - validation loss at fixed wall clock
 - ruliad source loss
 - normalized and mean source difficulty
@@ -956,9 +1614,59 @@ Efficiency metrics:
 Statistical rules:
 
 - Use paired seed deltas for AdamW+PC vs AdamW.
-- Report mean, standard deviation, and 95% CI.
+- Report mean, standard deviation, and two-sided 95% Student-t intervals for small matrices.
 - Keep fixed-token and fixed-wall-clock conclusions separate.
 - Do not claim improvement unless quality and wall-clock results both support it.
+
+## Residual-Conditioned Adjoint Promotion (2026-08-08)
+
+This promotion slice tests whether Dragon can remove the serial reverse-depth local-VJP wave by
+learning each layer-output adjoint from terminal credit and a model-owned trace feature. The generic
+`burn_pc` predictor has an exact residual identity base plus independent static and conditioned
+linear corrections. Dragon supplies either the local residual or terminal displacement, owns the
+checkpoint geometry, and fingerprints the complete predictor/warmup/cadence contract. A configured
+warmup uses exact local teachers on every update before entering its sparse refresh cadence.
+
+The selected fixed-token matrix used the CUDA backend, the 1M-class local-PC profile, block size
+128, batch size 32, 512 updates, three paired seeds, a fixed holdout, open-loop source selection,
+and no TBPTT. Values are means with two-sided 95% Student-t intervals.
+
+| Arm | Cold validation CE | Source cadence CE | Verifier accuracy | Partial progress | Wall tok/s | Model tok/s | Duty |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| AdamW | 2.019 +/- 0.0646 | 1.262 +/- 0.0375 | 0.1458 +/- 0.179 | 0.3490 +/- 0.221 | 63,840 +/- 5,300 | 76,790 +/- 5,840 | 0.8313 +/- 0.0069 |
+| Exact fixed-prediction PC | 2.062 +/- 0.100 | 1.265 +/- 0.0296 | 0.1146 +/- 0.162 | 0.3099 +/- 0.174 | 39,360 +/- 1,830 | 46,890 +/- 2,000 | 0.8394 +/- 0.0056 |
+| Residual adjoint, teacher every 2 | 2.041 +/- 0.111 | 1.299 +/- 0.0152 | 0.1667 +/- 0.0448 | 0.3507 +/- 0.0395 | 28,850 +/- 1,010 | 39,050 +/- 1,830 | 0.7389 +/- 0.0087 |
+| Residual adjoint, warmup 64/every 16 | 2.080 +/- 0.125 | 1.310 +/- 0.0267 | 0.1979 +/- 0.0448 | 0.3168 +/- 0.140 | 32,410 +/- 2,040 | 46,140 +/- 2,770 | 0.7025 +/- 0.0020 |
+
+The warmup-64/every-16 arm has a `+0.0521 +/- 0.162` paired verifier delta versus AdamW, but its
+validation CE delta is `+0.0615 +/- 0.110`, source cadence CE is worse, and wall throughput is about
+49% lower. This is directional verifier evidence, not a resolved quality advantage. It remains a
+research arm; neither the production default nor the P2P protocol changes.
+
+The tensorized first-order residual-Jacobian approximation is retained only as an explicit negative
+control. At 128 updates across three seeds it reached `2.710 +/- 0.257` validation CE, zero verifier
+accuracy, and 22,240 wall tok/s. Per-layer normalization makes the assumed near-identity product
+approximation invalid for the current Dragon factorization.
+
+Batch scaling shows that the bottleneck is kernel/intermediate traffic rather than insufficient
+batch memory. These are 64-update, single-seed CUDA screens; all observed peaks remained below
+22.4 GB.
+
+| Arm | Batch | Wall tok/s | Model tok/s | Peak host/shared memory |
+| --- | ---: | ---: | ---: | ---: |
+| AdamW | 32 | 44,540 | 76,050 | 9.64 GB |
+| AdamW | 64 | 54,250 | 77,070 | 12.65 GB |
+| AdamW | 128 | 60,670 | 78,130 | 15.45 GB |
+| Exact fixed-prediction PC | 32 | 32,430 | 48,340 | 8.31 GB |
+| Exact fixed-prediction PC | 64 | 35,610 | 47,150 | 9.21 GB |
+| Exact fixed-prediction PC | 128 | 35,820 | 44,520 | 11.51 GB |
+| Residual adjoint, teacher every 2 | 64 | 26,830 | 39,090 | 14.64 GB |
+| Residual adjoint, teacher every 2 | 128 | 24,900 | 34,600 | 22.36 GB |
+
+Canonical artifacts are under
+`target/pc-paper/adjoint-promotion-512x3-combined-20260808`,
+`target/pc-paper/first-order-adjoint-128x3-20260808`, and the
+`target/pc-paper/{local-pc,amortized}-batch*-64-20260808` directories.
 
 ## Claim Boundary
 
@@ -983,6 +1691,23 @@ Supported by current evidence:
    result without a family-specific descriptor.
 10. Exact local-PC factors carry detached linear-attention rho through TBPTT and match the
     corresponding stateful autodiff/numerical contracts.
+11. Fixed-prediction local VJPs match bounded three-seed AdamW held-out loss on text and Ruliad
+    data without a global autodiff graph; matched open-loop recurrent eight-token factors retain
+    about 96% of AdamW throughput, although their observed-stream training loss remains higher.
+12. Matched byte-text and Ruliad continuation probes show positive rho carry gain under both AdamW
+    and fixed-prediction learning; neither paired carry-gain delta resolves a solver difference.
+13. Direct layer-local next-token supervision does not transfer to general text or Ruliad in the
+    current form and should not be promoted outside the routed modular-recurrence experiment.
+14. Tied direct Kolen-Pollack training runs end to end without a global backward call, preserves
+    feedback and recurrent state across exact resume, and executes densely on CUDA. Identity
+    feedback improves its short-run convergence, but does not make it competitive.
+15. Residual-conditioned adjoint prediction has an exact identity initialization, checkpointed
+    warmup/cadence semantics, and no hidden global backward path. Its three-seed verifier direction
+    is promising but its CE and throughput do not clear promotion gates.
+16. Increasing batch size from 64 to 128 does not improve exact or amortized local-PC model
+    throughput, so the current performance gap is not explained by batch starvation.
+17. The first-order residual-Jacobian suffix approximation is numerically well-defined but is an
+    unsuitable solver for Dragon's normalized factors and is retained only as a negative control.
 
 Not yet supported:
 
@@ -995,9 +1720,11 @@ Not yet supported:
 6. The historical recurrent-state replay auxiliary is layer-local PC or parallelizes credit
    assignment across Dragon layers.
 7. The predictive context bank is ready as a default Ruliad routing policy; production still lacks
-   run-scoped subnetwork/optimizer checkpoint integration and a Ruliad holdout promotion matrix.
+   long-horizon Ruliad routing promotion and decentralized checkpoint/synchronization evidence.
 8. Fixed-prediction PC exceeds matched Backpropagation throughput or establishes a quality advantage
    away from the controlled benchmark's ceiling.
+9. Direct Kolen-Pollack feedback matches AdamW quality or throughput on Dragon. The current selected
+   arm reaches 21.0% of AdamW model throughput and is materially worse at the 512-update gate.
 
 ## Acceptance Gate For An arXiv Submission
 

@@ -740,6 +740,14 @@ impl RuliadFrontierSampler {
             })
             .sum::<f32>();
         let max_difficulty_level = self.max_difficulty_level();
+        let active_max_difficulty_level = probs
+            .iter()
+            .zip(&self.candidates)
+            .filter_map(|(prob, candidate)| {
+                (*prob > ACTIVE_PROBABILITY_EPSILON).then_some(candidate.difficulty_level)
+            })
+            .max()
+            .unwrap_or(0);
         let mean_difficulty_level = probs
             .iter()
             .zip(&self.candidates)
@@ -755,6 +763,13 @@ impl RuliadFrontierSampler {
             .zip(&self.candidates)
             .filter_map(|(prob, candidate)| {
                 (candidate.difficulty_level == max_difficulty_level).then_some(*prob)
+            })
+            .sum::<f32>();
+        let active_max_difficulty_probability = probs
+            .iter()
+            .zip(&self.candidates)
+            .filter_map(|(prob, candidate)| {
+                (candidate.difficulty_level == active_max_difficulty_level).then_some(*prob)
             })
             .sum::<f32>();
         let mastered_probability = probs
@@ -838,9 +853,12 @@ impl RuliadFrontierSampler {
             target_loss: self.config.target_loss,
             target_difficulty_score,
             max_difficulty_level,
+            active_max_difficulty_level,
+            curriculum_released_max_difficulty_level: max_difficulty_level,
             mean_difficulty_level,
             normalized_difficulty_score,
             max_difficulty_probability,
+            active_max_difficulty_probability,
             mastered_probability,
             capability_feedback_probability: capability_summary.feedback_probability,
             capability_verifier_ema: capability_summary.verifier,

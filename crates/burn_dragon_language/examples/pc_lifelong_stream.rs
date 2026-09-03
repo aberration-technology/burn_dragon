@@ -51,6 +51,7 @@ enum LearningRule {
     Backpropagation,
     FixedPrediction,
     ReverseGaussSeidel,
+    LayerLocalPrediction,
 }
 
 #[cfg(feature = "train")]
@@ -60,6 +61,7 @@ impl LearningRule {
             Self::Backpropagation => None,
             Self::FixedPrediction => Some(LocalPredictiveCodingSolver::FixedPrediction),
             Self::ReverseGaussSeidel => Some(LocalPredictiveCodingSolver::ReverseGaussSeidel),
+            Self::LayerLocalPrediction => Some(LocalPredictiveCodingSolver::LayerLocalPrediction),
         }
     }
 }
@@ -228,6 +230,8 @@ struct ContextDiscoveryEvent {
     task: ContextRecurrenceTask,
     context_index: usize,
     created: bool,
+    reserve_loss: Option<f64>,
+    reserve_supported_novelty: Option<bool>,
     candidates: Vec<PredictiveContextCandidate>,
 }
 
@@ -337,6 +341,7 @@ fn parse_args() -> Result<Args> {
                         "backpropagation" | "adamw" => Ok(LearningRule::Backpropagation),
                         "fixed_prediction" => Ok(LearningRule::FixedPrediction),
                         "reverse_gauss_seidel" => Ok(LearningRule::ReverseGaussSeidel),
+                        "layer_local_prediction" => Ok(LearningRule::LayerLocalPrediction),
                         _ => Err(anyhow!("unsupported learning rule {part:?}")),
                     })
                     .collect::<Result<_>>()?;
@@ -475,7 +480,7 @@ fn parse_args() -> Result<Args> {
             }
             "--help" | "-h" => {
                 println!(
-                    "pc_lifelong_stream: --backend cpu|cuda --rules backpropagation,fixed_prediction,reverse_gauss_seidel --topologies dense_shared,selected_sparse_context_scoped --selector predictive_evidence|recurrence_descriptor_control --seeds 17,29,43 [model, PC, selector, and output options]"
+                    "pc_lifelong_stream: --backend cpu|cuda --rules backpropagation,fixed_prediction,reverse_gauss_seidel,layer_local_prediction --topologies dense_shared,selected_sparse_context_scoped --selector predictive_evidence|recurrence_descriptor_control --seeds 17,29,43 [model, PC, selector, and output options]"
                 );
                 std::process::exit(0);
             }
@@ -698,6 +703,8 @@ struct RoutedContext {
     created: bool,
     novelty_deferred: bool,
     probe_tokens: usize,
+    reserve_loss: Option<f64>,
+    reserve_supported_novelty: Option<bool>,
     candidates: Vec<PredictiveContextCandidate>,
 }
 
@@ -774,6 +781,8 @@ where
                 created: selection.created,
                 novelty_deferred: false,
                 probe_tokens: 0,
+                reserve_loss: None,
+                reserve_supported_novelty: None,
                 candidates: Vec::new(),
             })
         }
@@ -790,11 +799,30 @@ where
                 ));
             }
             let mut losses = read_context_losses(loss_tensors)?;
+            let mut probe_evaluations = losses.len();
             let mut selection = bank
                 .select(&losses, allow_create)
                 .map_err(anyhow::Error::msg)?;
             let mut novelty_deferred = false;
+            let mut reserve_loss = None;
+            let mut reserve_supported_novelty = None;
             if selection.created && known > 0 {
+                if selection.replacement.is_none() && known < bank.config().max_contexts {
+                    let loss = read_context_losses(vec![causal_prefix_loss(
+                        model,
+                        batch.inputs.clone(),
+                        spec,
+                        mask_bank.get(known, &device),
+                    )])?[0];
+                    let supported = bank
+                        .reserve_supports_novelty(&selection, loss)
+                        .map_err(anyhow::Error::msg)?;
+                    reserve_loss = Some(loss);
+                    reserve_supported_novelty = Some(supported);
+                    selection.novel_evidence &= supported;
+                    losses.push(loss);
+                    probe_evaluations += 1;
+                }
                 let confirmed = observe && novelty_gate.observe(selection.novel_evidence);
                 if !confirmed {
                     let fallback = selection
@@ -804,7 +832,7 @@ where
                         .expect("known predictive contexts have candidates");
                     selection.context_index = fallback.context_index;
                     selection.created = false;
-                    novelty_deferred = true;
+                    novelty_deferred = selection.novel_evidence;
                 }
             } else if selection.created {
                 novelty_gate.reset();
@@ -819,14 +847,19 @@ where
                         selection.context_index
                     ));
                 }
-                let loss = read_context_losses(vec![causal_prefix_loss(
-                    model,
-                    batch.inputs.clone(),
-                    spec,
-                    mask_bank.get(created, &device),
-                )])?[0];
-                losses.push(loss);
-                loss
+                if let Some(loss) = reserve_loss {
+                    loss
+                } else {
+                    let loss = read_context_losses(vec![causal_prefix_loss(
+                        model,
+                        batch.inputs.clone(),
+                        spec,
+                        mask_bank.get(created, &device),
+                    )])?[0];
+                    losses.push(loss);
+                    probe_evaluations += 1;
+                    loss
+                }
             } else {
                 losses[selection.context_index]
             };
@@ -839,7 +872,9 @@ where
                 context_index: selection.context_index,
                 created: selection.created,
                 novelty_deferred,
-                probe_tokens: losses.len() * spec.batch_size * probe_time,
+                probe_tokens: probe_evaluations * spec.batch_size * probe_time,
+                reserve_loss,
+                reserve_supported_novelty,
                 candidates: selection.candidates,
             })
         }
@@ -862,6 +897,10 @@ fn pc_config(
     config.inference.steps = args.pc_inference_steps;
     config.inference.step_size = args.pc_step_size;
     config.inference.max_grad_norm = args.pc_max_grad_norm;
+    if matches!(rule, LearningRule::LayerLocalPrediction) {
+        config.factor_reduction = burn_dragon_language::PredictiveCodingFactorReduction::Mean;
+        config.sync_diagnostics = false;
+    }
     Some(config)
 }
 
@@ -1121,6 +1160,8 @@ where
                     task,
                     context_index: selection.context_index,
                     created: selection.created,
+                    reserve_loss: selection.reserve_loss,
+                    reserve_supported_novelty: selection.reserve_supported_novelty,
                     candidates: selection.candidates,
                 });
                 selection.context_index
@@ -1186,7 +1227,10 @@ where
                         }
                         if selection.created {
                             return Err(anyhow!(
-                                "selector created a duplicate context inside task {task:?}"
+                                "selector created a duplicate context inside task {task:?} at update {update}; reserve_loss={:?} reserve_supported_novelty={:?} candidates={:?}",
+                                selection.reserve_loss,
+                                selection.reserve_supported_novelty,
+                                selection.candidates
                             ));
                         }
                         selection.context_index

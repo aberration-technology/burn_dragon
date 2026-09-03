@@ -1,0 +1,13 @@
+[training]
+# Four eight-token factors form one exact reverse-credit window. Rho values
+# continue across optimizer steps, while parameter credit detaches at each
+# four-chunk boundary.
+tbptt_chunk_size = 8
+tbptt_persist_across_steps = true
+
+[training.local_predictive_coding]
+solver = "fixed_prediction"
+
+[training.local_predictive_coding.temporal_credit]
+mode = "exact_window"
+window_chunks = 4

@@ -9,6 +9,28 @@ const BACKWARD_WORKGROUP_SIZE_X: u32 = 64;
 const BACKWARD_WGPU_WORKGROUP_SIZE: usize = BACKWARD_WORKGROUP_SIZE_X as usize;
 const BACKWARD_WGPU_EMBD_TILE: usize = 16;
 const BACKWARD_WGPU_LATENT_TILE: usize = 16;
+#[cfg(feature = "cuda")]
+const STREAMING_BACKWARD_META_LEN: usize = 9;
+#[cfg(feature = "cuda")]
+const STREAMING_BACKWARD_WORKGROUP_SIZE_X: u32 = 128;
+#[cfg(feature = "cuda")]
+const STREAMING_BACKWARD_WORKGROUP_SIZE: usize = STREAMING_BACKWARD_WORKGROUP_SIZE_X as usize;
+#[cfg(feature = "cuda")]
+const STREAMING_QUERY_WORKGROUP_SIZE_X: u32 = 32;
+#[cfg(feature = "cuda")]
+const STREAMING_QUERY_WORKGROUP_SIZE: usize = STREAMING_QUERY_WORKGROUP_SIZE_X as usize;
+
+/// Plain-backend input VJP for the fused recurrent linear-attention kernel.
+///
+/// The decay schedule is treated as fixed because Dragon's local predictive-
+/// coding factors do not optimize ALiBi slopes. `grad_initial_rho` is returned
+/// only when the caller supplied an incoming recurrent state.
+#[derive(Debug, Clone)]
+pub struct RecurrentAttentionInputVjp<B: BackendTrait> {
+    pub grad_query: BurnTensor<B, 4>,
+    pub grad_value: BurnTensor<B, 4>,
+    pub grad_initial_rho: Option<BurnTensor<B, 4>>,
+}
 
 #[cube]
 fn reduce_partials_wgpu(
@@ -57,6 +79,241 @@ fn reduce_partials_wgpu(
             partials[lane] = partials[lane] + partials[lane + 1usize];
         }
         sync_cube();
+    }
+}
+
+/// Exact history-free query and incoming-state VJP for recurrent attention.
+///
+/// The context contribution to `dL/dq_t` depends only on the forward state
+/// entering token `t`, so it can be accumulated in a forward scan. The state
+/// transition contribution depends only on the reverse adjoint, so it can be
+/// accumulated in a reverse scan. Keeping both scans in one workgroup avoids
+/// materializing the full `[batch, head, time, latent, embedding]` history.
+#[cfg(feature = "cuda")]
+#[cube(launch)]
+fn recurrent_attention_streaming_grad_query_cuda_kernel(
+    query: &Tensor<f32>,
+    value: &Tensor<f32>,
+    initial_rho: &Tensor<f32>,
+    grad_output: &Tensor<f32>,
+    grad_terminal_rho: &Tensor<f32>,
+    decay: &Tensor<f32>,
+    grad_query_partial: &mut Tensor<f32>,
+    grad_initial_rho: &mut Tensor<f32>,
+    params: &Tensor<f32>,
+) {
+    let batch = u32::cast_from(params[0]) as usize;
+    let heads = u32::cast_from(params[1]) as usize;
+    let value_heads = u32::cast_from(params[2]) as usize;
+    let time = u32::cast_from(params[3]) as usize;
+    let latent = u32::cast_from(params[4]) as usize;
+    let embd = u32::cast_from(params[5]) as usize;
+    let embd_groups = u32::cast_from(params[6]) as usize;
+    let has_terminal_rho = params[8] > f32::cast_from(0u32);
+
+    let b = CUBE_POS_Z as usize;
+    let h = CUBE_POS_Y as usize;
+    let packed = CUBE_POS_X as usize;
+    let l = packed / embd_groups;
+    let embd_group = packed % embd_groups;
+    let lane = UNIT_POS_X as usize;
+    let e = embd_group * STREAMING_QUERY_WORKGROUP_SIZE + lane;
+    if b >= batch || h >= heads || l >= latent {
+        terminate!();
+    }
+
+    let active_e = e < embd;
+    let mut value_head = h;
+    if value_heads == 1usize {
+        value_head = 0usize;
+    }
+    let decay_value = decay[h * decay.stride(0)];
+    let rho_index = b * initial_rho.stride(0)
+        + h * initial_rho.stride(1)
+        + l * initial_rho.stride(2)
+        + e * initial_rho.stride(3);
+    let mut forward_state = if active_e {
+        initial_rho[rho_index]
+    } else {
+        f32::cast_from(0u32)
+    };
+    // Context path: c_t[e] = sum_l rho_t[l,e] * q_t[l].
+    let mut t = 0usize;
+    while t < time {
+        let query_index =
+            b * query.stride(0) + h * query.stride(1) + t * query.stride(2) + l * query.stride(3);
+        let q = query[query_index];
+        let value_index = b * value.stride(0)
+            + value_head * value.stride(1)
+            + t * value.stride(2)
+            + e * value.stride(3);
+        let grad_output_index = b * grad_output.stride(0)
+            + h * grad_output.stride(1)
+            + t * grad_output.stride(2)
+            + e * grad_output.stride(3);
+        let value_t = if active_e {
+            value[value_index]
+        } else {
+            f32::cast_from(0u32)
+        };
+        let grad_out = if active_e {
+            grad_output[grad_output_index]
+        } else {
+            f32::cast_from(0u32)
+        };
+        let partial = plane_sum(forward_state * grad_out);
+        if lane == 0usize {
+            let output_index = b * grad_query_partial.stride(0)
+                + h * grad_query_partial.stride(1)
+                + embd_group * grad_query_partial.stride(2)
+                + t * grad_query_partial.stride(3)
+                + l * grad_query_partial.stride(4);
+            grad_query_partial[output_index] = partial;
+        }
+        if active_e {
+            forward_state = (forward_state + q * value_t) * decay_value;
+        }
+        t += 1usize;
+    }
+
+    // Transition path: rho_{t+1} = d * (rho_t + q_t outer v_t).
+    let terminal_index = b * grad_terminal_rho.stride(0)
+        + h * grad_terminal_rho.stride(1)
+        + l * grad_terminal_rho.stride(2)
+        + e * grad_terminal_rho.stride(3);
+    let mut reverse_state = if active_e && has_terminal_rho {
+        grad_terminal_rho[terminal_index] * decay_value
+    } else {
+        f32::cast_from(0u32)
+    };
+    let mut tau = 0usize;
+    while tau < time {
+        let reverse_t = time - 1usize - tau;
+        let query_index = b * query.stride(0)
+            + h * query.stride(1)
+            + reverse_t * query.stride(2)
+            + l * query.stride(3);
+        let q = query[query_index];
+        let value_index = b * value.stride(0)
+            + value_head * value.stride(1)
+            + reverse_t * value.stride(2)
+            + e * value.stride(3);
+        let grad_output_index = b * grad_output.stride(0)
+            + h * grad_output.stride(1)
+            + reverse_t * grad_output.stride(2)
+            + e * grad_output.stride(3);
+        let value_t = if active_e {
+            value[value_index]
+        } else {
+            f32::cast_from(0u32)
+        };
+        let grad_out = if active_e {
+            grad_output[grad_output_index]
+        } else {
+            f32::cast_from(0u32)
+        };
+        let partial = plane_sum(reverse_state * value_t);
+        if lane == 0usize {
+            let output_index = b * grad_query_partial.stride(0)
+                + h * grad_query_partial.stride(1)
+                + embd_group * grad_query_partial.stride(2)
+                + reverse_t * grad_query_partial.stride(3)
+                + l * grad_query_partial.stride(4);
+            grad_query_partial[output_index] = grad_query_partial[output_index] + partial;
+        }
+        if active_e {
+            reverse_state = (reverse_state + q * grad_out) * decay_value;
+        }
+        tau += 1usize;
+    }
+
+    if active_e {
+        let grad_initial_index = ((b * heads + h) * latent + l) * embd + e;
+        grad_initial_rho[grad_initial_index] = reverse_state / decay_value;
+    }
+}
+
+/// Exact history-free value VJP. Each workgroup owns one latent tile and
+/// emits a compact partial; a final device reduction combines latent tiles.
+#[cfg(feature = "cuda")]
+#[cube(launch)]
+fn recurrent_attention_streaming_grad_value_cuda_kernel(
+    query: &Tensor<f32>,
+    grad_output: &Tensor<f32>,
+    grad_terminal_rho: &Tensor<f32>,
+    decay: &Tensor<f32>,
+    grad_value_partial: &mut Tensor<f32>,
+    params: &Tensor<f32>,
+) {
+    let batch = u32::cast_from(params[0]) as usize;
+    let heads = u32::cast_from(params[1]) as usize;
+    let time = u32::cast_from(params[3]) as usize;
+    let latent = u32::cast_from(params[4]) as usize;
+    let embd = u32::cast_from(params[5]) as usize;
+    let latent_groups = u32::cast_from(params[7]) as usize;
+    let has_terminal_rho = params[8] > f32::cast_from(0u32);
+
+    let b = CUBE_POS_Z as usize;
+    let h = CUBE_POS_Y as usize;
+    let packed = CUBE_POS_X as usize;
+    let e = packed / latent_groups;
+    let latent_group = packed % latent_groups;
+    let lane = UNIT_POS_X as usize;
+    let l = latent_group * STREAMING_BACKWARD_WORKGROUP_SIZE + lane;
+    if b >= batch || h >= heads || e >= embd {
+        terminate!();
+    }
+
+    let active_l = l < latent;
+    let decay_value = decay[h * decay.stride(0)];
+    let terminal_index = b * grad_terminal_rho.stride(0)
+        + h * grad_terminal_rho.stride(1)
+        + l * grad_terminal_rho.stride(2)
+        + e * grad_terminal_rho.stride(3);
+    let mut reverse_state = if active_l && has_terminal_rho {
+        grad_terminal_rho[terminal_index] * decay_value
+    } else {
+        f32::cast_from(0u32)
+    };
+    let mut partials = SharedMemory::<f32>::new_aligned(STREAMING_BACKWARD_WORKGROUP_SIZE, 1usize);
+
+    let mut tau = 0usize;
+    while tau < time {
+        let reverse_t = time - 1usize - tau;
+        let query_index = b * query.stride(0)
+            + h * query.stride(1)
+            + reverse_t * query.stride(2)
+            + l * query.stride(3);
+        let grad_output_index = b * grad_output.stride(0)
+            + h * grad_output.stride(1)
+            + reverse_t * grad_output.stride(2)
+            + e * grad_output.stride(3);
+        let q = if active_l {
+            query[query_index]
+        } else {
+            f32::cast_from(0u32)
+        };
+        let grad_out = if active_l {
+            grad_output[grad_output_index]
+        } else {
+            f32::cast_from(0u32)
+        };
+        partials[lane] = reverse_state * q;
+        sync_cube();
+        reduce_partials_wgpu(&mut partials, lane, STREAMING_BACKWARD_WORKGROUP_SIZE);
+        if lane == 0usize {
+            let output_index = b * grad_value_partial.stride(0)
+                + h * grad_value_partial.stride(1)
+                + latent_group * grad_value_partial.stride(2)
+                + reverse_t * grad_value_partial.stride(3)
+                + e * grad_value_partial.stride(4);
+            grad_value_partial[output_index] = partials[0usize];
+        }
+        sync_cube();
+        if active_l {
+            reverse_state = (reverse_state + q * grad_out) * decay_value;
+        }
+        tau += 1usize;
     }
 }
 
@@ -501,6 +758,370 @@ fn recurrent_attention_grad_decay_kernel(
     grad_decay_partial[out_index] = grad;
 }
 
+#[cfg(feature = "cuda")]
+fn streaming_backward_params_tensor<B: BackendTrait>(
+    batch: usize,
+    heads: usize,
+    value_heads: usize,
+    time: usize,
+    latent: usize,
+    embd: usize,
+    embd_groups: usize,
+    latent_groups: usize,
+    has_terminal_rho: bool,
+    device: &B::Device,
+) -> BurnTensor<B, 1> {
+    BurnTensor::<B, 1>::from_data(
+        TensorData::new(
+            vec![
+                batch as f32,
+                heads as f32,
+                value_heads as f32,
+                time as f32,
+                latent as f32,
+                embd as f32,
+                embd_groups as f32,
+                latent_groups as f32,
+                u8::from(has_terminal_rho) as f32,
+            ],
+            [STREAMING_BACKWARD_META_LEN],
+        ),
+        device,
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn recurrent_attention_streaming_grad_query_cuda_runtime(
+    query: CubeTensor<CudaRuntime>,
+    value: CubeTensor<CudaRuntime>,
+    initial_rho: CubeTensor<CudaRuntime>,
+    grad_output: CubeTensor<CudaRuntime>,
+    grad_terminal_rho: CubeTensor<CudaRuntime>,
+    decay: CubeTensor<CudaRuntime>,
+    params: CubeTensor<CudaRuntime>,
+    embd_groups: usize,
+) -> (CubeTensor<CudaRuntime>, CubeTensor<CudaRuntime>) {
+    let [batch, heads, time, latent] = query.meta.shape.dims::<4>();
+    let embd = grad_output.meta.shape.dims::<4>()[3];
+    let client = query.client.clone();
+    let device = query.device.clone();
+    let grad_query_partial = empty_device::<CudaRuntime, f32>(
+        client.clone(),
+        device.clone(),
+        Shape::new([batch, heads, embd_groups, time, latent]),
+    );
+    let grad_initial_rho = empty_device::<CudaRuntime, f32>(
+        client.clone(),
+        device,
+        Shape::new([batch * heads * latent * embd]),
+    );
+    let cube_dim = CubeDim::new_1d(STREAMING_QUERY_WORKGROUP_SIZE_X);
+    let cube_count = CubeCount::Static((latent * embd_groups) as u32, heads as u32, batch as u32);
+    let _ = recurrent_attention_streaming_grad_query_cuda_kernel::launch::<CudaRuntime>(
+        &client,
+        cube_count,
+        cube_dim,
+        into_contiguous(query).into_tensor_arg(),
+        into_contiguous(value).into_tensor_arg(),
+        into_contiguous(initial_rho).into_tensor_arg(),
+        into_contiguous(grad_output).into_tensor_arg(),
+        into_contiguous(grad_terminal_rho).into_tensor_arg(),
+        into_contiguous(decay).into_tensor_arg(),
+        grad_query_partial.clone().into_tensor_arg(),
+        grad_initial_rho.clone().into_tensor_arg(),
+        into_contiguous(params).into_tensor_arg(),
+    );
+    (grad_query_partial, grad_initial_rho)
+}
+
+#[cfg(feature = "cuda")]
+fn recurrent_attention_streaming_grad_value_cuda_runtime(
+    query: CubeTensor<CudaRuntime>,
+    grad_output: CubeTensor<CudaRuntime>,
+    grad_terminal_rho: CubeTensor<CudaRuntime>,
+    decay: CubeTensor<CudaRuntime>,
+    params: CubeTensor<CudaRuntime>,
+    latent_groups: usize,
+) -> CubeTensor<CudaRuntime> {
+    let [batch, heads, time, _] = query.meta.shape.dims::<4>();
+    let embd = grad_output.meta.shape.dims::<4>()[3];
+    let client = query.client.clone();
+    let device = query.device.clone();
+    let grad_value_partial = empty_device::<CudaRuntime, f32>(
+        client.clone(),
+        device,
+        Shape::new([batch, heads, latent_groups, time, embd]),
+    );
+    let cube_dim = CubeDim::new_1d(STREAMING_BACKWARD_WORKGROUP_SIZE_X);
+    let cube_count = CubeCount::Static((embd * latent_groups) as u32, heads as u32, batch as u32);
+    let _ = recurrent_attention_streaming_grad_value_cuda_kernel::launch::<CudaRuntime>(
+        &client,
+        cube_count,
+        cube_dim,
+        into_contiguous(query).into_tensor_arg(),
+        into_contiguous(grad_output).into_tensor_arg(),
+        into_contiguous(grad_terminal_rho).into_tensor_arg(),
+        into_contiguous(decay).into_tensor_arg(),
+        grad_value_partial.clone().into_tensor_arg(),
+        into_contiguous(params).into_tensor_arg(),
+    );
+    grad_value_partial
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn finish_streaming_recurrent_attention_input_vjp<B: BackendTrait>(
+    grad_query_partial: BurnTensor<B, 5>,
+    grad_value_partial: BurnTensor<B, 5>,
+    grad_initial_rho_flat: BurnTensor<B, 1>,
+    batch: usize,
+    heads: usize,
+    value_heads: usize,
+    time: usize,
+    latent: usize,
+    embd: usize,
+    embd_groups: usize,
+    latent_groups: usize,
+    had_initial_rho: bool,
+) -> RecurrentAttentionInputVjp<B> {
+    let grad_query = if embd_groups == 1 {
+        grad_query_partial.reshape([batch, heads, time, latent])
+    } else {
+        grad_query_partial
+            .sum_dim(2)
+            .reshape([batch, heads, time, latent])
+    };
+    let grad_value_heads = if latent_groups == 1 {
+        grad_value_partial.reshape([batch, heads, time, embd])
+    } else {
+        grad_value_partial
+            .sum_dim(2)
+            .reshape([batch, heads, time, embd])
+    };
+    let grad_value = if value_heads == heads {
+        grad_value_heads
+    } else {
+        grad_value_heads.sum_dim(1).reshape([batch, 1, time, embd])
+    };
+    let grad_initial_rho =
+        had_initial_rho.then(|| grad_initial_rho_flat.reshape([batch, heads, latent, embd]));
+
+    RecurrentAttentionInputVjp {
+        grad_query,
+        grad_value,
+        grad_initial_rho,
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn try_streaming_recurrent_attention_input_vjp_cuda<B: BackendTrait>(
+    grad_output: BurnTensor<B, 4>,
+    query: BurnTensor<B, 4>,
+    value: BurnTensor<B, 4>,
+    initial_rho: BurnTensor<B, 4>,
+    decay: BurnTensor<B, 1>,
+    grad_terminal_rho: Option<BurnTensor<B, 4>>,
+    had_initial_rho: bool,
+) -> Option<RecurrentAttentionInputVjp<B>>
+where
+    B::FloatTensorPrimitive: 'static,
+{
+    let [batch, heads, time, latent] = query.shape().dims::<4>();
+    let value_heads = value.shape().dims::<4>()[1];
+    let embd = grad_output.shape().dims::<4>()[3];
+    let embd_groups = embd.div_ceil(STREAMING_QUERY_WORKGROUP_SIZE);
+    let latent_groups = latent.div_ceil(STREAMING_BACKWARD_WORKGROUP_SIZE);
+    let has_terminal_rho = grad_terminal_rho.is_some();
+    let terminal = grad_terminal_rho.unwrap_or_else(|| initial_rho.clone());
+    let params = streaming_backward_params_tensor::<B>(
+        batch,
+        heads,
+        value_heads,
+        time,
+        latent,
+        embd,
+        embd_groups,
+        latent_groups,
+        has_terminal_rho,
+        &query.device(),
+    );
+
+    let query_cube =
+        try_cast_primitive::<B, CubeTensor<CudaRuntime>>(query.clone().into_primitive().tensor())?;
+    let value_cube =
+        try_cast_primitive::<B, CubeTensor<CudaRuntime>>(value.into_primitive().tensor())?;
+    let initial_cube =
+        try_cast_primitive::<B, CubeTensor<CudaRuntime>>(initial_rho.into_primitive().tensor())?;
+    let grad_output_cube = try_cast_primitive::<B, CubeTensor<CudaRuntime>>(
+        grad_output.clone().into_primitive().tensor(),
+    )?;
+    let terminal_cube =
+        try_cast_primitive::<B, CubeTensor<CudaRuntime>>(terminal.into_primitive().tensor())?;
+    let decay_cube =
+        try_cast_primitive::<B, CubeTensor<CudaRuntime>>(decay.into_primitive().tensor())?;
+    let params_cube =
+        try_cast_primitive::<B, CubeTensor<CudaRuntime>>(params.into_primitive().tensor())?;
+    if query_cube.dtype != DType::F32
+        || value_cube.dtype != DType::F32
+        || initial_cube.dtype != DType::F32
+        || grad_output_cube.dtype != DType::F32
+        || terminal_cube.dtype != DType::F32
+        || decay_cube.dtype != DType::F32
+        || params_cube.dtype != DType::F32
+    {
+        return None;
+    }
+
+    let (grad_query_partial, grad_initial_rho) =
+        recurrent_attention_streaming_grad_query_cuda_runtime(
+            query_cube.clone(),
+            value_cube,
+            initial_cube,
+            grad_output_cube.clone(),
+            terminal_cube.clone(),
+            decay_cube.clone(),
+            params_cube.clone(),
+            embd_groups,
+        );
+    let grad_value_partial = recurrent_attention_streaming_grad_value_cuda_runtime(
+        query_cube,
+        grad_output_cube,
+        terminal_cube,
+        decay_cube,
+        params_cube,
+        latent_groups,
+    );
+
+    let grad_query_partial = BurnTensor::<B, 5>::from_primitive(TensorPrimitive::Float(
+        try_cast_backend::<B, _>(grad_query_partial)?,
+    ));
+    let grad_value_partial = BurnTensor::<B, 5>::from_primitive(TensorPrimitive::Float(
+        try_cast_backend::<B, _>(grad_value_partial)?,
+    ));
+    let grad_initial_rho_flat = BurnTensor::<B, 1>::from_primitive(TensorPrimitive::Float(
+        try_cast_backend::<B, _>(grad_initial_rho)?,
+    ));
+
+    Some(finish_streaming_recurrent_attention_input_vjp(
+        grad_query_partial,
+        grad_value_partial,
+        grad_initial_rho_flat,
+        batch,
+        heads,
+        value_heads,
+        time,
+        latent,
+        embd,
+        embd_groups,
+        latent_groups,
+        had_initial_rho,
+    ))
+}
+
+#[cfg(feature = "cuda")]
+fn try_streaming_recurrent_attention_input_vjp_cuda_fusion<B, BT>(
+    grad_output: BurnTensor<B, 4>,
+    query: BurnTensor<B, 4>,
+    value: BurnTensor<B, 4>,
+    initial_rho: BurnTensor<B, 4>,
+    decay: BurnTensor<B, 1>,
+    grad_terminal_rho: Option<BurnTensor<B, 4>>,
+    had_initial_rho: bool,
+) -> Option<RecurrentAttentionInputVjp<B>>
+where
+    B: BackendTrait,
+    B::FloatTensorPrimitive: 'static,
+    BT: BoolElement + 'static,
+{
+    if !matches_type::<B::FloatTensorPrimitive, FusionTensor<FusionCubeRuntime<CudaRuntime>>>() {
+        return None;
+    }
+
+    let [batch, heads, time, latent] = query.shape().dims::<4>();
+    let value_heads = value.shape().dims::<4>()[1];
+    let embd = grad_output.shape().dims::<4>()[3];
+    let embd_groups = embd.div_ceil(STREAMING_QUERY_WORKGROUP_SIZE);
+    let latent_groups = latent.div_ceil(STREAMING_BACKWARD_WORKGROUP_SIZE);
+    let has_terminal_rho = grad_terminal_rho.is_some();
+    let terminal = grad_terminal_rho.unwrap_or_else(|| initial_rho.clone());
+    let params = streaming_backward_params_tensor::<B>(
+        batch,
+        heads,
+        value_heads,
+        time,
+        latent,
+        embd,
+        embd_groups,
+        latent_groups,
+        has_terminal_rho,
+        &query.device(),
+    );
+
+    let query_primitive = query.clone().into_primitive().tensor();
+    let fusion_query: FusionTensor<FusionCubeRuntime<CudaRuntime>> =
+        try_cast_primitive::<B, _>(query_primitive)?;
+    let fusion_client = fusion_query.client.clone();
+    let query_cube =
+        fusion_client.resolve_tensor_float::<CubeBackend<CudaRuntime, f32, i32, BT>>(fusion_query);
+    if query_cube.dtype != DType::F32 {
+        return None;
+    }
+    let value_cube = resolve_fusion_tensor_runtime::<B, BT, CudaRuntime, 4>(&value)?;
+    let initial_cube = resolve_fusion_tensor_runtime::<B, BT, CudaRuntime, 4>(&initial_rho)?;
+    let grad_output_cube = resolve_fusion_tensor_runtime::<B, BT, CudaRuntime, 4>(&grad_output)?;
+    let terminal_cube = resolve_fusion_tensor_runtime::<B, BT, CudaRuntime, 4>(&terminal)?;
+    let decay_cube = resolve_fusion_tensor_runtime::<B, BT, CudaRuntime, 1>(&decay)?;
+    let params_cube = resolve_fusion_tensor_runtime::<B, BT, CudaRuntime, 1>(&params)?;
+
+    let (grad_query_partial, grad_initial_rho) =
+        recurrent_attention_streaming_grad_query_cuda_runtime(
+            query_cube.clone(),
+            value_cube,
+            initial_cube,
+            grad_output_cube.clone(),
+            terminal_cube.clone(),
+            decay_cube.clone(),
+            params_cube.clone(),
+            embd_groups,
+        );
+    let grad_value_partial = recurrent_attention_streaming_grad_value_cuda_runtime(
+        query_cube,
+        grad_output_cube,
+        terminal_cube,
+        decay_cube,
+        params_cube,
+        latent_groups,
+    );
+
+    let grad_query_partial = register_fusion_float_tensor(&fusion_client, grad_query_partial);
+    let grad_value_partial = register_fusion_float_tensor(&fusion_client, grad_value_partial);
+    let grad_initial_rho = register_fusion_float_tensor(&fusion_client, grad_initial_rho);
+    let grad_query_partial = BurnTensor::<B, 5>::from_primitive(TensorPrimitive::Float(
+        try_cast_backend::<B, _>(grad_query_partial)?,
+    ));
+    let grad_value_partial = BurnTensor::<B, 5>::from_primitive(TensorPrimitive::Float(
+        try_cast_backend::<B, _>(grad_value_partial)?,
+    ));
+    let grad_initial_rho_flat = BurnTensor::<B, 1>::from_primitive(TensorPrimitive::Float(
+        try_cast_backend::<B, _>(grad_initial_rho)?,
+    ));
+
+    Some(finish_streaming_recurrent_attention_input_vjp(
+        grad_query_partial,
+        grad_value_partial,
+        grad_initial_rho_flat,
+        batch,
+        heads,
+        value_heads,
+        time,
+        latent,
+        embd,
+        embd_groups,
+        latent_groups,
+        had_initial_rho,
+    ))
+}
+
 fn backward_params_tensor<B: BackendTrait>(
     batch: usize,
     heads: usize,
@@ -763,10 +1384,11 @@ fn recurrent_attention_grad_decay_runtime<R: CubeRuntime>(
     grad_decay_partial
 }
 
-pub(super) fn recurrent_attention_reverse_state_history<B: BackendTrait>(
+fn recurrent_attention_reverse_state_history_with_terminal<B: BackendTrait>(
     query: BurnTensor<B, 4>,
     grad_output: BurnTensor<B, 4>,
     decay: BurnTensor<B, 1>,
+    grad_terminal_rho: Option<BurnTensor<B, 4>>,
 ) -> Option<(BurnTensor<B, 5>, BurnTensor<B, 4>)>
 where
     B::FloatTensorPrimitive: 'static,
@@ -775,13 +1397,24 @@ where
     let embd = grad_output.shape().dims::<4>()[3];
     let query_rev = reverse_time_tensor4(query);
     let grad_output_rev = reverse_time_tensor4(grad_output);
-    let zero_rho = BurnTensor::<B, 4>::zeros([batch, heads, latent, embd], &query_rev.device());
+    // The recurrent kernel decays after each state write. Seeding the reverse
+    // recurrence with d * dL/drho_T makes its state before the last token equal
+    // the exact cotangent consumed by q_{T-1} and v_{T-1}.
+    let reverse_rho = match grad_terminal_rho {
+        Some(grad) => {
+            if grad.shape().dims::<4>() != [batch, heads, latent, embd] {
+                return None;
+            }
+            grad * decay.clone().reshape([1, heads, 1, 1])
+        }
+        None => BurnTensor::<B, 4>::zeros([batch, heads, latent, embd], &query_rev.device()),
+    };
     let meta = recurrent_meta_tensor(&query_rev, heads, embd);
 
     let captured = try_direct_path_runtime_with_state_history::<B, WgpuRuntime>(
         &query_rev,
         &grad_output_rev,
-        &zero_rho,
+        &reverse_rho,
         &decay,
         &meta,
     )
@@ -791,7 +1424,7 @@ where
             try_direct_path_runtime_with_state_history::<B, CudaRuntime>(
                 &query_rev,
                 &grad_output_rev,
-                &zero_rho,
+                &reverse_rho,
                 &decay,
                 &meta,
             )
@@ -803,6 +1436,145 @@ where
     })?;
 
     Some((captured.state_history, captured.rho))
+}
+
+pub(super) fn recurrent_attention_reverse_state_history<B: BackendTrait>(
+    query: BurnTensor<B, 4>,
+    grad_output: BurnTensor<B, 4>,
+    decay: BurnTensor<B, 1>,
+) -> Option<(BurnTensor<B, 5>, BurnTensor<B, 4>)>
+where
+    B::FloatTensorPrimitive: 'static,
+{
+    recurrent_attention_reverse_state_history_with_terminal(query, grad_output, decay, None)
+}
+
+/// Evaluate the exact VJP of the production recurrent linear-attention
+/// executor without constructing an autodiff graph.
+///
+/// The forward state history is rematerialized one factor at a time. This
+/// keeps local-PC memory bounded by one recurrent layer instead of retaining a
+/// global history for every shared-weight layer.
+pub fn try_fused_recurrent_attention_input_vjp<B: BackendTrait>(
+    grad_output: BurnTensor<B, 4>,
+    query: BurnTensor<B, 4>,
+    value: BurnTensor<B, 4>,
+    initial_rho: Option<BurnTensor<B, 4>>,
+    decay: BurnTensor<B, 1>,
+    grad_terminal_rho: Option<BurnTensor<B, 4>>,
+) -> Option<RecurrentAttentionInputVjp<B>>
+where
+    B::FloatTensorPrimitive: 'static,
+{
+    let [batch, heads, time, latent] = query.shape().dims::<4>();
+    let [value_batch, value_heads, value_time, embd] = value.shape().dims::<4>();
+    if batch == 0
+        || heads == 0
+        || time == 0
+        || latent == 0
+        || embd == 0
+        || value_batch != batch
+        || value_time != time
+        || (value_heads != 1 && value_heads != heads)
+        || grad_output.shape().dims::<4>() != [batch, heads, time, embd]
+        || decay.shape().dims::<1>() != [heads]
+    {
+        return None;
+    }
+
+    let had_initial_rho = initial_rho.is_some();
+    let rho = match initial_rho {
+        Some(rho) if rho.shape().dims::<4>() == [batch, heads, latent, embd] => rho,
+        Some(_) => return None,
+        None => BurnTensor::<B, 4>::zeros([batch, heads, latent, embd], &query.device()),
+    };
+    if grad_terminal_rho
+        .as_ref()
+        .is_some_and(|grad| grad.shape().dims::<4>() != [batch, heads, latent, embd])
+    {
+        return None;
+    }
+    recurrent_vjp_route_profile_record_attempt();
+    #[cfg(feature = "cuda")]
+    if let Some(vjp) = try_streaming_recurrent_attention_input_vjp_cuda(
+        grad_output.clone(),
+        query.clone(),
+        value.clone(),
+        rho.clone(),
+        decay.clone(),
+        grad_terminal_rho.clone(),
+        had_initial_rho,
+    ) {
+        recurrent_vjp_route_profile_record_route(RecurrentVjpRouteKind::CudaStreamingDirect);
+        return Some(vjp);
+    }
+    #[cfg(feature = "cuda")]
+    if let Some(vjp) = try_streaming_recurrent_attention_input_vjp_cuda_fusion::<B, u8>(
+        grad_output.clone(),
+        query.clone(),
+        value.clone(),
+        rho.clone(),
+        decay.clone(),
+        grad_terminal_rho.clone(),
+        had_initial_rho,
+    ) {
+        recurrent_vjp_route_profile_record_route(RecurrentVjpRouteKind::CudaStreamingFusion);
+        return Some(vjp);
+    }
+    let meta = recurrent_meta_tensor(&query, value_heads, embd);
+    let captured = try_direct_path_runtime_with_state_history::<B, WgpuRuntime>(
+        &query, &value, &rho, &decay, &meta,
+    )
+    .or_else(|| {
+        #[cfg(feature = "cuda")]
+        {
+            try_direct_path_runtime_with_state_history::<B, CudaRuntime>(
+                &query, &value, &rho, &decay, &meta,
+            )
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
+    })?;
+
+    let value_per_head = if value_heads == heads {
+        value.clone()
+    } else {
+        value.clone().repeat_dim(1, heads)
+    };
+    let (reverse_state_rev, reverse_final_rho) =
+        recurrent_attention_reverse_state_history_with_terminal(
+            query.clone(),
+            grad_output.clone(),
+            decay.clone(),
+            grad_terminal_rho,
+        )?;
+    let params = backward_params_tensor(batch, heads, time, latent, embd, &query.device());
+    let grad_query = try_direct_recurrent_grad_query::<B>(
+        captured.state_history,
+        reverse_state_rev.clone(),
+        grad_output,
+        value_per_head,
+        params.clone(),
+    )?;
+    let grad_value_heads =
+        try_direct_recurrent_grad_value::<B>(reverse_state_rev, query, value_heads, params)?;
+    let grad_value = if value_heads == heads {
+        grad_value_heads
+    } else {
+        grad_value_heads.sum_dim(1).reshape([batch, 1, time, embd])
+    };
+    let grad_initial_rho = had_initial_rho
+        .then(|| reverse_final_rho.div(decay.add_scalar(1.0e-8).reshape([1, heads, 1, 1])));
+
+    let result = RecurrentAttentionInputVjp {
+        grad_query,
+        grad_value,
+        grad_initial_rho,
+    };
+    recurrent_vjp_route_profile_record_route(RecurrentVjpRouteKind::HistoryFallback);
+    Some(result)
 }
 
 pub(super) fn recurrent_attention_backward_impl<B: BackendTrait>(

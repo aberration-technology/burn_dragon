@@ -933,6 +933,17 @@ jobs:
           echo "timed out waiting for bootstrap head mirror restart" >&2
           exit 1
 
+      - name: wait for bootstrap head mirror to publish canonical head
+        if: ${{ github.event.inputs.plan_only != 'true' }}
+        uses: ./.github/actions/wait-for-canonical-head
+        with:
+          edge-base-url: ${{ steps.outputs.outputs.edge_url }}
+          experiment-id: ${{ env.BOOTSTRAP_HEAD_MIRROR_EXPERIMENT_ID }}
+          revision-id: ${{ env.BOOTSTRAP_HEAD_MIRROR_REVISION_ID }}
+          bootstrap-instance-id: ${{ steps.outputs.outputs.instance_id }}
+          aws-region: ${{ env.AWS_REGION }}
+          timeout-seconds: "300"
+
       - name: provision authority-signed browser revision contract
         if: ${{ github.event.inputs.plan_only != 'true' }}
         shell: bash
@@ -957,7 +968,21 @@ jobs:
             --wait-timeout-secs 600 \
             --poll-interval-secs 5 \
             --output-format json
-          parameters="$(jq -cn --arg command "$provision_command" '{commands:["set -eu", $command, "systemctl restart burn-p2p-bootstrap", "systemctl is-active burn-p2p-bootstrap"]}')"
+          cleanup_command="trap 'systemctl start burn-dragon-p2p-head-mirror >/dev/null 2>&1 || true' EXIT"
+          parameters="$(jq -cn \
+            --arg command "$provision_command" \
+            --arg cleanup "$cleanup_command" \
+            '{commands:[
+              "set -eu",
+              "systemctl stop burn-dragon-p2p-head-mirror",
+              $cleanup,
+              $command,
+              "systemctl restart burn-p2p-bootstrap",
+              "systemctl start burn-dragon-p2p-head-mirror",
+              "systemctl is-active burn-p2p-bootstrap",
+              "systemctl is-active burn-dragon-p2p-head-mirror",
+              "trap - EXIT"
+            ]}')"
           command_id="$(aws ssm send-command \
             --region "$AWS_REGION" \
             --instance-ids "$BOOTSTRAP_INSTANCE_ID" \

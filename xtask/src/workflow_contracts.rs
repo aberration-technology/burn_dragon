@@ -292,6 +292,21 @@ fn deployment_workflow_contracts() -> Result<()> {
         )?;
         require_contains(
             &text,
+            "uses: ./.github/actions/wait-for-canonical-head",
+            "deployment waits for a fully edge-visible canonical head before signing",
+        )?;
+        require_contains(
+            &text,
+            "systemctl stop burn-dragon-p2p-head-mirror",
+            "deployment serializes head initialization and revision-contract signing",
+        )?;
+        require_contains(
+            &text,
+            "trap 'systemctl start burn-dragon-p2p-head-mirror",
+            "deployment restores the head mirror when signing fails",
+        )?;
+        require_contains(
+            &text,
             "--authority-key",
             "revision-contract signing remains colocated with the edge authority",
         )?;
@@ -345,8 +360,30 @@ fn deployment_workflow_contracts() -> Result<()> {
 
     let deploy = read(".github/workflows/deploy-burn-dragon-p2p-aws.yml")?;
     let restore = read(".github/workflows/restore-burn-dragon-p2p-aws.yml")?;
+    let canonical_head_action = read(".github/actions/wait-for-canonical-head/action.yml")?;
+    let inspect_commands = read("xtask/assets/bootstrap-inspect-commands.txt")?;
     let secret_sync = read(
         "crates/burn_dragon_p2p/deploy/terraform/aws/templates/bootstrap-secret-sync.sh.tftpl",
+    )?;
+    require_contains(
+        &canonical_head_action,
+        "/portal/snapshot",
+        "canonical-head readiness is derived from the public edge snapshot",
+    )?;
+    require_contains(
+        &canonical_head_action,
+        ".current_head_id",
+        "canonical-head readiness requires a directory-selected head",
+    )?;
+    require_contains(
+        &canonical_head_action,
+        "journalctl -u burn-dragon-p2p-head-mirror",
+        "canonical-head failures capture bounded head-mirror diagnostics",
+    )?;
+    require_contains(
+        &inspect_commands,
+        "timeout --foreground 90s /usr/local/bin/burn_dragon_p2p_native deployment-diagnostics",
+        "bootstrap inspection cannot hang indefinitely in model preparation",
     )?;
     require_contains(
         &secret_sync,

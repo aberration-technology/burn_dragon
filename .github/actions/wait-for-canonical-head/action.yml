@@ -1,0 +1,147 @@
+name: Wait for canonical head
+description: Wait for a revision-scoped head to become visible at the edge and capture bounded host diagnostics on failure.
+
+inputs:
+  edge-base-url:
+    description: Public burn_p2p edge base URL.
+    required: true
+  experiment-id:
+    description: Experiment whose current revision is being bootstrapped.
+    required: true
+  revision-id:
+    description: Revision expected to publish a current head.
+    required: true
+  bootstrap-instance-id:
+    description: EC2 instance used for lightweight SSM failure diagnostics.
+    required: true
+  aws-region:
+    description: AWS region containing the bootstrap instance.
+    required: true
+  timeout-seconds:
+    description: Maximum readiness wait.
+    required: false
+    default: "600"
+  poll-interval-seconds:
+    description: Delay between edge snapshot requests.
+    required: false
+    default: "10"
+
+runs:
+  using: composite
+  steps:
+    - name: wait for edge-visible canonical head
+      shell: bash
+      env:
+        EDGE_BASE_URL: ${{ inputs['edge-base-url'] }}
+        EXPERIMENT_ID: ${{ inputs['experiment-id'] }}
+        REVISION_ID: ${{ inputs['revision-id'] }}
+        BOOTSTRAP_INSTANCE_ID: ${{ inputs['bootstrap-instance-id'] }}
+        AWS_REGION: ${{ inputs['aws-region'] }}
+        WAIT_TIMEOUT_SECONDS: ${{ inputs['timeout-seconds'] }}
+        POLL_INTERVAL_SECONDS: ${{ inputs['poll-interval-seconds'] }}
+      run: |
+        set -euo pipefail
+        if ! [[ "$WAIT_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+          echo "timeout-seconds must be a positive integer" >&2
+          exit 2
+        fi
+        if ! [[ "$POLL_INTERVAL_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+          echo "poll-interval-seconds must be a positive integer" >&2
+          exit 2
+        fi
+
+        deadline=$((SECONDS + WAIT_TIMEOUT_SECONDS))
+        attempts=0
+        last_observation="edge snapshot unavailable"
+        while (( SECONDS < deadline )); do
+          attempts=$((attempts + 1))
+          snapshot="$(curl \
+            --connect-timeout 5 \
+            --max-time 20 \
+            --retry 2 \
+            --retry-delay 1 \
+            -fsS \
+            "${EDGE_BASE_URL%/}/portal/snapshot" 2>/dev/null || true)"
+          if jq -e . >/dev/null 2>&1 <<<"$snapshot"; then
+            current_head_id="$(jq -r \
+              --arg experiment_id "$EXPERIMENT_ID" \
+              --arg revision_id "$REVISION_ID" \
+              '[.directory.entries[]?
+                | select(
+                    .experiment_id == $experiment_id
+                    and .current_revision_id == $revision_id
+                  )
+                | .current_head_id
+                | select(. != null and . != "")
+              ] | first // empty' <<<"$snapshot")"
+            if [ -n "$current_head_id" ]; then
+              matching_head_count="$(jq -r \
+                --arg experiment_id "$EXPERIMENT_ID" \
+                --arg revision_id "$REVISION_ID" \
+                --arg head_id "$current_head_id" \
+                '[.heads[]?
+                  | select(
+                      .head_id == $head_id
+                      and .experiment_id == $experiment_id
+                      and .revision_id == $revision_id
+                      and (.artifact_id // "") != ""
+                    )
+                ] | length' <<<"$snapshot")"
+              if [ "$matching_head_count" = "1" ]; then
+                echo "canonical head ready: experiment=$EXPERIMENT_ID revision=$REVISION_ID head=$current_head_id attempts=$attempts"
+                exit 0
+              fi
+              last_observation="directory current head $current_head_id is not present exactly once in the edge head set"
+            else
+              last_observation="matching directory entry has no current head"
+            fi
+          fi
+          if [ "$attempts" = "1" ] || (( attempts % 6 == 0 )); then
+            echo "waiting for canonical head: $last_observation"
+          fi
+          sleep "$POLL_INTERVAL_SECONDS"
+        done
+
+        echo "canonical head did not become ready within ${WAIT_TIMEOUT_SECONDS}s: $last_observation" >&2
+        diagnostics="$(jq -cn '{commands:[
+          "set -eu",
+          "systemctl show burn-dragon-p2p-head-mirror --no-pager -p ActiveState -p SubState -p Result -p ExecMainCode -p ExecMainStatus -p NRestarts",
+          "systemctl status burn-dragon-p2p-head-mirror --no-pager || true",
+          "journalctl -u burn-dragon-p2p-head-mirror --no-pager -n 240 || true",
+          "free -h || true",
+          "ps -eo pid,ppid,stat,rss,etimes,comm,args --sort=-rss | head -n 24 || true"
+        ]}')"
+        command_id="$(aws ssm send-command \
+          --region "$AWS_REGION" \
+          --instance-ids "$BOOTSTRAP_INSTANCE_ID" \
+          --document-name AWS-RunShellScript \
+          --comment "diagnose burn_dragon canonical head readiness" \
+          --timeout-seconds 120 \
+          --parameters "$diagnostics" \
+          --query 'Command.CommandId' \
+          --output text 2>/dev/null || true)"
+        if [ -n "$command_id" ] && [ "$command_id" != "None" ]; then
+          invocation_status=""
+          for _ in $(seq 1 24); do
+            invocation_status="$(aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$command_id" \
+              --instance-id "$BOOTSTRAP_INSTANCE_ID" \
+              --query Status \
+              --output text 2>/dev/null || true)"
+            case "$invocation_status" in
+              Success|Cancelled|TimedOut|Failed|Cancelling)
+                break
+                ;;
+            esac
+            sleep 5
+          done
+          aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --command-id "$command_id" \
+            --instance-id "$BOOTSTRAP_INSTANCE_ID" \
+            --output json || true
+        else
+          echo "unable to dispatch canonical-head failure diagnostics" >&2
+        fi
+        exit 1

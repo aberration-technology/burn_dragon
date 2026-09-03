@@ -3,7 +3,7 @@ date -Is
 echo "--- deployment diagnostics ---"
 auth_flags="$(python3 -c 'from pathlib import Path; import json; p=Path("/etc/burn-dragon-p2p/bootstrap.json"); cfg=json.loads(p.read_text()) if p.exists() else {}; kind=(((cfg.get("auth") or {}).get("connector") or {}).get("kind") or "").strip(); print("--check-auth-authorize" if kind in {"github","oidc","oauth"} else "")')"
 echo "--- deployment diagnostics json begin ---"
-/usr/local/bin/burn_dragon_p2p_native deployment-diagnostics --config /etc/burn_dragon_p2p/bootstrap-head-mirror.toml --experiment-kind nca --backend cpu --check-metrics-catchup ${auth_flags} --output-format json || true
+timeout --foreground 90s /usr/local/bin/burn_dragon_p2p_native deployment-diagnostics --config /etc/burn_dragon_p2p/bootstrap-head-mirror.toml --experiment-kind nca --backend cpu --check-metrics-catchup ${auth_flags} --output-format json || true
 echo "--- deployment diagnostics json end ---"
 echo "--- service status ---"
 systemctl status caddy --no-pager || true

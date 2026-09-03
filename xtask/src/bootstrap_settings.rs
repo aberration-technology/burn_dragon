@@ -8,6 +8,9 @@ use serde_json::{Value, json};
 use crate::stack_lock;
 use crate::workflow_tools::BootstrapStackSettingsMode;
 
+const BOOTSTRAP_HEAD_MIRROR_ADMIN_CAPABILITIES: &str =
+    "register_live_head,rollout_auth_policy,rollout_revision_contracts";
+
 pub fn resolve(mode: BootstrapStackSettingsMode) -> Result<()> {
     match mode {
         BootstrapStackSettingsMode::Deploy => resolve_deploy(),
@@ -878,7 +881,7 @@ fn add_bootstrap_head_mirror_principal(
                 "stack": stack_name,
                 "bootstrap_head_mirror": "true",
                 "bootstrap_head_mirror_experiment_id": experiment_id,
-                "admin_capabilities": "register_live_head,rollout_auth_policy"
+                "admin_capabilities": BOOTSTRAP_HEAD_MIRROR_ADMIN_CAPABILITIES
             }
         }),
     );
@@ -1526,6 +1529,8 @@ fn aws_account_id(role_arn: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     #[test]
@@ -1565,6 +1570,22 @@ mod tests {
     fn managed_git_bootstrap_rejects_stack_lock_drift() {
         assert!(
             resolve_bootstrap_git_ref("git", "1111111111111111111111111111111111111111").is_err()
+        );
+    }
+
+    #[test]
+    fn bootstrap_head_mirror_can_publish_and_roll_out_canonical_state() {
+        let capabilities = BOOTSTRAP_HEAD_MIRROR_ADMIN_CAPABILITIES
+            .split(',')
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            capabilities,
+            BTreeSet::from([
+                "register_live_head",
+                "rollout_auth_policy",
+                "rollout_revision_contracts",
+            ])
         );
     }
 }

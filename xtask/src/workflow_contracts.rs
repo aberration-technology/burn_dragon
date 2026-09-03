@@ -764,12 +764,19 @@ fn production_profile_contracts() -> Result<()> {
         "\"/ip4/0.0.0.0/tcp/${var.p2p_port}\"",
         "\"/ip4/0.0.0.0/udp/${local.p2p_webrtc_port}/webrtc-direct\"",
         "authority = null",
+        "\"RolloutRevisionContracts\",",
         "identity = \"Persistent\"",
         "\"/ip4/PUBLIC_IP/udp/${local.p2p_webrtc_port}/webrtc-direct\"",
         "limit_nofile       = 262144",
     ] {
         require_contains(&main_tf, snippet, "production low-resource p2p config")?;
     }
+    let bootstrap_settings = read("xtask/src/bootstrap_settings.rs")?;
+    require_contains(
+        &bootstrap_settings,
+        "register_live_head,rollout_auth_policy,rollout_revision_contracts",
+        "bootstrap head mirror revision-contract rollout authorization",
+    )?;
     let runtime = read("xtask/src/bootstrap_runtime.rs")?;
     require_contains(
         &runtime,

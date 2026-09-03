@@ -681,6 +681,7 @@ locals {
           "RegisterLiveHead",
           "OperatorRetentionPrune",
           "RolloutAuthPolicy",
+          "RolloutRevisionContracts",
         ]
         diagnostics_enabled     = true
         receipt_exports_enabled = true

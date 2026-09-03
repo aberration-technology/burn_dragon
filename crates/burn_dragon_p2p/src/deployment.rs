@@ -31,6 +31,7 @@ pub struct DeploymentDiagnosticsOptions {
     pub require_head_published: bool,
     pub require_head_advanced: bool,
     pub require_directory_entry_published: bool,
+    pub require_revision_contract: bool,
     pub require_metrics_catchup: bool,
     pub require_auth_authorize: bool,
     pub require_artifact_head_view: bool,
@@ -74,6 +75,11 @@ pub struct DeploymentEdgeSnapshotSummary {
     pub matching_directory_entry_present: bool,
     pub matching_directory_current_head_id: Option<String>,
     pub matching_directory_current_head_visible: bool,
+    pub revision_contracts: usize,
+    pub matching_revision_contract_present: bool,
+    pub matching_revision_contract_verified: bool,
+    pub matching_revision_contract_id: Option<String>,
+    pub matching_revision_contract_error: Option<String>,
     pub matching_head_present: bool,
     pub matching_head_id: Option<String>,
     pub matching_head_global_step: Option<u64>,
@@ -306,6 +312,29 @@ fn fetch_deployment_edge_snapshot(
     let matching_directory_current_head_visible = matching_directory_current_head
         .as_ref()
         .is_some_and(|head_id| snapshot.heads.iter().any(|head| &head.head_id == head_id));
+    let matching_revision_contract = matching_directory_entry.and_then(|entry| {
+        snapshot.revision_contracts.iter().find(|contract| {
+            contract.revision.experiment_id == entry.experiment_id
+                && contract.revision.revision_id == entry.current_revision_id
+                && contract.revision.workload_id == entry.workload_id
+        })
+    });
+    let matching_revision_contract_id = matching_revision_contract
+        .and_then(|contract| burn_p2p::ContentId::derive(contract).ok())
+        .map(|id| id.as_str().to_owned());
+    let matching_revision_contract_error = matching_revision_contract.and_then(|contract| {
+        let result = snapshot
+            .trust_bundle
+            .as_ref()
+            .ok_or_else(|| anyhow!("edge snapshot has no authority trust bundle"))
+            .and_then(|trust| {
+                burn_p2p::verify_revision_contract_with_trust_bundle(trust, contract)
+                    .map_err(anyhow::Error::from)
+            });
+        result.err().map(|error| format!("{error:#}"))
+    });
+    let matching_revision_contract_verified =
+        matching_revision_contract.is_some() && matching_revision_contract_error.is_none();
     let matching_head = matching_directory_current_head
         .as_ref()
         .and_then(|head_id| snapshot.heads.iter().find(|head| &head.head_id == head_id))
@@ -346,6 +375,11 @@ fn fetch_deployment_edge_snapshot(
             .as_ref()
             .map(|head_id| head_id.as_str().to_owned()),
         matching_directory_current_head_visible,
+        revision_contracts: snapshot.revision_contracts.len(),
+        matching_revision_contract_present: matching_revision_contract.is_some(),
+        matching_revision_contract_verified,
+        matching_revision_contract_id,
+        matching_revision_contract_error,
         matching_head_present: matching_head.is_some(),
         matching_head_id: matching_head.map(|head| head.head_id.as_str().to_owned()),
         matching_head_global_step: matching_head.map(|head| head.global_step),
@@ -594,6 +628,19 @@ pub fn evaluate_deployment_readiness(
                 observed_warnings.push("matching_directory_entry_missing".into());
             }
         }
+        if !snapshot.matching_revision_contract_present {
+            if options.require_revision_contract {
+                blocking_issues.push("matching_revision_contract_missing".into());
+            } else {
+                observed_warnings.push("matching_revision_contract_missing".into());
+            }
+        } else if !snapshot.matching_revision_contract_verified {
+            if options.require_revision_contract {
+                blocking_issues.push("matching_revision_contract_invalid".into());
+            } else {
+                observed_warnings.push("matching_revision_contract_invalid".into());
+            }
+        }
         if snapshot.matching_directory_current_head_id.is_none() {
             if options.require_head_published {
                 blocking_issues.push("matching_directory_current_head_missing".into());
@@ -811,6 +858,11 @@ mod tests {
             matching_directory_entry_present: true,
             matching_directory_current_head_id: head_present.then(|| "head-1".into()),
             matching_directory_current_head_visible: head_present,
+            revision_contracts: 1,
+            matching_revision_contract_present: true,
+            matching_revision_contract_verified: true,
+            matching_revision_contract_id: Some("contract-1".into()),
+            matching_revision_contract_error: None,
             matching_head_present: head_present,
             matching_head_id: head_present.then(|| "head-1".into()),
             matching_head_global_step: head_present.then_some(1),
@@ -870,6 +922,64 @@ mod tests {
             readiness
                 .observed_warnings
                 .contains(&"matching_experiment_head_missing".to_owned())
+        );
+    }
+
+    #[test]
+    fn deployment_readiness_requires_a_verified_revision_contract_when_requested() {
+        let mut edge = edge_check(true);
+        let snapshot = edge.value.as_mut().expect("edge summary");
+        snapshot.revision_contracts = 0;
+        snapshot.matching_revision_contract_present = false;
+        snapshot.matching_revision_contract_verified = false;
+        snapshot.matching_revision_contract_id = None;
+
+        let readiness = evaluate_deployment_readiness(
+            &capability_check(true),
+            &edge,
+            &profile_check(),
+            None,
+            None,
+            None,
+            &DeploymentDiagnosticsOptions {
+                require_revision_contract: true,
+                ..DeploymentDiagnosticsOptions::default()
+            },
+        );
+
+        assert!(!readiness.ready);
+        assert!(
+            readiness
+                .blocking_issues
+                .contains(&"matching_revision_contract_missing".to_owned())
+        );
+    }
+
+    #[test]
+    fn deployment_readiness_rejects_an_invalid_revision_contract_when_requested() {
+        let mut edge = edge_check(true);
+        let snapshot = edge.value.as_mut().expect("edge summary");
+        snapshot.matching_revision_contract_verified = false;
+        snapshot.matching_revision_contract_error = Some("signature mismatch".into());
+
+        let readiness = evaluate_deployment_readiness(
+            &capability_check(true),
+            &edge,
+            &profile_check(),
+            None,
+            None,
+            None,
+            &DeploymentDiagnosticsOptions {
+                require_revision_contract: true,
+                ..DeploymentDiagnosticsOptions::default()
+            },
+        );
+
+        assert!(!readiness.ready);
+        assert!(
+            readiness
+                .blocking_issues
+                .contains(&"matching_revision_contract_invalid".to_owned())
         );
     }
 

@@ -287,6 +287,21 @@ fn deployment_workflow_contracts() -> Result<()> {
         require_contains(&text, "EDGE_BASE_URL", "edge base url env")?;
         require_contains(
             &text,
+            "admin-provision-revision-contract",
+            "deployment provisions the active signed browser revision contract",
+        )?;
+        require_contains(
+            &text,
+            "--authority-key",
+            "revision-contract signing remains colocated with the edge authority",
+        )?;
+        require_contains(
+            &text,
+            "--require-revision-contract",
+            "deployment readiness requires the browser revision contract",
+        )?;
+        require_contains(
+            &text,
             "default: git\n        type: choice\n        options:\n          - crate\n          - git",
             "managed deployment defaults to the public locked P2P source",
         )?;
@@ -330,6 +345,19 @@ fn deployment_workflow_contracts() -> Result<()> {
 
     let deploy = read(".github/workflows/deploy-burn-dragon-p2p-aws.yml")?;
     let restore = read(".github/workflows/restore-burn-dragon-p2p-aws.yml")?;
+    let secret_sync = read(
+        "crates/burn_dragon_p2p/deploy/terraform/aws/templates/bootstrap-secret-sync.sh.tftpl",
+    )?;
+    require_contains(
+        &secret_sync,
+        "BURN_P2P_REVISION_CONTRACT_FILES",
+        "bootstrap restart reloads the provisioned immutable revision contract",
+    )?;
+    require_contains(
+        &secret_sync,
+        "if [ -s \"$REVISION_CONTRACT_PATH\" ]",
+        "first bootstrap startup does not require a contract before genesis exists",
+    )?;
     require_contains(
         &deploy,
         "deferring strict head/artifact readiness to the live native canary",
@@ -476,6 +504,16 @@ fn browser_canary_contracts() -> Result<()> {
         &ci_workflow,
         "node --test xtask/assets/live-browser-canary-profile.test.mjs",
         "live browser canary profile tests run in CI",
+    )?;
+    let pages_workflow = read(".github/workflows/deploy-pages.yml")?;
+    require_ordered(
+        &pages_workflow,
+        &[
+            "resolve browser shell settings",
+            "verify-edge-revision-contract",
+            "build browser site artifact",
+        ],
+        "Pages verifies the live canonical contract before building or deploying",
     )?;
     Ok(())
 }

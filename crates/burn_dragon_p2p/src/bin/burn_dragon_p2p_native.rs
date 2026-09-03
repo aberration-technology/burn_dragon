@@ -20,8 +20,8 @@ use burn_dragon_language::{TrainingConfig, load_training_config, train};
 use burn_dragon_p2p::admin::{
     fetch_directory_entries, fetch_signed_directory_entries, mirror_peer_artifact,
     preserve_directory_entry_current_head, recover_directory_current_head_from_visible_roots,
-    register_live_head, rollout_directory_entries, upsert_directory_entry,
-    upsert_directory_entry_current_head,
+    register_live_head, rollout_directory_entries, rollout_revision_contracts,
+    upsert_directory_entry, upsert_directory_entry_current_head,
 };
 use burn_dragon_p2p::auth::{
     DragonPendingGitHubLogin, NativeCliBridgeAuthResult, NativeCliBridgeBootstrap,
@@ -125,6 +125,7 @@ enum CommandKind {
     BuildProfile(BuildProfileArgs),
     AdminExportDirectory(AdminExportDirectoryArgs),
     AdminRolloutProfile(AdminRolloutProfileArgs),
+    AdminProvisionRevisionContract(AdminProvisionRevisionContractArgs),
     #[command(alias = "github-login")]
     Login(LoginArgs),
     #[command(alias = "begin-login")]
@@ -484,6 +485,8 @@ struct DeploymentDiagnosticsArgs {
     #[arg(long, default_value_t = false)]
     require_directory_entry_published: bool,
     #[arg(long, default_value_t = false)]
+    require_revision_contract: bool,
+    #[arg(long, default_value_t = false)]
     require_metrics_catchup: bool,
     #[arg(long, default_value_t = false)]
     require_auth_authorize: bool,
@@ -605,6 +608,38 @@ struct AdminRolloutProfileArgs {
     recover_current_head_from_visible_root: bool,
     #[arg(long, action = ArgAction::SetTrue)]
     reset_current_head_to_visible_root: bool,
+    #[arg(long, value_enum, default_value = "json")]
+    output_format: OutputFormat,
+}
+
+#[derive(Debug, Parser)]
+struct AdminProvisionRevisionContractArgs {
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long, value_enum, default_value = "auto")]
+    config_format: ConfigFormat,
+    #[arg(long, value_enum)]
+    experiment_kind: ExperimentKindArg,
+    #[arg(long, value_enum)]
+    backend: BackendArg,
+    #[arg(long)]
+    auth_bundle: PathBuf,
+    #[arg(long, value_enum, default_value = "auto")]
+    auth_bundle_format: ConfigFormat,
+    #[arg(long)]
+    authority_key: PathBuf,
+    #[arg(long)]
+    contract_out: PathBuf,
+    #[arg(long)]
+    edge_url: Option<String>,
+    #[arg(long, default_value_t = 1)]
+    authority_epoch: u64,
+    #[arg(long, default_value = "burn-dragon-deterministic-init-v1")]
+    initialization_algorithm: String,
+    #[arg(long, default_value_t = 600)]
+    wait_timeout_secs: u64,
+    #[arg(long, default_value_t = 5)]
+    poll_interval_secs: u64,
     #[arg(long, value_enum, default_value = "json")]
     output_format: OutputFormat,
 }
@@ -1072,6 +1107,9 @@ fn main() -> Result<()> {
         CommandKind::BuildProfile(args) => build_profile(args),
         CommandKind::AdminExportDirectory(args) => admin_export_directory(args),
         CommandKind::AdminRolloutProfile(args) => admin_rollout_profile(args),
+        CommandKind::AdminProvisionRevisionContract(args) => {
+            admin_provision_revision_contract(args)
+        }
         CommandKind::Login(args) => login(args),
         CommandKind::BeginGithubLogin(args) => begin_github_login(args),
         CommandKind::CompleteGithubLogin(args) => complete_github_login(args),
@@ -1098,6 +1136,7 @@ fn command_label(command: &CommandKind) -> &'static str {
         CommandKind::BuildProfile(_) => "build-profile",
         CommandKind::AdminExportDirectory(_) => "admin-export-directory",
         CommandKind::AdminRolloutProfile(_) => "admin-rollout-profile",
+        CommandKind::AdminProvisionRevisionContract(_) => "admin-provision-revision-contract",
         CommandKind::Login(_) => "login",
         CommandKind::BeginGithubLogin(_) => "begin-github-login",
         CommandKind::CompleteGithubLogin(_) => "complete-github-login",
@@ -1393,6 +1432,7 @@ fn deployment_diagnostics(args: DeploymentDiagnosticsArgs) -> Result<()> {
             require_head_published: args.require_head_published,
             require_head_advanced: args.require_head_advanced,
             require_directory_entry_published: args.require_directory_entry_published,
+            require_revision_contract: args.require_revision_contract,
             require_metrics_catchup: args.require_metrics_catchup,
             require_auth_authorize: args.require_auth_authorize,
             require_artifact_head_view: args.require_artifact_head_view,
@@ -4920,6 +4960,10 @@ fn infer_format(path: &Path) -> Result<ConfigFormat> {
     }
 }
 
+#[path = "burn_dragon_p2p_native/revision_contract.rs"]
+mod revision_contract;
+use revision_contract::*;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5458,6 +5502,27 @@ mod tests {
         };
         assert!(admin_rollout.config.is_none());
         assert!(admin_rollout.reset_current_head_to_visible_root);
+
+        let provision = Cli::try_parse_from([
+            "burn_dragon_p2p_native",
+            "admin-provision-revision-contract",
+            "--experiment-kind",
+            "nca",
+            "--backend",
+            "cpu",
+            "--auth-bundle",
+            "/tmp/auth.json",
+            "--authority-key",
+            "/tmp/authority.key",
+            "--contract-out",
+            "/tmp/nca-r1.revision-contract.json",
+        ])
+        .expect("parse revision-contract provisioning command");
+        let CommandKind::AdminProvisionRevisionContract(provision) = provision.command else {
+            panic!("expected admin-provision-revision-contract command");
+        };
+        assert_eq!(provision.wait_timeout_secs, 600);
+        assert_eq!(provision.poll_interval_secs, 5);
     }
 
     #[test]

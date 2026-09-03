@@ -115,6 +115,15 @@ jobs:
             --edge-domain-name-from-env "${{ vars.BURN_DRAGON_P2P_EDGE_DOMAIN_NAME }}"
           echo "REQUIRE_EDGE_AUTH=${{ github.event.inputs.require_edge_auth }}" >>"$GITHUB_ENV"
 
+      - name: verify selected browser revision contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run -p xtask -- verify-edge-revision-contract \
+            --edge-url "$EDGE_BASE_URL" \
+            --experiment-id "$SELECTED_EXPERIMENT_ID" \
+            --revision-id "$SELECTED_REVISION_ID"
+
       - name: build browser site artifact
         shell: bash
         run: |

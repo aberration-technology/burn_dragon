@@ -110,6 +110,18 @@ was already evaluated before attestation.
 Production native and browser peers must converge on the same signed revision
 contract and exact full-head genesis artifact.
 
+The managed AWS deploy and restore workflows provision the selected head-mirror
+revision automatically after its canonical genesis is visible. Provisioning
+runs on the bootstrap host: it loads the local full-head artifact, decodes it
+through the Dragon workload adapter, computes the canonical tensor digest,
+signs with the bootstrap authority key, atomically rolls the complete contract
+set into the edge, and verifies that the exact bundle is present in
+`/portal/snapshot`. A repeat deployment reuses an already-valid immutable
+contract. The bootstrap service reloads that bundle from the retained head
+mirror storage on every subsequent start. Deployment readiness fails before
+Pages deployment when the selected browser revision has no valid
+authority-signed contract.
+
 The bootstrap accepts one or more JSON contract bundle files through the
 comma-separated `BURN_P2P_REVISION_CONTRACT_FILES` environment variable. On
 startup it:
@@ -171,9 +183,11 @@ cargo run -p xtask -- rollout-revision-contracts \
 
 The rollout validates the complete replacement set before one atomic
 control-plane update; readers never observe a partially rotated revision set.
-Terraform deliberately does not manufacture authority keys or signed
-contracts. Secret custody, staging rotation, and disaster-recovery rehearsal
-remain operator release gates.
+Terraform does not manufacture authority keys. The managed deployment signs
+only after canonical genesis materialization on the authority host; manual
+build/rotation remains available for offline ceremonies. Secret custody,
+staging rotation, and disaster-recovery rehearsal remain operator release
+gates.
 
 ## Artifact Storage
 

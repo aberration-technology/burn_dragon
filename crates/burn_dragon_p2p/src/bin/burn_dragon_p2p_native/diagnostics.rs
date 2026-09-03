@@ -226,6 +226,7 @@ pub(super) fn deployment_diagnostics(args: DeploymentDiagnosticsArgs) -> Result<
             require_head_published: args.require_head_published,
             require_head_advanced: args.require_head_advanced,
             require_directory_entry_published: args.require_directory_entry_published,
+            require_revision_contract: args.require_revision_contract,
             require_metrics_catchup: args.require_metrics_catchup,
             require_auth_authorize: args.require_auth_authorize,
             require_artifact_head_view: args.require_artifact_head_view,

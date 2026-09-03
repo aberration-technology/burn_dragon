@@ -530,6 +530,27 @@ fn native_join_commands_default_to_mainnet_wgpu_and_head_sync() {
     };
     assert!(admin_rollout.config.is_none());
     assert!(admin_rollout.reset_current_head_to_visible_root);
+
+    let provision = Cli::try_parse_from([
+        "burn_dragon_p2p_native",
+        "admin-provision-revision-contract",
+        "--experiment-kind",
+        "nca",
+        "--backend",
+        "cpu",
+        "--auth-bundle",
+        "/tmp/auth.json",
+        "--authority-key",
+        "/tmp/authority.key",
+        "--contract-out",
+        "/tmp/nca-r1.revision-contract.json",
+    ])
+    .expect("parse revision-contract provisioning command");
+    let CommandKind::AdminProvisionRevisionContract(provision) = provision.command else {
+        panic!("expected admin-provision-revision-contract command");
+    };
+    assert_eq!(provision.wait_timeout_secs, 600);
+    assert_eq!(provision.poll_interval_secs, 5);
 }
 
 #[test]

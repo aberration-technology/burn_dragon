@@ -20,8 +20,8 @@ use burn_dragon_language::{TrainingConfig, load_training_config, train};
 use burn_dragon_p2p::admin::{
     fetch_directory_entries, fetch_signed_directory_entries, mirror_peer_artifact,
     preserve_directory_entry_current_head, recover_directory_current_head_from_visible_roots,
-    register_live_head, rollout_directory_entries, upsert_directory_entry,
-    upsert_directory_entry_current_head,
+    register_live_head, rollout_directory_entries, rollout_revision_contracts,
+    upsert_directory_entry, upsert_directory_entry_current_head,
 };
 use burn_dragon_p2p::auth::{
     DragonPendingGitHubLogin, NativeCliBridgeAuthResult, NativeCliBridgeBootstrap,
@@ -125,6 +125,7 @@ enum CommandKind {
     BuildProfile(BuildProfileArgs),
     AdminExportDirectory(AdminExportDirectoryArgs),
     AdminRolloutProfile(AdminRolloutProfileArgs),
+    AdminProvisionRevisionContract(AdminProvisionRevisionContractArgs),
     #[command(alias = "github-login")]
     Login(LoginArgs),
     #[command(alias = "begin-login")]
@@ -484,6 +485,8 @@ struct DeploymentDiagnosticsArgs {
     #[arg(long, default_value_t = false)]
     require_directory_entry_published: bool,
     #[arg(long, default_value_t = false)]
+    require_revision_contract: bool,
+    #[arg(long, default_value_t = false)]
     require_metrics_catchup: bool,
     #[arg(long, default_value_t = false)]
     require_auth_authorize: bool,
@@ -605,6 +608,38 @@ struct AdminRolloutProfileArgs {
     recover_current_head_from_visible_root: bool,
     #[arg(long, action = ArgAction::SetTrue)]
     reset_current_head_to_visible_root: bool,
+    #[arg(long, value_enum, default_value = "json")]
+    output_format: OutputFormat,
+}
+
+#[derive(Debug, Parser)]
+struct AdminProvisionRevisionContractArgs {
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long, value_enum, default_value = "auto")]
+    config_format: ConfigFormat,
+    #[arg(long, value_enum)]
+    experiment_kind: ExperimentKindArg,
+    #[arg(long, value_enum)]
+    backend: BackendArg,
+    #[arg(long)]
+    auth_bundle: PathBuf,
+    #[arg(long, value_enum, default_value = "auto")]
+    auth_bundle_format: ConfigFormat,
+    #[arg(long)]
+    authority_key: PathBuf,
+    #[arg(long)]
+    contract_out: PathBuf,
+    #[arg(long)]
+    edge_url: Option<String>,
+    #[arg(long, default_value_t = 1)]
+    authority_epoch: u64,
+    #[arg(long, default_value = "burn-dragon-deterministic-init-v1")]
+    initialization_algorithm: String,
+    #[arg(long, default_value_t = 600)]
+    wait_timeout_secs: u64,
+    #[arg(long, default_value_t = 5)]
+    poll_interval_secs: u64,
     #[arg(long, value_enum, default_value = "json")]
     output_format: OutputFormat,
 }
@@ -1072,6 +1107,9 @@ fn main() -> Result<()> {
         CommandKind::BuildProfile(args) => build_profile(args),
         CommandKind::AdminExportDirectory(args) => admin_export_directory(args),
         CommandKind::AdminRolloutProfile(args) => admin_rollout_profile(args),
+        CommandKind::AdminProvisionRevisionContract(args) => {
+            admin_provision_revision_contract(args)
+        }
         CommandKind::Login(args) => login(args),
         CommandKind::BeginGithubLogin(args) => begin_github_login(args),
         CommandKind::CompleteGithubLogin(args) => complete_github_login(args),
@@ -1098,6 +1136,7 @@ fn command_label(command: &CommandKind) -> &'static str {
         CommandKind::BuildProfile(_) => "build-profile",
         CommandKind::AdminExportDirectory(_) => "admin-export-directory",
         CommandKind::AdminRolloutProfile(_) => "admin-rollout-profile",
+        CommandKind::AdminProvisionRevisionContract(_) => "admin-provision-revision-contract",
         CommandKind::Login(_) => "login",
         CommandKind::BeginGithubLogin(_) => "begin-github-login",
         CommandKind::CompleteGithubLogin(_) => "complete-github-login",
@@ -1179,6 +1218,8 @@ mod diagnostics;
 mod io;
 #[path = "burn_dragon_p2p_native/local_training.rs"]
 mod local_training;
+#[path = "burn_dragon_p2p_native/revision_contract.rs"]
+mod revision_contract;
 #[path = "burn_dragon_p2p_native/runtime.rs"]
 mod runtime;
 #[path = "burn_dragon_p2p_native/services.rs"]
@@ -1190,6 +1231,7 @@ use auth::*;
 use diagnostics::*;
 use io::*;
 use local_training::*;
+use revision_contract::*;
 use runtime::*;
 use services::*;
 use train_window::*;

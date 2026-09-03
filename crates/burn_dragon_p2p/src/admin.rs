@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use burn_p2p::{
     ContentId, ExperimentDirectoryEntry, HeadAnnouncement, HeadDescriptor, HeadId,
-    directory_revision_contract_matches,
+    RevisionContractBundle, directory_revision_contract_matches,
 };
 use burn_p2p_admin::{AdminClient, AdminClientConfig, AdminResult};
 #[cfg(feature = "native")]
@@ -124,6 +124,19 @@ pub async fn rollout_directory_entries(
         .rollout_directory_entries(directory_entries)
         .await
         .map_err(|error| anyhow!("failed to roll out directory entries: {error}"))
+}
+
+/// Atomically publishes the complete signed revision-contract set exposed by the edge.
+pub async fn rollout_revision_contracts(
+    edge_base_url: &str,
+    session_id: &str,
+    contracts: Vec<RevisionContractBundle>,
+    allow_signature_rotation: bool,
+) -> Result<AdminResult> {
+    admin_client(edge_base_url, Some(session_id))
+        .rollout_revision_contracts(contracts, allow_signature_rotation)
+        .await
+        .map_err(|error| anyhow!("failed to roll out revision contracts: {error}"))
 }
 
 pub async fn register_live_head(

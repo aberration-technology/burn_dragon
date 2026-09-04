@@ -6098,6 +6098,7 @@ start_policy = "capability_gate"
             Some(burn_dragon_core::LanguageHeadConfig::NcaFactorizedPatch {
                 state_count: 2,
                 patch_size: 2,
+                factorize_input_embedding: false,
                 frame_special_tokens: false,
                 eos_id: None,
             });

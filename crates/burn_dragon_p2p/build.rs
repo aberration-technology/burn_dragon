@@ -5,9 +5,11 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=BURN_DRAGON_GIT_COMMIT");
-    println!("cargo:rerun-if-changed=.cargo_vcs_info.json");
-
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
+    let cargo_vcs_info = manifest_dir.join(".cargo_vcs_info.json");
+    if cargo_vcs_info.is_file() {
+        println!("cargo:rerun-if-changed={}", cargo_vcs_info.display());
+    }
     if let Some(commit) = resolve_git_commit(&manifest_dir) {
         println!("cargo:rustc-env=BURN_DRAGON_GIT_COMMIT={commit}");
     }
@@ -59,16 +61,28 @@ fn cargo_vcs_commit(manifest_dir: &Path) -> Option<String> {
 }
 
 fn git_rerun_paths(manifest_dir: &Path) -> Vec<PathBuf> {
-    let git_common_dir = git_command_output(manifest_dir, ["rev-parse", "--git-common-dir"]);
-    let Some(git_common_dir) = git_common_dir else {
+    let Some(git_dir) = git_command_output(manifest_dir, ["rev-parse", "--git-dir"])
+        .map(|path| resolve_git_path(manifest_dir, path))
+    else {
         return Vec::new();
     };
-    let git_dir = manifest_dir.join(git_common_dir);
-    let mut paths = vec![git_dir.join("HEAD"), git_dir.join("packed-refs")];
+    let common_dir = git_command_output(manifest_dir, ["rev-parse", "--git-common-dir"])
+        .map(|path| resolve_git_path(manifest_dir, path))
+        .unwrap_or_else(|| git_dir.clone());
+    let mut paths = vec![git_dir.join("HEAD"), common_dir.join("packed-refs")];
     if let Some(reference) = git_command_output(manifest_dir, ["symbolic-ref", "-q", "HEAD"]) {
-        paths.push(git_dir.join(reference));
+        paths.push(common_dir.join(reference));
     }
+    paths.retain(|path| path.is_file());
     paths
+}
+
+fn resolve_git_path(manifest_dir: &Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        manifest_dir.join(path)
+    }
 }
 
 fn git_command_output<const N: usize>(manifest_dir: &Path, args: [&str; N]) -> Option<PathBuf> {

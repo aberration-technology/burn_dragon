@@ -10,6 +10,7 @@ pub(crate) enum LanguageHeadRuntimeRef<'a, B: Backend> {
         factorized_lm_head: &'a Param<Tensor<B, 2>>,
         special_lm_head: Option<&'a Param<Tensor<B, 2>>>,
         tables: &'a NcaFactorizedHeadTables,
+        device_tables: &'a NcaFactorizedDeviceTables<B>,
     },
 }
 
@@ -43,6 +44,62 @@ impl<B: Backend> DragonModel<B> {
         module
             .map(Self::collect_param_ids_from_module)
             .unwrap_or_default()
+    }
+
+    pub(crate) fn embed_language_tokens(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
+        if !self.language_head.factorizes_input_embedding() {
+            return self.embed.forward(tokens);
+        }
+
+        let tables = self
+            .nca_factorized_head_tables
+            .as_ref()
+            .expect("factorized NCA input tables missing");
+        let device_tables = self
+            .nca_factorized_device_tables
+            .as_ref()
+            .expect("factorized NCA device input tables missing");
+        let [batch, time] = tokens.shape().dims();
+        let token_count = batch * time;
+        let tokens = tokens.reshape([token_count]);
+        let embedding_indices = device_tables
+            .patch_embedding_indices
+            .clone()
+            .select(0, tokens.clone());
+        let patch_embeddings = self
+            .embed
+            .weight
+            .val()
+            .select(
+                0,
+                embedding_indices.reshape([token_count * tables.patch_cells]),
+            )
+            .reshape([token_count, tables.patch_cells, self.n_embd])
+            .sum_dim(1)
+            .reshape([token_count, self.n_embd])
+            .div_scalar((tables.patch_cells as f32).sqrt());
+        let patch_mask = device_tables
+            .patch_mask
+            .clone()
+            .select(0, tokens.clone())
+            .reshape([token_count, 1]);
+        let mut embedded = patch_embeddings * patch_mask;
+
+        if tables.special_count() > 0 {
+            let special_indices = device_tables
+                .special_embedding_indices
+                .clone()
+                .select(0, tokens.clone());
+            let special_embeddings = self.embed.weight.val().select(0, special_indices);
+            let special_mask = device_tables
+                .special_mask
+                .clone()
+                .select(0, tokens)
+                .reshape([token_count, 1]);
+            embedded = embedded + special_embeddings * special_mask;
+        }
+
+        embedded.reshape([batch, time, self.n_embd])
     }
 
     pub fn language_module_lr_scale_param_ids(
@@ -453,7 +510,7 @@ impl<B: Backend> DragonModel<B> {
                         .expect("flat language-model head weights missing"),
                 }
             }
-            LanguageHeadRuntimeKind::NcaFactorizedPatch => {
+            LanguageHeadRuntimeKind::NcaFactorizedPatch { .. } => {
                 LanguageHeadRuntimeRef::NcaFactorizedPatch {
                     factorized_lm_head: self
                         .nca_factorized_lm_head
@@ -464,6 +521,10 @@ impl<B: Backend> DragonModel<B> {
                         .nca_factorized_head_tables
                         .as_ref()
                         .expect("factorized NCA head tables missing"),
+                    device_tables: self
+                        .nca_factorized_device_tables
+                        .as_ref()
+                        .expect("factorized NCA device tables missing"),
                 }
             }
         }
@@ -584,6 +645,7 @@ impl<B: Backend> DragonModel<B> {
         let LanguageHeadRuntimeRef::NcaFactorizedPatch {
             factorized_lm_head,
             special_lm_head,
+            device_tables,
             ..
         } = self.language_head_runtime()
         else {
@@ -596,27 +658,25 @@ impl<B: Backend> DragonModel<B> {
             .reshape([token_count, tables.patch_cells, tables.state_count]);
 
         let targets_flat = targets.reshape([token_count]);
-        let patch_mask = self.lookup_f32_table(
-            &tables.patch_mask_table,
-            targets_flat.clone(),
-            &device,
-            token_count,
-        );
-        let special_mask = self.lookup_f32_table(
-            &tables.special_mask_table,
-            targets_flat.clone(),
-            &device,
-            token_count,
-        );
+        let patch_mask = device_tables
+            .patch_mask
+            .clone()
+            .select(0, targets_flat.clone());
+        let special_mask = device_tables
+            .special_mask
+            .clone()
+            .select(0, targets_flat.clone());
+        let patch_targets = device_tables
+            .patch_digits
+            .clone()
+            .select(0, targets_flat.clone());
 
         let mut patch_nll = Tensor::<B, 1>::zeros([token_count], &device);
         for cell_idx in 0..tables.patch_cells {
-            let cell_targets = self.lookup_i64_table(
-                &tables.patch_digit_tables[cell_idx],
-                targets_flat.clone(),
-                &device,
-                token_count,
-            );
+            let cell_targets = patch_targets
+                .clone()
+                .slice([0..token_count, cell_idx..cell_idx + 1])
+                .reshape([token_count]);
             let cell_logits = patch_logits
                 .clone()
                 .slice([
@@ -633,12 +693,10 @@ impl<B: Backend> DragonModel<B> {
         }
 
         let special_nll = if tables.special_count() > 0 {
-            let special_targets = self.lookup_i64_table(
-                &tables.special_index_table,
-                targets_flat,
-                &device,
-                token_count,
-            );
+            let special_targets = device_tables
+                .special_indices
+                .clone()
+                .select(0, targets_flat);
             let special_logits = hidden_flat
                 .matmul(
                     special_lm_head
@@ -666,20 +724,17 @@ impl<B: Backend> DragonModel<B> {
     ) -> Tensor<B, 1> {
         let [batch, time, _dim] = hidden.shape().dims();
         let token_count = batch * time;
-        let device = hidden.device();
         let targets_flat = targets.clone().reshape([token_count]);
-        let patch_mask = self.lookup_f32_table(
-            &tables.patch_mask_table,
-            targets_flat.clone(),
-            &device,
-            token_count,
-        );
-        let special_mask = self.lookup_f32_table(
-            &tables.special_mask_table,
-            targets_flat.clone(),
-            &device,
-            token_count,
-        );
+        let LanguageHeadRuntimeRef::NcaFactorizedPatch { device_tables, .. } =
+            self.language_head_runtime()
+        else {
+            panic!("factorized NCA loss requires NCA factorized language head runtime");
+        };
+        let patch_mask = device_tables
+            .patch_mask
+            .clone()
+            .select(0, targets_flat.clone());
+        let special_mask = device_tables.special_mask.clone().select(0, targets_flat);
 
         let token_nll = self
             .nca_factorized_language_token_losses_from_hidden(hidden, targets, tables)
@@ -689,29 +744,5 @@ impl<B: Backend> DragonModel<B> {
             .sum()
             .div(supported.sum().clamp_min(1.0))
             .reshape([1])
-    }
-
-    fn lookup_i64_table(
-        &self,
-        values: &[i64],
-        indices: Tensor<B, 1, Int>,
-        device: &B::Device,
-        token_count: usize,
-    ) -> Tensor<B, 1, Int> {
-        Tensor::<B, 2, Int>::from_data(TensorData::new(values.to_vec(), [1, values.len()]), device)
-            .gather(1, indices.reshape([1, token_count]))
-            .reshape([token_count])
-    }
-
-    fn lookup_f32_table(
-        &self,
-        values: &[f32],
-        indices: Tensor<B, 1, Int>,
-        device: &B::Device,
-        token_count: usize,
-    ) -> Tensor<B, 1> {
-        Tensor::<B, 2>::from_data(TensorData::new(values.to_vec(), [1, values.len()]), device)
-            .gather(1, indices.reshape([1, token_count]))
-            .reshape([token_count])
     }
 }

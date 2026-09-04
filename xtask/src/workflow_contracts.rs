@@ -803,24 +803,24 @@ fn production_profile_contracts() -> Result<()> {
     )?;
     require_contains(
         &bootstrap_settings,
-        "DEFAULT_NCA_REVISION_ID: &str = \"nca-r2\"",
+        "DEFAULT_NCA_REVISION_ID: &str = \"nca-r3\"",
         "deployment settings share the active immutable NCA revision",
     )?;
     require_contains(
         &main_tf,
-        "profiles/nca-r2.profile.json",
-        "terraform publishes the active NCA R2 profile",
+        "profiles/nca-r3.profile.json",
+        "terraform publishes the active NCA R3 profile",
     )?;
     require_contains(
         &main_tf,
-        "current_revision_id = \"nca-r2\"",
-        "terraform advertises NCA R2 as the active revision",
+        "current_revision_id = \"nca-r3\"",
+        "terraform advertises NCA R3 as the active revision",
     )?;
     let pages_workflow = read(".github/workflows/deploy-pages.yml")?;
     require_contains(
         &pages_workflow,
-        "default: nca-r2",
-        "Pages selects the active NCA R2 revision by default",
+        "default: nca-r3",
+        "Pages selects the active NCA R3 revision by default",
     )?;
     let runtime = read("xtask/src/bootstrap_runtime.rs")?;
     require_contains(
@@ -879,7 +879,7 @@ fn production_profile_contracts() -> Result<()> {
         "deploy probes the signed browser-direct seed",
     )?;
 
-    let profile = read("crates/burn_dragon_p2p/deploy/profiles/nca-r2.profile.json")?;
+    let profile = read("crates/burn_dragon_p2p/deploy/profiles/nca-r3.profile.json")?;
     let profile: Value = serde_json::from_str(&profile)?;
     let browser = profile
         .get("browser_training")
@@ -905,6 +905,15 @@ fn production_profile_contracts() -> Result<()> {
         browser["max_eval_batches"].as_u64().unwrap_or(u64::MAX) <= 1,
         "browser max eval batches should stay cheap"
     );
+    ensure!(
+        browser["model_config"]["sequence_kernel"]["executor"]
+            == json!("dense_score_short_context"),
+        "active browser profile must use the tensorized short-context executor"
+    );
+    ensure!(
+        browser["model_config"]["language_head"]["factorize_input_embedding"] == json!(true),
+        "active browser profile must use the publishable factorized NCA input"
+    );
     let previous_profile = read("crates/burn_dragon_p2p/deploy/profiles/nca-r1.profile.json")?;
     let previous_profile: Value = serde_json::from_str(&previous_profile)?;
     let previous_browser = previous_profile
@@ -915,6 +924,20 @@ fn production_profile_contracts() -> Result<()> {
         previous_browser["block_size"] == json!(512)
             && previous_browser["tbptt_chunk_size"].is_null(),
         "immutable nca-r1 browser execution contract drifted"
+    );
+    let previous_profile = read("crates/burn_dragon_p2p/deploy/profiles/nca-r2.profile.json")?;
+    let previous_profile: Value = serde_json::from_str(&previous_profile)?;
+    let previous_browser = previous_profile
+        .get("browser_training")
+        .or_else(|| previous_profile.get("browser"))
+        .unwrap_or(&Value::Null);
+    ensure!(
+        previous_browser["block_size"] == json!(256)
+            && previous_browser["tbptt_chunk_size"] == json!(64)
+            && previous_browser["model_config"]["sequence_kernel"] == json!("linear_attention")
+            && previous_browser["model_config"]["language_head"]["factorize_input_embedding"]
+                .is_null(),
+        "immutable nca-r2 browser execution contract drifted"
     );
     Ok(())
 }

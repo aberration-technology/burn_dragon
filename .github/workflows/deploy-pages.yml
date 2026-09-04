@@ -35,7 +35,7 @@ on:
       selected_revision_id:
         description: Default revision id selected on load.
         required: false
-        default: nca-r2
+        default: nca-r3
         type: string
       canary_principal_id:
         description: Optional admitted principal id for the post-deploy live browser canary. Leave empty to use the environment default.

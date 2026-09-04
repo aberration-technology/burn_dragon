@@ -449,6 +449,58 @@ mod tests {
     }
 
     #[test]
+    fn dense_score_matches_recurrent_attention_with_decay_and_state() {
+        let batch = 2;
+        let heads = 3;
+        let time = 16;
+        let latent = 5;
+        let n_embd = 7;
+        let query_shape = [batch, heads, time, latent];
+        let value_shape = [batch, 1, time, n_embd];
+        let rho_shape = [batch, heads, latent, n_embd];
+        let query = tensor4(
+            (0..query_shape.iter().product::<usize>())
+                .map(|index| ((index * 5) % 97) as f32 / 97.0)
+                .collect(),
+            query_shape,
+        );
+        let value = tensor4(
+            (0..value_shape.iter().product::<usize>())
+                .map(|index| (((index * 7) % 89) as f32 - 44.0) / 89.0)
+                .collect(),
+            value_shape,
+        );
+        let rho_state = tensor4(
+            (0..rho_shape.iter().product::<usize>())
+                .map(|index| (((index * 11) % 83) as f32 - 41.0) / 83.0)
+                .collect(),
+            rho_shape,
+        );
+        let decay = Tensor::<TestBackend, 1>::from_data(
+            TensorData::new(vec![0.91f32, 0.95, 0.98], [heads]),
+            &Default::default(),
+        );
+
+        let (recurrent_context, recurrent_rho) = recurrent_attention_reference(
+            query.clone(),
+            value.clone(),
+            Some(rho_state.clone()),
+            Some(decay.clone()),
+        );
+        let (dense_context, dense_rho) = recurrent_attention_dense_score_reference(
+            query,
+            value,
+            Some(rho_state),
+            Some(decay),
+            64,
+            None,
+        );
+
+        assert!(max_abs_diff(recurrent_context, dense_context) < 2.0e-4);
+        assert!(max_abs_diff(recurrent_rho, dense_rho) < 2.0e-4);
+    }
+
+    #[test]
     fn chunked_dense_score_reference_matches_full_without_decay() {
         let row_chunk = 256;
         let time = row_chunk + 64;

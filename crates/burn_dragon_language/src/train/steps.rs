@@ -13987,6 +13987,7 @@ mod objective_step_tests {
         config.language_head = burn_dragon_core::LanguageHeadConfig::NcaFactorizedPatch {
             state_count: 2,
             patch_size: 2,
+            factorize_input_embedding: false,
             frame_special_tokens: true,
             eos_id: Some(31),
         };

@@ -78,6 +78,8 @@ const PORTABLE_CACHE_DIR_NAME: &str = "__dragon_network_profile_cache__";
 const BUILTIN_NCA_R1_PROFILE_JSON: &str = include_str!("../deploy/profiles/nca-r1.profile.json");
 #[cfg(feature = "native")]
 const BUILTIN_NCA_R2_PROFILE_JSON: &str = include_str!("../deploy/profiles/nca-r2.profile.json");
+#[cfg(feature = "native")]
+const BUILTIN_NCA_R3_PROFILE_JSON: &str = include_str!("../deploy/profiles/nca-r3.profile.json");
 
 #[cfg(feature = "native")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -872,6 +874,10 @@ pub fn build_profile_from_local_config(
             .fit(std::iter::empty::<&str>())?
             .as_ref(),
     )?;
+    let mut browser_model_config = model_config.clone();
+    if let Some(sequence_kernel) = config.training.sequence_kernel_override {
+        browser_model_config.sequence_kernel = sequence_kernel;
+    }
     let portable_corpus = portable_universality_corpus(config)?;
     let portable_kind = portable_corpus.as_ref().map(|corpus| corpus.kind);
     let nca_corpus_toml = portable_corpus
@@ -893,7 +899,7 @@ pub fn build_profile_from_local_config(
         browser: browser_profile_from_native_config(
             config,
             experiment_kind,
-            &model_config,
+            &browser_model_config,
             portable_corpus.as_ref(),
             revision_id,
             browser_climbmix_manifest_url,
@@ -1074,6 +1080,7 @@ fn builtin_nca_profile_json(revision_id: &str) -> Option<&'static str> {
     match revision_id {
         "nca-r1" => Some(BUILTIN_NCA_R1_PROFILE_JSON),
         "nca-r2" => Some(BUILTIN_NCA_R2_PROFILE_JSON),
+        "nca-r3" => Some(BUILTIN_NCA_R3_PROFILE_JSON),
         _ => None,
     }
 }
@@ -1837,7 +1844,7 @@ prompt = "[R2"
             manifest: DragonManifestSeed {
                 study_id: "burn-dragon-mainnet".into(),
                 experiment_id: "nca-prepretraining".into(),
-                revision_id: "nca-r2".into(),
+                revision_id: "nca-r3".into(),
                 ..DragonManifestSeed::default()
             },
             app_semver: semver::Version::parse(env!("CARGO_PKG_VERSION"))
@@ -1861,7 +1868,7 @@ prompt = "[R2"
             resolved.manifest_seed.experiment_id,
             "nca-prepretraining".to_owned()
         );
-        assert_eq!(resolved.manifest_seed.revision_id, "nca-r2".to_owned());
+        assert_eq!(resolved.manifest_seed.revision_id, "nca-r3".to_owned());
         assert_eq!(
             resolved.source,
             DragonResolvedProfileSource::BuiltinFallback
@@ -1948,6 +1955,40 @@ prompt = "[R2"
         let browser_model = profile.browser.expect("browser profile").model_config;
 
         assert_eq!(browser_model, native_model);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn builtin_nca_r3_promotes_the_factorized_dense_browser_path() {
+        let profile: DragonExperimentProfile =
+            serde_json::from_str(BUILTIN_NCA_R3_PROFILE_JSON).expect("builtin NCA R3 profile");
+        let native_config: TrainingConfig =
+            toml::from_str(&profile.native.training_toml).expect("native training config");
+        let browser = profile.browser.expect("browser profile");
+
+        assert_eq!(
+            native_config.training.sequence_kernel_override,
+            Some(browser.model_config.sequence_kernel)
+        );
+        assert_eq!(
+            browser.model_config.sequence_kernel.executor,
+            burn_dragon_core::SequenceTrainingExecutor::DenseScoreShortContext
+        );
+        assert!(matches!(
+            browser.model_config.language_head,
+            burn_dragon_core::LanguageHeadConfig::NcaFactorizedPatch {
+                factorize_input_embedding: true,
+                ..
+            }
+        ));
+        let footprint = crate::capability::estimate_language_training_footprint(
+            &browser.model_config,
+            browser.batch_size,
+            browser.block_size,
+            crate::capability::DragonCapabilityClass::BrowserWgpu,
+        );
+        assert!(footprint.estimated_parameter_bytes <= 16 * 1024 * 1024);
+        assert!(builtin_nca_profile_json("nca-r3").is_some());
     }
 
     #[cfg(feature = "native")]

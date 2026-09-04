@@ -268,6 +268,8 @@ pub struct DragonModel<B: Backend> {
     next_latent_transition_out: Option<Linear<B>>,
     #[module(skip)]
     nca_factorized_head_tables: Option<NcaFactorizedHeadTables>,
+    #[module(skip)]
+    nca_factorized_device_tables: Option<NcaFactorizedDeviceTables<B>>,
 }
 
 #[derive(Clone, Debug)]
@@ -398,22 +400,46 @@ pub(crate) struct NcaFactorizedHeadTables {
     special_mask_table: Vec<f32>,
 }
 
+#[derive(Module, Debug)]
+pub(crate) struct NcaFactorizedDeviceTables<B: Backend> {
+    patch_digits: Tensor<B, 2, Int>,
+    patch_embedding_indices: Tensor<B, 2, Int>,
+    patch_mask: Tensor<B, 1>,
+    special_indices: Tensor<B, 1, Int>,
+    special_embedding_indices: Tensor<B, 1, Int>,
+    special_mask: Tensor<B, 1>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum LanguageHeadRuntimeKind {
     StandardTokenClassification,
-    NcaFactorizedPatch,
+    NcaFactorizedPatch { factorize_input_embedding: bool },
 }
 
 impl LanguageHeadRuntimeKind {
     fn from_config(config: &LanguageHeadConfig) -> Self {
         match config {
             LanguageHeadConfig::StandardTokenClassification => Self::StandardTokenClassification,
-            LanguageHeadConfig::NcaFactorizedPatch { .. } => Self::NcaFactorizedPatch,
+            LanguageHeadConfig::NcaFactorizedPatch {
+                factorize_input_embedding,
+                ..
+            } => Self::NcaFactorizedPatch {
+                factorize_input_embedding: *factorize_input_embedding,
+            },
         }
     }
 
     fn uses_flat_token_logits(&self) -> bool {
         matches!(self, Self::StandardTokenClassification)
+    }
+
+    fn factorizes_input_embedding(&self) -> bool {
+        matches!(
+            self,
+            Self::NcaFactorizedPatch {
+                factorize_input_embedding: true,
+            }
+        )
     }
 }
 
@@ -467,6 +493,7 @@ impl NcaFactorizedHeadTables {
         let LanguageHeadConfig::NcaFactorizedPatch {
             state_count,
             patch_size,
+            factorize_input_embedding: _,
             frame_special_tokens,
             eos_id,
         } = config
@@ -474,9 +501,13 @@ impl NcaFactorizedHeadTables {
             return Ok(None);
         };
         config.validate_for_vocab_size(vocab_size)?;
-        let patch_cells = patch_size.saturating_mul(*patch_size);
+        let patch_cells = patch_size
+            .checked_mul(*patch_size)
+            .ok_or_else(|| "NCA factorized head patch cell count overflow".to_string())?;
+        let patch_exponent = u32::try_from(patch_cells)
+            .map_err(|_| "NCA factorized head patch cell count exceeds u32".to_string())?;
         let patch_vocab_size = state_count
-            .checked_pow(patch_cells as u32)
+            .checked_pow(patch_exponent)
             .ok_or_else(|| "NCA factorized head patch vocabulary overflow".to_string())?;
         let mut special_token_ids = Vec::new();
         if *frame_special_tokens {
@@ -524,6 +555,54 @@ impl NcaFactorizedHeadTables {
 
     fn special_count(&self) -> usize {
         self.special_token_ids.len()
+    }
+
+    fn to_device_tables<B: Backend>(&self, device: &B::Device) -> NcaFactorizedDeviceTables<B> {
+        let vocab_size = self.patch_mask_table.len();
+        let mut token_major_digits = Vec::with_capacity(vocab_size * self.patch_cells);
+        let mut token_major_embedding_indices = Vec::with_capacity(vocab_size * self.patch_cells);
+        for token_id in 0..vocab_size {
+            for (cell_index, cell) in self.patch_digit_tables.iter().enumerate() {
+                let digit = cell[token_id];
+                token_major_digits.push(digit);
+                token_major_embedding_indices.push((cell_index * self.state_count) as i64 + digit);
+            }
+        }
+        let special_embedding_offset = self.patch_cells * self.state_count;
+        let special_embedding_indices = self
+            .special_index_table
+            .iter()
+            .map(|index| special_embedding_offset as i64 + index)
+            .collect::<Vec<_>>();
+        NcaFactorizedDeviceTables {
+            patch_digits: Tensor::<B, 2, Int>::from_data(
+                TensorData::new(token_major_digits, [vocab_size, self.patch_cells]),
+                device,
+            ),
+            patch_embedding_indices: Tensor::<B, 2, Int>::from_data(
+                TensorData::new(
+                    token_major_embedding_indices,
+                    [vocab_size, self.patch_cells],
+                ),
+                device,
+            ),
+            patch_mask: Tensor::<B, 1>::from_data(
+                TensorData::new(self.patch_mask_table.clone(), [vocab_size]),
+                device,
+            ),
+            special_indices: Tensor::<B, 1, Int>::from_data(
+                TensorData::new(self.special_index_table.clone(), [vocab_size]),
+                device,
+            ),
+            special_embedding_indices: Tensor::<B, 1, Int>::from_data(
+                TensorData::new(special_embedding_indices, [vocab_size]),
+                device,
+            ),
+            special_mask: Tensor::<B, 1>::from_data(
+                TensorData::new(self.special_mask_table.clone(), [vocab_size]),
+                device,
+            ),
+        }
     }
 }
 
@@ -685,7 +764,16 @@ impl<B: Backend> DragonModel<B> {
             .validate_for_model(config.n_embd, config.n_head, config.latent_total())
             .unwrap_or_else(|message| panic!("invalid model.random_scaffold: {message}"));
         let initializer = DragonInitializer::new(&config.initialization);
-        let embed = EmbeddingConfig::new(config.vocab_size, config.n_embd)
+        let nca_factorized_head_tables = NcaFactorizedHeadTables::from_language_head_config(
+            &config.language_head,
+            config.vocab_size,
+        )
+        .unwrap_or_else(|message| panic!("invalid language head config: {message}"));
+        let input_embedding_rows = config
+            .language_head
+            .input_embedding_rows(config.vocab_size)
+            .unwrap_or_else(|message| panic!("invalid language head config: {message}"));
+        let embed = EmbeddingConfig::new(input_embedding_rows, config.n_embd)
             .with_initializer(initializer.embedding_initializer(config.n_embd))
             .init(device);
         let dropout = DropoutConfig::new(config.dropout).init();
@@ -890,11 +978,9 @@ impl<B: Backend> DragonModel<B> {
                 .unwrap_or_else(|error| panic!("invalid upstream gated_deltanet2 config: {error}"))
             });
         let language_head = LanguageHeadRuntimeKind::from_config(&config.language_head);
-        let nca_factorized_head_tables = NcaFactorizedHeadTables::from_language_head_config(
-            &config.language_head,
-            config.vocab_size,
-        )
-        .unwrap_or_else(|message| panic!("invalid language head config: {message}"));
+        let nca_factorized_device_tables = nca_factorized_head_tables
+            .as_ref()
+            .map(|tables| tables.to_device_tables(device));
         let lm_head = if nca_factorized_head_tables.is_none() {
             Some(Param::from_tensor(initializer.projection_tensor::<B>(
                 DragonProjectionRole::LmHead,
@@ -1073,6 +1159,7 @@ impl<B: Backend> DragonModel<B> {
             next_latent_transition_mid,
             next_latent_transition_out,
             nca_factorized_head_tables,
+            nca_factorized_device_tables,
         }
     }
 
@@ -1581,7 +1668,7 @@ impl<B: Backend> DragonModel<B> {
         assert!(population > 0, "population size must be > 0");
         self.assert_shared_lowrank_population_shapes(&lowrank);
 
-        let embedded = self.embed.forward(tokens);
+        let embedded = self.embed_tokens(tokens);
         let embedded_population = Tensor::cat(
             (0..population)
                 .map(|_| embedded.clone())
@@ -1627,7 +1714,7 @@ impl<B: Backend> DragonModel<B> {
         assert!(population > 0, "population size must be > 0");
         self.assert_shared_lowrank_population_factor_shapes(&factors);
 
-        let embedded = self.embed.forward(tokens);
+        let embedded = self.embed_tokens(tokens);
         let embedded_population = Tensor::cat(
             (0..population)
                 .map(|_| embedded.clone())
@@ -1646,7 +1733,7 @@ impl<B: Backend> DragonModel<B> {
     }
 
     pub fn embed_tokens(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
-        self.embed.forward(tokens)
+        self.embed_language_tokens(tokens)
     }
 
     pub fn begin_language_pipeline_from_embedded(
@@ -1669,7 +1756,7 @@ impl<B: Backend> DragonModel<B> {
     }
 
     pub fn begin_language_pipeline(&self, tokens: Tensor<B, 2, Int>) -> LanguagePipelineState<B> {
-        self.begin_language_pipeline_from_embedded(self.embed.forward(tokens))
+        self.begin_language_pipeline_from_embedded(self.embed_tokens(tokens))
     }
 
     pub fn forward_language_pipeline_stage_with_state(
@@ -2704,7 +2791,7 @@ impl<B: Backend> DragonModel<B> {
         state: &mut ModelState<B>,
         summary_event_mask: Option<Tensor<B, 2, Int>>,
     ) -> (Tensor<B, 3>, Tensor<B, 3>) {
-        let embedded = self.embed.forward(tokens);
+        let embedded = self.embed_tokens(tokens);
         self.forward_with_state_from_embedded(embedded, state, summary_event_mask)
     }
 
@@ -2714,7 +2801,7 @@ impl<B: Backend> DragonModel<B> {
         state: &mut ModelState<B>,
         summary_event_mask: Option<Tensor<B, 2, Int>>,
     ) -> Tensor<B, 3> {
-        let embedded = self.embed.forward(tokens);
+        let embedded = self.embed_tokens(tokens);
         self.forward_hidden_with_state_from_embedded(embedded, state, summary_event_mask)
     }
 
@@ -4154,7 +4241,7 @@ impl<B: Backend> DragonModel<B> {
         tokens: Tensor<B, 2, Int>,
         state: &mut ModelState<B>,
     ) -> Tensor<B, 3> {
-        let embedded = self.embed.forward(tokens);
+        let embedded = self.embed_tokens(tokens);
         self.forward_hidden_raw_with_state_from_embedded(embedded, state, None)
     }
 
@@ -4255,7 +4342,7 @@ mod tests {
     use crate::model::init::{
         DragonInitializationConfig, DragonInitializationKind, DragonReservoirInitializationConfig,
     };
-    use burn::optim::GradientsParams;
+    use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
     use burn_autodiff::Autodiff;
     use burn_ndarray::NdArray;
 
@@ -4523,6 +4610,170 @@ mod tests {
             .reshape([1, 1, 32]);
         let diff = max_abs_diff(tensor_values(logits), tensor_values(expected));
         assert!(diff <= 1e-6, "tied logits drifted by {diff}");
+    }
+
+    #[test]
+    fn factorized_nca_lookup_tables_are_materialized_once_on_device() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mut config = tiny_scaling_source_config(SequenceKernelConfig::default());
+        config.language_head = LanguageHeadConfig::NcaFactorizedPatch {
+            state_count: 2,
+            patch_size: 2,
+            factorize_input_embedding: false,
+            frame_special_tokens: true,
+            eos_id: Some(31),
+        };
+        let model = DragonModel::<TestBackend>::new(config, &device);
+        let host = model
+            .nca_factorized_head_tables
+            .as_ref()
+            .expect("host NCA lookup metadata");
+        let cached = model
+            .nca_factorized_device_tables
+            .as_ref()
+            .expect("device NCA lookup tables");
+
+        let expected_digits = (0..host.patch_mask_table.len())
+            .flat_map(|token_id| {
+                host.patch_digit_tables
+                    .iter()
+                    .map(move |cell| cell[token_id])
+            })
+            .collect::<Vec<_>>();
+        let actual_digits = cached
+            .patch_digits
+            .clone()
+            .to_data()
+            .into_vec::<i64>()
+            .expect("cached NCA patch digits");
+        assert_eq!(actual_digits, expected_digits);
+        assert_eq!(
+            tensor_values(cached.patch_mask.clone()),
+            host.patch_mask_table
+        );
+        assert_eq!(
+            cached
+                .special_indices
+                .clone()
+                .to_data()
+                .into_vec::<i64>()
+                .expect("cached NCA special indices"),
+            host.special_index_table
+        );
+        assert_eq!(
+            tensor_values(cached.special_mask.clone()),
+            host.special_mask_table
+        );
+
+        let hidden = Tensor::<TestBackend, 3>::ones([1, 5, 16], &device);
+        let targets = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0_i64, 15, 16, 17, 31], [1, 5]),
+            &device,
+        );
+        let losses = tensor_values(model.language_token_losses_from_hidden(hidden, targets));
+        assert!(losses.iter().all(|loss| loss.is_finite()));
+    }
+
+    #[test]
+    fn factorized_nca_input_composes_patch_cells_and_special_tokens() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mut config = tiny_scaling_source_config(SequenceKernelConfig::default());
+        config.language_head = LanguageHeadConfig::NcaFactorizedPatch {
+            state_count: 2,
+            patch_size: 2,
+            factorize_input_embedding: true,
+            frame_special_tokens: true,
+            eos_id: Some(31),
+        };
+        let mut model = DragonModel::<TestBackend>::new(config, &device);
+        assert_eq!(model.embed.weight.val().shape().dims::<2>(), [11, 16]);
+        let rows = (0..11)
+            .flat_map(|row| std::iter::repeat_n(row as f32 + 1.0, 16))
+            .collect::<Vec<_>>();
+        model.embed.weight = Param::from_tensor(Tensor::<TestBackend, 2>::from_data(
+            TensorData::new(rows, [11, 16]),
+            &device,
+        ));
+        let tokens = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0_i64, 15, 16, 17, 31, 18], [1, 6]),
+            &device,
+        );
+        let embedded = model.embed_tokens(tokens);
+        let values = tensor_values(embedded);
+        let first_dimension = values
+            .chunks_exact(16)
+            .map(|row| row[0])
+            .collect::<Vec<_>>();
+
+        assert_eq!(first_dimension, vec![8.0, 10.0, 9.0, 10.0, 11.0, 0.0]);
+    }
+
+    #[test]
+    fn factorized_nca_input_removes_flat_vocabulary_parameter_cost() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mut flat_config = tiny_scaling_source_config(SequenceKernelConfig::default());
+        flat_config.language_head = LanguageHeadConfig::NcaFactorizedPatch {
+            state_count: 2,
+            patch_size: 2,
+            factorize_input_embedding: false,
+            frame_special_tokens: true,
+            eos_id: Some(31),
+        };
+        let flat = DragonModel::<TestBackend>::new(flat_config.clone(), &device);
+        let mut factorized_config = flat_config;
+        let LanguageHeadConfig::NcaFactorizedPatch {
+            factorize_input_embedding,
+            ..
+        } = &mut factorized_config.language_head
+        else {
+            unreachable!();
+        };
+        *factorize_input_embedding = true;
+        let factorized = DragonModel::<TestBackend>::new(factorized_config, &device);
+
+        assert_eq!(flat.num_params() - factorized.num_params(), (32 - 11) * 16);
+    }
+
+    #[test]
+    fn factorized_nca_input_trains_end_to_end() {
+        let device = burn::tensor::Device::<TestAutodiffBackend>::default();
+        TestAutodiffBackend::seed(&device, 1337);
+        let mut config = tiny_scaling_source_config(SequenceKernelConfig::default());
+        config.language_head = LanguageHeadConfig::NcaFactorizedPatch {
+            state_count: 2,
+            patch_size: 2,
+            factorize_input_embedding: true,
+            frame_special_tokens: true,
+            eos_id: Some(31),
+        };
+        let mut model = DragonModel::<TestAutodiffBackend>::new(config, &device);
+        let mut optimizer = AdamWConfig::new().init();
+        let tokens = Tensor::<TestAutodiffBackend, 2, Int>::from_data(
+            TensorData::new((0_i64..16).collect(), [1, 16]),
+            &device,
+        );
+        let targets = Tensor::<TestAutodiffBackend, 2, Int>::from_data(
+            TensorData::new((0_i64..16).rev().collect(), [1, 16]),
+            &device,
+        );
+        let initial_loss = model
+            .language_loss_from_hidden(model.forward_hidden(tokens.clone()), targets.clone())
+            .into_scalar();
+
+        for _ in 0..40 {
+            let loss = model
+                .language_loss_from_hidden(model.forward_hidden(tokens.clone()), targets.clone());
+            let grads = GradientsParams::from_grads(loss.backward(), &model);
+            model = optimizer.step(5.0e-3, model, grads);
+        }
+
+        let final_loss = model
+            .language_loss_from_hidden(model.forward_hidden(tokens), targets)
+            .into_scalar();
+        assert!(
+            final_loss < initial_loss * 0.75,
+            "factorized NCA training failed to converge: initial={initial_loss} final={final_loss}"
+        );
     }
 
     #[test]

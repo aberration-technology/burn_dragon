@@ -295,6 +295,11 @@ fn deployment_workflow_contracts() -> Result<()> {
             "uses: ./.github/actions/wait-for-canonical-head",
             "deployment waits for a fully edge-visible canonical head before signing",
         )?;
+        require_absent(
+            &text,
+            "timeout-seconds: \"300\"",
+            "deployment does not truncate first-time canonical-head materialization",
+        )?;
         require_contains(
             &text,
             "systemctl stop burn-dragon-p2p-head-mirror",
@@ -379,6 +384,11 @@ fn deployment_workflow_contracts() -> Result<()> {
         &canonical_head_action,
         "journalctl -u burn-dragon-p2p-head-mirror",
         "canonical-head failures capture bounded head-mirror diagnostics",
+    )?;
+    require_contains(
+        &canonical_head_action,
+        "default: \"1800\"",
+        "canonical-head readiness allows bounded cold model materialization",
     )?;
     require_contains(
         &inspect_commands,

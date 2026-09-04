@@ -18,9 +18,9 @@ inputs:
     description: AWS region containing the bootstrap instance.
     required: true
   timeout-seconds:
-    description: Maximum readiness wait.
+    description: Maximum readiness wait, including first-time model initialization and artifact materialization.
     required: false
-    default: "600"
+    default: "1800"
   poll-interval-seconds:
     description: Delay between edge snapshot requests.
     required: false

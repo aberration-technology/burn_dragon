@@ -942,7 +942,6 @@ jobs:
           revision-id: ${{ env.BOOTSTRAP_HEAD_MIRROR_REVISION_ID }}
           bootstrap-instance-id: ${{ steps.outputs.outputs.instance_id }}
           aws-region: ${{ env.AWS_REGION }}
-          timeout-seconds: "300"
 
       - name: provision authority-signed browser revision contract
         if: ${{ github.event.inputs.plan_only != 'true' }}

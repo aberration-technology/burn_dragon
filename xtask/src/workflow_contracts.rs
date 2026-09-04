@@ -886,7 +886,7 @@ fn production_profile_contracts() -> Result<()> {
         .or_else(|| profile.get("browser"))
         .unwrap_or(&Value::Null);
     ensure!(
-        browser["batch_size"] == json!(4),
+        browser["batch_size"] == json!(6),
         "browser batch size drifted"
     );
     ensure!(

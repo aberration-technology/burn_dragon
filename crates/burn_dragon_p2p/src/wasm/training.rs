@@ -3676,10 +3676,14 @@ mod tests {
             serde_json::from_str(include_str!("../../deploy/profiles/nca-r2.profile.json"))
                 .expect("builtin NCA R2 profile");
         let browser = profile.browser.expect("browser profile");
-        let train_source = production_nca_runtime_source(browser.train_source, None);
+        let train_document_limit = batch_size
+            .checked_mul(train_batches)
+            .expect("bounded benchmark shape should not overflow");
+        let train_source =
+            production_nca_runtime_source(browser.train_source, Some(train_document_limit));
         let eval_source = browser
             .eval_source
-            .map(|source| production_nca_runtime_source(source, None));
+            .map(|source| production_nca_runtime_source(source, Some(batch_size)));
         let mut model_config = browser.model_config;
         model_config.fused_kernels.enabled = fused;
         model_config.fused_kernels.set_wgpu_recurrent_kernel(fused);

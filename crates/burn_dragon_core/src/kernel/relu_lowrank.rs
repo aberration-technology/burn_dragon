@@ -329,7 +329,7 @@ mod tests {
         .to_vec::<f32>()
         .expect("masked output");
 
-        for channels in actual.chunks_exact(4) {
+        for channels in actual.as_chunks::<4>().0 {
             assert_eq!(channels, &[3.0, 0.0, 3.0, 0.0]);
         }
     }

@@ -368,7 +368,7 @@ impl<B: Backend> BrowserTrainingKernel<B> for BrowserSeededFitnessKernel<B> {
             }
             losses.extend(scalar_values_from_loss_tensors_async(loss_tensors).await?);
         }
-        for (pair_index, pair_losses) in losses.chunks_exact(2).enumerate() {
+        for (pair_index, pair_losses) in losses.as_chunks::<2>().0.iter().enumerate() {
             fitness.push(AntitheticFitness {
                 pair_index: pair_index as u64,
                 plus: -(pair_losses[0] as f32),

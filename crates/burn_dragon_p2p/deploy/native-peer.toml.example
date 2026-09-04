@@ -27,7 +27,7 @@ project_family_id = "burn-dragon-language"
 network_id = "burn-dragon-mainnet"
 study_id = "burn-dragon-mainnet"
 experiment_id = "nca-prepretraining"
-revision_id = "nca-r1"
+revision_id = "nca-r2"
 display_name = "burn_dragon mainnet NCA pre-pre-training"
 description = "burn_dragon mainnet native trainer"
 protocol_major = 0
@@ -35,7 +35,7 @@ authority_public_keys = []
 bootstrap_addrs = []
 # Production peers fail closed unless this authority-signed bundle exists and
 # matches the local Dragon model, dataset, objective, optimizer, and revision.
-revision_contract_path = "/etc/burn_dragon_p2p/nca-r1.revision-contract.json"
+revision_contract_path = "/etc/burn_dragon_p2p/nca-r2.revision-contract.json"
 require_signed_revision_contracts = true
 
 # Keep this identical across every peer in the signed revision. Use

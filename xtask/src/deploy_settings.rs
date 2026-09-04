@@ -9,11 +9,12 @@ use burn_p2p_core::{BrowserSeedAdvertisement, SchemaEnvelope, SignedPayload};
 use clap::Args;
 use serde::Serialize;
 
+use crate::bootstrap_settings::DEFAULT_NCA_REVISION_ID;
+
 const EDGE_FETCH_MAX_ATTEMPTS: usize = 3;
 const DEFAULT_BROWSER_APP_BASE_URL: &str = "https://dragon.aberration.technology";
 const DEFAULT_EDGE_BASE_URL: &str = "https://edge.dragon.aberration.technology";
 const DEFAULT_EXPERIMENT_ID: &str = "nca-prepretraining";
-const DEFAULT_REVISION_ID: &str = "nca-r1";
 
 #[derive(Debug, Clone, Args)]
 pub struct ResolvePagesDeploySettingsArgs {
@@ -92,7 +93,7 @@ pub fn resolve_pages_deploy_settings_inner(
     let selected_revision_id = first_nonempty([
         &args.selected_revision_id_input,
         &args.selected_revision_id_from_env,
-        DEFAULT_REVISION_ID,
+        DEFAULT_NCA_REVISION_ID,
     ])
     .to_owned();
     let default_canary_principal_id = default_canary_principal_id(&args.environment);

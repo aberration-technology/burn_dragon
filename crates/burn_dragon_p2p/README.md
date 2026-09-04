@@ -431,7 +431,7 @@ burn_dragon_p2p_native run-peer
 
 With no `--config`, the binary uses the public Dragon edge at
 `https://edge.dragon.aberration.technology`, DNS TCP/QUIC seeds for that edge,
-the `burn-dragon-mainnet` / `nca-prepretraining` / `nca-r1` experiment ids, and
+the `burn-dragon-mainnet` / `nca-prepretraining` / `nca-r2` experiment ids, and
 a storage root under `$XDG_DATA_HOME/burn_dragon_p2p/mainnet-native` or
 `~/.local/share/burn_dragon_p2p/mainnet-native`. Override the storage root with
 `BURN_DRAGON_P2P_NATIVE_STORAGE_ROOT` when running multiple peers on one host.
@@ -612,6 +612,7 @@ cargo run -p burn_dragon_p2p --features native --bin burn_dragon_p2p_native -- \
   build-profile \
   --training-config crates/burn_dragon_p2p/deploy/profiles/nca-r1.training.toml \
   --experiment-kind nca \
+  --revision-id nca-r2 \
   --output /tmp/nca-r2.profile.json
 ```
 

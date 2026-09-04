@@ -165,7 +165,8 @@
       }
     },
     "execution_backend": "auto",
-    "block_size": 512,
+    "block_size": 256,
+    "tbptt_chunk_size": 64,
     "learning_rate": 0.001,
     "weight_decay": 0.0,
     "batch_size": 1,

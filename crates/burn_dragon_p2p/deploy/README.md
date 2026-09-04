@@ -135,7 +135,7 @@ Native peer config points to the same bundle with:
 
 ```toml
 [manifest]
-revision_contract_path = "/etc/burn_dragon_p2p/nca-r1.revision-contract.json"
+revision_contract_path = "/etc/burn_dragon_p2p/nca-r2.revision-contract.json"
 require_signed_revision_contracts = true
 ```
 
@@ -149,13 +149,13 @@ Build and verify a bundle from explicit authority material:
 
 ```bash
 cargo run -p xtask -- build-revision-contract \
-  --spec /secure/nca-r1.contract-spec.json \
+  --spec /secure/nca-r2.contract-spec.json \
   --artifact-store-root /var/lib/burn-p2p/artifacts \
   --authority-key /secure/authority.key \
-  --output /secure/nca-r1.revision-contract.json
+  --output /secure/nca-r2.revision-contract.json
 
 cargo run -p xtask -- verify-revision-contract \
-  --bundle /secure/nca-r1.revision-contract.json \
+  --bundle /secure/nca-r2.revision-contract.json \
   --trust-bundle /secure/trust-bundle.json \
   --artifact-store-root /var/lib/burn-p2p/artifacts
 ```
@@ -170,13 +170,13 @@ them out through the authenticated live admin API:
 
 ```bash
 cargo run -p xtask -- rotate-revision-contracts \
-  --bundle /secure/nca-r1.revision-contract.json \
+  --bundle /secure/nca-r2.revision-contract.json \
   --new-authority-key /secure/next-authority.key \
   --output-dir /secure/contracts-next
 
 cargo run -p xtask -- rollout-revision-contracts \
   --edge-url https://edge.dragon.aberration.technology \
-  --bundle /secure/contracts-next/nca-r1.revision-contract.json \
+  --bundle /secure/contracts-next/nca-r2.revision-contract.json \
   --session-id "$BURN_P2P_ADMIN_SESSION_ID" \
   --allow-signature-rotation
 ```
@@ -316,7 +316,7 @@ Optional GitHub repository variables for the Pages workflow:
 - `BURN_DRAGON_P2P_PAGES_SELECTED_EXPERIMENT_ID`
 - `BURN_DRAGON_P2P_PAGES_SELECTED_REVISION_ID`
 
-None of those values are secrets. If they are omitted, the Pages workflow defaults to `https://edge.dragon.aberration.technology`, `nca-prepretraining`, and `nca-r1`, then derives browser-capable bootstrap material from the live edge before publishing. Operators can still override everything with workflow inputs, `?edge=` / `?seed=` query params, or the UI at runtime.
+None of those values are secrets. If they are omitted, the Pages workflow defaults to `https://edge.dragon.aberration.technology`, `nca-prepretraining`, and `nca-r2`, then derives browser-capable bootstrap material from the live edge before publishing. Operators can still override everything with workflow inputs, `?edge=` / `?seed=` query params, or the UI at runtime.
 
 ## Required GitHub Environment Configuration
 
@@ -620,7 +620,7 @@ Use `BURN_DRAGON_P2P_AUTH_PRINCIPALS_JSON` to inject principals like:
 
 The initial directory entries are seeded from:
 
-- `crates/burn_dragon_p2p/deploy/profiles/nca-r1.profile.json`
+- `crates/burn_dragon_p2p/deploy/profiles/nca-r2.profile.json`
 - `crates/burn_dragon_p2p/deploy/profiles/climbmix-r1.profile.json`
 
 The checked-in `ruliad-1m` profile pair is the local ruliad trainability
@@ -634,7 +634,7 @@ and should not be treated as the default ruliad path.
 
 `BURN_DRAGON_P2P_CLIMBMIX_BROWSER_DATASET_BASE_URL` defaults to the managed dataset CDN path `https://datasets.dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1`. Terraform publishes `${base_url}/fetch-manifest.json` into the initial ClimbMix browser profile. Browser peers still fetch only the shards they train on. With a runtime-provided training lease they use the exact assigned microshards; otherwise they use the bounded deterministic per-peer fallback advertised by the profile. The shipped Dragon browser app now reads that persisted browser training lease automatically before local training starts.
 
-The shipped `nca-r1` native profile is sized for operator-run trainers rather than the old tiny bootstrap smoke path: `8` layers, `512` hidden width, `1024` total latent width, `512` token windows, batch `6`, and `24` training steps per window. The corresponding browser profile uses the same model and optimizer with an explicitly signed WebGPU execution tier: `256` token windows, `64` token TBPTT chunks, `batch_size = 1`, `8` train batches, `1` eval batch, a generated-document pool derived from the native window, and a `30s` window budget. The shorter browser gradient horizon avoids unbounded WebGPU command/resource retention; it was verified with the full production model rather than only the tiny browser smoke model. The profile advertises a `6 GiB` browser WebGPU training budget. Capable high-memory WebGPU browsers can train without taking the native trainer memory path; lower-memory browsers still downgrade before allocating the training buffers.
+The shipped `nca-r2` profile retains the `nca-r1` native model and corpus settings: `8` layers, `512` hidden width, `1024` total latent width, `512` token windows, batch `6`, and `24` training steps per window. Its explicitly signed browser WebGPU execution tier uses `256` token windows, `64` token TBPTT chunks, `batch_size = 1`, `8` train batches, `1` eval batch, a generated-document pool derived from the native window, and a `30s` window budget. The shorter browser gradient horizon avoids unbounded WebGPU command/resource retention; it was verified with the full production model rather than only the tiny browser smoke model. The profile advertises a `6 GiB` browser WebGPU training budget. `nca-r1` remains checked in as an immutable historical contract. Capable high-memory WebGPU browsers can train without taking the native trainer memory path; lower-memory browsers still downgrade before allocating the training buffers.
 
 Those profile payloads are derived from the source configs in the same folder. To regenerate a profile locally:
 
@@ -643,7 +643,8 @@ cargo run -p burn_dragon_p2p --features native --bin burn_dragon_p2p_native -- \
   build-profile \
   --training-config crates/burn_dragon_p2p/deploy/profiles/nca-r1.training.toml \
   --experiment-kind nca \
-  --output crates/burn_dragon_p2p/deploy/profiles/nca-r1.profile.json
+  --revision-id nca-r2 \
+  --output crates/burn_dragon_p2p/deploy/profiles/nca-r2.profile.json
 ```
 
 For ClimbMix, pass the revision id so the browser shard-manifest URL is included in the profile:
@@ -735,7 +736,7 @@ cargo install --locked burn_dragon_p2p --version 0.21.0 --bin burn_dragon_p2p_na
 
 With no `--config`, the binary points at
 `https://edge.dragon.aberration.technology`, uses DNS TCP/QUIC seed multiaddrs,
-joins `burn-dragon-mainnet` / `nca-prepretraining` / `nca-r1`, restores the
+joins `burn-dragon-mainnet` / `nca-prepretraining` / `nca-r2`, restores the
 canonical head at startup, and resyncs it every 15 seconds while `run-peer` is
 alive. Set `BURN_DRAGON_P2P_NATIVE_STORAGE_ROOT` if you want the auth cache,
 materialized network profile, and checkpoints somewhere other than the default

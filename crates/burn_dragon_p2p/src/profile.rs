@@ -76,6 +76,8 @@ const PORTABLE_RULIAD_CORPUS_FILE_NAME: &str = "ruliad-corpus.toml";
 const PORTABLE_CACHE_DIR_NAME: &str = "__dragon_network_profile_cache__";
 #[cfg(feature = "native")]
 const BUILTIN_NCA_R1_PROFILE_JSON: &str = include_str!("../deploy/profiles/nca-r1.profile.json");
+#[cfg(feature = "native")]
+const BUILTIN_NCA_R2_PROFILE_JSON: &str = include_str!("../deploy/profiles/nca-r2.profile.json");
 
 #[cfg(feature = "native")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1055,15 +1057,24 @@ fn builtin_native_training_profile(
     native: &DragonNativePeerConfig,
     experiment_kind: DragonExperimentKind,
 ) -> Result<Option<DragonExperimentProfile>> {
-    match (
-        experiment_kind,
-        native.manifest.experiment_id.as_str(),
-        native.manifest.revision_id.as_str(),
-    ) {
-        (DragonExperimentKind::NcaPrepretraining, "nca-prepretraining", "nca-r1") => {
-            Ok(Some(serde_json::from_str(BUILTIN_NCA_R1_PROFILE_JSON)?))
-        }
-        _ => Ok(None),
+    if experiment_kind != DragonExperimentKind::NcaPrepretraining
+        || native.manifest.experiment_id != "nca-prepretraining"
+    {
+        return Ok(None);
+    }
+    Ok(
+        builtin_nca_profile_json(native.manifest.revision_id.as_str())
+            .map(serde_json::from_str)
+            .transpose()?,
+    )
+}
+
+#[cfg(feature = "native")]
+fn builtin_nca_profile_json(revision_id: &str) -> Option<&'static str> {
+    match revision_id {
+        "nca-r1" => Some(BUILTIN_NCA_R1_PROFILE_JSON),
+        "nca-r2" => Some(BUILTIN_NCA_R2_PROFILE_JSON),
+        _ => None,
     }
 }
 
@@ -1309,17 +1320,14 @@ pub fn browser_training_config_from_directory_entries(
         return browser_training_config_from_profile(entry, &profile);
     }
 
-    match (
-        entry.experiment_id.as_str(),
-        entry.current_revision_id.as_str(),
-    ) {
-        ("nca-prepretraining", "nca-r1") => {
-            let profile: DragonExperimentProfile =
-                serde_json::from_str(BUILTIN_NCA_R1_PROFILE_JSON)?;
-            browser_training_config_from_profile(entry, &profile)
-        }
-        _ => Ok(None),
+    if entry.experiment_id.as_str() != "nca-prepretraining" {
+        return Ok(None);
     }
+    let Some(profile_json) = builtin_nca_profile_json(entry.current_revision_id.as_str()) else {
+        return Ok(None);
+    };
+    let profile: DragonExperimentProfile = serde_json::from_str(profile_json)?;
+    browser_training_config_from_profile(entry, &profile)
 }
 
 #[cfg(test)]
@@ -1829,7 +1837,7 @@ prompt = "[R2"
             manifest: DragonManifestSeed {
                 study_id: "burn-dragon-mainnet".into(),
                 experiment_id: "nca-prepretraining".into(),
-                revision_id: "nca-r1".into(),
+                revision_id: "nca-r2".into(),
                 ..DragonManifestSeed::default()
             },
             app_semver: semver::Version::parse(env!("CARGO_PKG_VERSION"))
@@ -1853,7 +1861,7 @@ prompt = "[R2"
             resolved.manifest_seed.experiment_id,
             "nca-prepretraining".to_owned()
         );
-        assert_eq!(resolved.manifest_seed.revision_id, "nca-r1".to_owned());
+        assert_eq!(resolved.manifest_seed.revision_id, "nca-r2".to_owned());
         assert_eq!(
             resolved.source,
             DragonResolvedProfileSource::BuiltinFallback
@@ -1868,9 +1876,29 @@ prompt = "[R2"
 
     #[cfg(feature = "native")]
     #[test]
-    fn builtin_nca_browser_window_uses_native_profile_tuning() {
+    fn builtin_nca_r1_remains_immutable_when_r2_changes_browser_execution() {
+        let r1: DragonExperimentProfile =
+            serde_json::from_str(BUILTIN_NCA_R1_PROFILE_JSON).expect("builtin NCA R1 profile");
+        let r2: DragonExperimentProfile =
+            serde_json::from_str(BUILTIN_NCA_R2_PROFILE_JSON).expect("builtin NCA R2 profile");
+        let r1_browser = r1.browser.expect("NCA R1 browser profile");
+        let r2_browser = r2.browser.expect("NCA R2 browser profile");
+
+        assert_eq!(r1_browser.block_size, 512);
+        assert_eq!(r1_browser.tbptt_chunk_size, None);
+        assert_eq!(r2_browser.block_size, 256);
+        assert_eq!(r2_browser.tbptt_chunk_size, Some(64));
+        assert_eq!(
+            crate::config::dragon_model_schema_hash(&r1_browser.model_config),
+            crate::config::dragon_model_schema_hash(&r2_browser.model_config)
+        );
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn builtin_nca_r2_browser_window_uses_native_profile_tuning() {
         let profile: DragonExperimentProfile =
-            serde_json::from_str(BUILTIN_NCA_R1_PROFILE_JSON).expect("builtin NCA profile");
+            serde_json::from_str(BUILTIN_NCA_R2_PROFILE_JSON).expect("builtin NCA R2 profile");
         let native_config: TrainingConfig =
             toml::from_str(&profile.native.training_toml).expect("native training config");
         let expected = DragonBrowserWindowTuning::nca_wgpu_from_native(&native_config);
@@ -1901,9 +1929,9 @@ prompt = "[R2"
 
     #[cfg(feature = "native")]
     #[test]
-    fn builtin_nca_browser_model_matches_native_profile_schema() {
+    fn builtin_nca_r2_browser_model_matches_native_profile_schema() {
         let profile: DragonExperimentProfile =
-            serde_json::from_str(BUILTIN_NCA_R1_PROFILE_JSON).expect("builtin NCA profile");
+            serde_json::from_str(BUILTIN_NCA_R2_PROFILE_JSON).expect("builtin NCA R2 profile");
         let native_config: TrainingConfig =
             toml::from_str(&profile.native.training_toml).expect("native training config");
         let tokenizer = native_config

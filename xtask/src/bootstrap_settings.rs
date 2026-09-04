@@ -10,6 +10,7 @@ use crate::workflow_tools::BootstrapStackSettingsMode;
 
 const BOOTSTRAP_HEAD_MIRROR_ADMIN_CAPABILITIES: &str =
     "register_live_head,rollout_auth_policy,rollout_revision_contracts";
+pub(crate) const DEFAULT_NCA_REVISION_ID: &str = "nca-r2";
 
 pub fn resolve(mode: BootstrapStackSettingsMode) -> Result<()> {
     match mode {
@@ -807,7 +808,7 @@ fn resolve_managed_trainer(
     );
     let (experiment_id, revision_id) = match experiment_kind.as_str() {
         "climbmix" => ("climbmix-pretraining", "climbmix-r1"),
-        _ => ("nca-prepretraining", "nca-r1"),
+        _ => ("nca-prepretraining", DEFAULT_NCA_REVISION_ID),
     };
     let mut auth_mode = "disabled".to_owned();
     let mut principal_id = String::new();
@@ -865,7 +866,7 @@ fn add_bootstrap_head_mirror_principal(
     let workspace = env_or("TF_WORKSPACE_NAME", "");
     let principal_id = format!("bootstrap-head-mirror-{workspace}-nca");
     let experiment_id = "nca-prepretraining".to_owned();
-    let revision_id = "nca-r1".to_owned();
+    let revision_id = DEFAULT_NCA_REVISION_ID.to_owned();
     upsert_principal(
         principals,
         json!({
@@ -900,7 +901,7 @@ fn canary_principals(workspace: &str) -> CanaryPrincipals {
     CanaryPrincipals {
         browser_principal_id: format!("browser-canary-{workspace}-nca"),
         browser_experiment_id: "nca-prepretraining".to_owned(),
-        browser_revision_id: "nca-r1".to_owned(),
+        browser_revision_id: DEFAULT_NCA_REVISION_ID.to_owned(),
         native_validator_principal_id: format!("{native_principal_id}-validator"),
         native_principal_id,
     }

@@ -2846,8 +2846,8 @@ mod tests {
     #[wasm_bindgen_test]
     fn browser_training_smoke_generated_nca_schema_is_cross_target_stable() {
         let profile: crate::profile::DragonExperimentProfile =
-            serde_json::from_str(include_str!("../../deploy/profiles/nca-r1.profile.json"))
-                .expect("builtin NCA profile");
+            serde_json::from_str(include_str!("../../deploy/profiles/nca-r2.profile.json"))
+                .expect("builtin NCA R2 profile");
         let wire_json = serde_json::to_string(&profile).expect("serialize browser profile");
         let javascript_value =
             js_sys::JSON::parse(&wire_json).expect("parse profile in JavaScript");
@@ -3143,8 +3143,8 @@ mod tests {
     #[ignore = "explicit production-scale browser WebGPU readiness probe"]
     async fn browser_training_production_nca_window() {
         let profile: crate::profile::DragonExperimentProfile =
-            serde_json::from_str(include_str!("../../deploy/profiles/nca-r1.profile.json"))
-                .expect("builtin NCA profile");
+            serde_json::from_str(include_str!("../../deploy/profiles/nca-r2.profile.json"))
+                .expect("builtin NCA R2 profile");
         let browser = profile.browser.expect("browser profile");
         let train_source = production_nca_runtime_source(browser.train_source);
         let eval_source = browser.eval_source.map(production_nca_runtime_source);

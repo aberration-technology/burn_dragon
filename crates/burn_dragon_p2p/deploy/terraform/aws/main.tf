@@ -217,7 +217,7 @@ locals {
   managed_trainer_features                   = local.managed_trainer_backend == "cpu" ? "native" : "native,${local.managed_trainer_backend}"
   managed_trainer_enabled_features_label     = local.managed_trainer_features
   managed_trainer_experiment_id              = local.managed_trainer_experiment_kind == "climbmix" ? "climbmix-pretraining" : "nca-prepretraining"
-  managed_trainer_revision_id                = local.managed_trainer_experiment_kind == "climbmix" ? "climbmix-r1" : "nca-r1"
+  managed_trainer_revision_id                = local.managed_trainer_experiment_kind == "climbmix" ? "climbmix-r1" : "nca-r2"
   managed_trainer_auth_bundle_parameter_name = trimspace(var.managed_trainer_auth_bundle_parameter_name) != "" ? trimspace(var.managed_trainer_auth_bundle_parameter_name) : local.secret_parameter_names.trainer_auth_bundle
   managed_trainer_seed_node_urls = [
     "/dns4/${var.edge_domain_name}/tcp/${var.p2p_port}",
@@ -227,7 +227,7 @@ locals {
   bootstrap_head_mirror_backend                    = "cpu"
   bootstrap_head_mirror_experiment_kind            = "nca"
   bootstrap_head_mirror_experiment_id              = "nca-prepretraining"
-  bootstrap_head_mirror_revision_id                = "nca-r1"
+  bootstrap_head_mirror_revision_id                = "nca-r2"
   bootstrap_head_mirror_target                     = "trainer"
   bootstrap_head_mirror_enabled_features_label     = "native"
   bootstrap_head_mirror_storage_root               = "${local.bootstrap_data_mount_path}/head-mirror"
@@ -241,7 +241,7 @@ locals {
   managed_validator_features                   = "native"
   managed_validator_enabled_features_label     = local.managed_validator_features
   managed_validator_experiment_id              = local.managed_validator_experiment_kind == "climbmix" ? "climbmix-pretraining" : "nca-prepretraining"
-  managed_validator_revision_id                = local.managed_validator_experiment_kind == "climbmix" ? "climbmix-r1" : "nca-r1"
+  managed_validator_revision_id                = local.managed_validator_experiment_kind == "climbmix" ? "climbmix-r1" : "nca-r2"
   managed_validator_auth_bundle_parameter_name = trimspace(var.managed_validator_auth_bundle_parameter_name) != "" ? trimspace(var.managed_validator_auth_bundle_parameter_name) : local.secret_parameter_names.validator_auth_bundle
   managed_validator_seed_node_urls             = local.managed_trainer_seed_node_urls
   auth_connector = local.auth_connector_kind == "github" ? merge(
@@ -320,7 +320,7 @@ locals {
     local.dragon_experiment_scopes,
     [{ "Admin" = { study_id = var.study_id } }],
   )
-  nca_profile_json = trimspace(file("${path.module}/../../profiles/nca-r1.profile.json"))
+  nca_profile_json = trimspace(file("${path.module}/../../profiles/nca-r2.profile.json"))
   climbmix_profile = jsondecode(trimspace(file("${path.module}/../../profiles/climbmix-r1.profile.json")))
   climbmix_profile_json = jsonencode(
     local.climbmix_browser_manifest_url == null ? merge(
@@ -567,7 +567,7 @@ locals {
       }
       visibility          = "OptIn"
       opt_in_policy       = "Scoped"
-      current_revision_id = "nca-r1"
+      current_revision_id = "nca-r2"
       current_head_id     = null
       allowed_roles = {
         roles = ["TrainerCpu", "TrainerGpu", "BrowserObserver", "BrowserTrainerWgpu", "Archive", "Viewer"]

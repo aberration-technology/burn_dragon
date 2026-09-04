@@ -102,7 +102,7 @@ const DEFAULT_MAINNET_PROJECT_FAMILY_ID: &str = "burn-dragon-language";
 const DEFAULT_MAINNET_NETWORK_ID: &str = "burn-dragon-mainnet";
 const DEFAULT_MAINNET_STUDY_ID: &str = "burn-dragon-mainnet";
 const DEFAULT_MAINNET_EXPERIMENT_ID: &str = "nca-prepretraining";
-const DEFAULT_MAINNET_REVISION_ID: &str = "nca-r1";
+const DEFAULT_MAINNET_REVISION_ID: &str = "nca-r2";
 const DEFAULT_MAINNET_SEED_NODE_URLS: &[&str] = &[
     "/dns4/edge.dragon.aberration.technology/tcp/4001",
     "/dns4/edge.dragon.aberration.technology/udp/4001/quic-v1",

@@ -55,7 +55,7 @@ const DRAGON_PROFILE_VERSION: u32 = 1;
 #[cfg(feature = "native")]
 const DEFAULT_BROWSER_CLIMBMIX_MAX_SHARDS_PER_WINDOW: usize = 4;
 #[cfg(feature = "native")]
-const NCA_BROWSER_WGPU_BATCH_SIZE_CAP: usize = 4;
+const NCA_BROWSER_WGPU_BATCH_SIZE_CAP: usize = 6;
 #[cfg(feature = "native")]
 const NCA_BROWSER_WGPU_MAX_TRAIN_BATCHES_CAP: usize = 8;
 #[cfg(feature = "native")]
@@ -1980,7 +1980,7 @@ prompt = "[R2"
                 ..
             }
         ));
-        assert_eq!(browser.batch_size, 4);
+        assert_eq!(browser.batch_size, 6);
         let footprint = crate::capability::estimate_language_training_footprint(
             &browser.model_config,
             browser.batch_size,

@@ -246,7 +246,7 @@
     "tbptt_persist_across_steps": false,
     "learning_rate": 0.001,
     "weight_decay": 0.0,
-    "batch_size": 1,
+    "batch_size": 4,
     "max_train_batches": 8,
     "max_eval_batches": 1,
     "capability_policy": {

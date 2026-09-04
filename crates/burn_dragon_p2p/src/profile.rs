@@ -55,7 +55,7 @@ const DRAGON_PROFILE_VERSION: u32 = 1;
 #[cfg(feature = "native")]
 const DEFAULT_BROWSER_CLIMBMIX_MAX_SHARDS_PER_WINDOW: usize = 4;
 #[cfg(feature = "native")]
-const NCA_BROWSER_WGPU_BATCH_SIZE_CAP: usize = 1;
+const NCA_BROWSER_WGPU_BATCH_SIZE_CAP: usize = 4;
 #[cfg(feature = "native")]
 const NCA_BROWSER_WGPU_MAX_TRAIN_BATCHES_CAP: usize = 8;
 #[cfg(feature = "native")]
@@ -1903,32 +1903,31 @@ prompt = "[R2"
 
     #[cfg(feature = "native")]
     #[test]
-    fn builtin_nca_r2_browser_window_uses_native_profile_tuning() {
+    fn builtin_nca_r2_browser_window_remains_immutable() {
         let profile: DragonExperimentProfile =
             serde_json::from_str(BUILTIN_NCA_R2_PROFILE_JSON).expect("builtin NCA R2 profile");
         let native_config: TrainingConfig =
             toml::from_str(&profile.native.training_toml).expect("native training config");
-        let expected = DragonBrowserWindowTuning::nca_wgpu_from_native(&native_config);
         let browser = profile.browser.expect("browser profile");
 
-        assert_eq!(browser.block_size, expected.block_size);
-        assert_eq!(browser.tbptt_chunk_size, Some(expected.tbptt_chunk_size));
+        assert_eq!(browser.block_size, 256);
+        assert_eq!(browser.tbptt_chunk_size, Some(64));
         assert!(browser.block_size <= native_config.training.block_size);
         assert_eq!(browser.learning_rate, native_config.optimizer.learning_rate);
         assert_eq!(browser.weight_decay, native_config.optimizer.weight_decay);
-        assert_eq!(browser.batch_size, expected.batch_size);
-        assert_eq!(browser.max_train_batches, Some(expected.max_train_batches));
-        assert_eq!(browser.max_eval_batches, Some(expected.max_eval_batches));
+        assert_eq!(browser.batch_size, 1);
+        assert_eq!(browser.max_train_batches, Some(8));
+        assert_eq!(browser.max_eval_batches, Some(1));
 
         match browser.train_source {
             DragonBrowserProfileTokenSource::GeneratedNca { max_documents, .. } => {
-                assert_eq!(max_documents, Some(expected.train_document_pool));
+                assert_eq!(max_documents, Some(144));
             }
             other => panic!("expected generated NCA train source, got {other:?}"),
         }
         match browser.eval_source.expect("eval source") {
             DragonBrowserProfileTokenSource::GeneratedNca { max_documents, .. } => {
-                assert_eq!(max_documents, Some(expected.eval_document_pool));
+                assert_eq!(max_documents, Some(8));
             }
             other => panic!("expected generated NCA eval source, got {other:?}"),
         }
@@ -1981,6 +1980,7 @@ prompt = "[R2"
                 ..
             }
         ));
+        assert_eq!(browser.batch_size, 4);
         let footprint = crate::capability::estimate_language_training_footprint(
             &browser.model_config,
             browser.batch_size,

@@ -143,7 +143,9 @@ where
             "seeded-fitness population must contain antithetic pairs"
         );
         let fitness = values
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .enumerate()
             .map(|(pair_index, pair)| AntitheticFitness {
                 pair_index: pair_index as u64,
@@ -479,7 +481,9 @@ where
             pairs_checked = pairs_checked.saturating_add(1);
         }
         let fitness = values
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .enumerate()
             .map(|(pair_index, pair)| AntitheticFitness {
                 pair_index: pair_index as u64,

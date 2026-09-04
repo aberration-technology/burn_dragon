@@ -538,7 +538,7 @@ mod tests {
             &RevisionId::new("revision"),
             &WorkloadId::new("workload"),
         )
-        .unwrap_err();
+        .expect_err("incomplete head lineage must be rejected");
 
         assert!(error.to_string().contains("incomplete at parent missing"));
     }

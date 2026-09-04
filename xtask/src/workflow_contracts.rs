@@ -859,6 +859,14 @@ fn production_profile_contracts() -> Result<()> {
         "browser batch size drifted"
     );
     ensure!(
+        browser["block_size"] == json!(256),
+        "browser WebGPU block size drifted from the production-scale readiness probe"
+    );
+    ensure!(
+        browser["tbptt_chunk_size"] == json!(64),
+        "browser WebGPU TBPTT chunk size drifted from the production-scale readiness probe"
+    );
+    ensure!(
         browser["max_train_batches"] == json!(8),
         "browser max train batches drifted"
     );

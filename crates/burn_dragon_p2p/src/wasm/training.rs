@@ -3140,6 +3140,49 @@ mod tests {
     }
 
     #[wasm_bindgen_test(async)]
+    #[ignore = "explicit production-scale browser WebGPU readiness probe"]
+    async fn browser_training_production_nca_window() {
+        let profile: crate::profile::DragonExperimentProfile =
+            serde_json::from_str(include_str!("../../deploy/profiles/nca-r1.profile.json"))
+                .expect("builtin NCA profile");
+        let browser = profile.browser.expect("browser profile");
+        let train_source = production_nca_runtime_source(browser.train_source);
+        let eval_source = browser.eval_source.map(production_nca_runtime_source);
+        let config = DragonBrowserTrainingConfig {
+            experiment_kind: profile.experiment_kind,
+            model_config: browser.model_config,
+            training_objective: browser.training_objective,
+            optimizer: browser.optimizer,
+            execution_backend: DragonBrowserExecutionBackend::Wgpu,
+            block_size: browser.block_size,
+            tbptt_chunk_size: browser.tbptt_chunk_size,
+            tbptt_persist_across_steps: browser.tbptt_persist_across_steps,
+            learning_rate: browser.learning_rate,
+            weight_decay: browser.weight_decay,
+            batch_size: browser.batch_size,
+            max_train_batches: Some(1),
+            max_eval_batches: Some(1),
+            capability_policy: browser.capability_policy,
+            training_lease: None,
+            train_source,
+            eval_source,
+            live_participant: None,
+        };
+
+        let result = run_browser_training_with_release_manifest(
+            "https://example.invalid",
+            &config,
+            &dummy_release_manifest(),
+        )
+        .await
+        .expect("production NCA browser training window should succeed");
+        assert_eq!(result.backend, "burn-webgpu-wasm");
+        assert_eq!(result.train_batches, 1);
+        assert!(result.train_loss_mean.is_finite());
+        assert!(result.eval_loss.is_some_and(f64::is_finite));
+    }
+
+    #[wasm_bindgen_test(async)]
     async fn browser_training_smoke_generated_ruliad() {
         use burn_dragon_universality::ruliad::{
             RuliadTokenSupervisionConfig, RuliadTokenSupervisionMode,
@@ -3688,6 +3731,23 @@ mod tests {
             n_expert: 1,
             vocab_size,
             ..DragonConfig::default()
+        }
+    }
+
+    fn production_nca_runtime_source(
+        source: crate::profile::DragonBrowserProfileTokenSource,
+    ) -> DragonBrowserTokenSource {
+        match source {
+            crate::profile::DragonBrowserProfileTokenSource::GeneratedNca {
+                corpus_toml,
+                split,
+                max_documents,
+            } => DragonBrowserTokenSource::GeneratedNca {
+                corpus: toml::from_str(&corpus_toml).expect("builtin NCA corpus"),
+                split,
+                max_documents: max_documents.map(|limit| limit.min(1)),
+            },
+            other => panic!("expected generated NCA browser source, got {other:?}"),
         }
     }
 

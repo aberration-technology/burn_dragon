@@ -59,6 +59,10 @@ const NCA_BROWSER_WGPU_BATCH_SIZE_CAP: usize = 1;
 #[cfg(feature = "native")]
 const NCA_BROWSER_WGPU_MAX_TRAIN_BATCHES_CAP: usize = 8;
 #[cfg(feature = "native")]
+const NCA_BROWSER_WGPU_BLOCK_SIZE_CAP: usize = 256;
+#[cfg(feature = "native")]
+const NCA_BROWSER_WGPU_TBPTT_CHUNK_SIZE_CAP: usize = 64;
+#[cfg(feature = "native")]
 const DEFAULT_NCA_BROWSER_WGPU_MEMORY_BUDGET_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 #[cfg(feature = "native")]
 const NCA_BROWSER_MIN_TRAIN_DOCUMENT_POOL: usize = 64;
@@ -206,6 +210,8 @@ fn portable_universality_corpus(
 #[cfg(feature = "native")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DragonBrowserWindowTuning {
+    block_size: usize,
+    tbptt_chunk_size: usize,
     batch_size: usize,
     max_train_batches: usize,
     max_eval_batches: usize,
@@ -216,6 +222,15 @@ struct DragonBrowserWindowTuning {
 #[cfg(feature = "native")]
 impl DragonBrowserWindowTuning {
     fn nca_wgpu_from_native(config: &TrainingConfig) -> Self {
+        let block_size = config
+            .training
+            .block_size
+            .clamp(1, NCA_BROWSER_WGPU_BLOCK_SIZE_CAP);
+        let tbptt_chunk_size = config
+            .training
+            .tbptt_chunk_size
+            .unwrap_or(block_size)
+            .clamp(1, block_size.min(NCA_BROWSER_WGPU_TBPTT_CHUNK_SIZE_CAP));
         let batch_size = config
             .training
             .batch_size
@@ -236,6 +251,8 @@ impl DragonBrowserWindowTuning {
             .max(NCA_BROWSER_MIN_EVAL_DOCUMENT_POOL);
 
         Self {
+            block_size,
+            tbptt_chunk_size,
             batch_size,
             max_train_batches,
             max_eval_batches: 1,
@@ -691,8 +708,8 @@ fn browser_profile_from_native_config(
                 training_objective: config.training.objective.clone(),
                 optimizer: optimizer.clone(),
                 execution_backend: DragonBrowserExecutionBackend::Auto,
-                block_size: config.training.block_size,
-                tbptt_chunk_size: config.training.tbptt_chunk_size,
+                block_size: window_tuning.block_size,
+                tbptt_chunk_size: Some(window_tuning.tbptt_chunk_size),
                 tbptt_persist_across_steps: config.training.tbptt_persist_across_steps,
                 learning_rate: config.optimizer.learning_rate,
                 weight_decay: config.optimizer.weight_decay,
@@ -1859,7 +1876,9 @@ prompt = "[R2"
         let expected = DragonBrowserWindowTuning::nca_wgpu_from_native(&native_config);
         let browser = profile.browser.expect("browser profile");
 
-        assert_eq!(browser.block_size, native_config.training.block_size);
+        assert_eq!(browser.block_size, expected.block_size);
+        assert_eq!(browser.tbptt_chunk_size, Some(expected.tbptt_chunk_size));
+        assert!(browser.block_size <= native_config.training.block_size);
         assert_eq!(browser.learning_rate, native_config.optimizer.learning_rate);
         assert_eq!(browser.weight_decay, native_config.optimizer.weight_decay);
         assert_eq!(browser.batch_size, expected.batch_size);

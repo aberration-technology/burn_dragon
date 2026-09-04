@@ -2848,6 +2848,15 @@ mod tests {
         let profile: crate::profile::DragonExperimentProfile =
             serde_json::from_str(include_str!("../../deploy/profiles/nca-r1.profile.json"))
                 .expect("builtin NCA profile");
+        let wire_json = serde_json::to_string(&profile).expect("serialize browser profile");
+        let javascript_value =
+            js_sys::JSON::parse(&wire_json).expect("parse profile in JavaScript");
+        let javascript_json = js_sys::JSON::stringify(&javascript_value)
+            .expect("stringify profile in JavaScript")
+            .as_string()
+            .expect("JavaScript profile JSON string");
+        let profile: crate::profile::DragonExperimentProfile =
+            serde_json::from_str(&javascript_json).expect("decode JavaScript profile round trip");
         let model = profile.browser.expect("browser profile").model_config;
 
         assert_eq!(

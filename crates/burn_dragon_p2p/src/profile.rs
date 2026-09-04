@@ -273,6 +273,7 @@ pub struct DragonNativeExperimentProfile {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DragonBrowserExperimentProfile {
+    #[serde(with = "crate::config::browser_model_config_serde")]
     pub model_config: DragonConfig,
     #[serde(default)]
     pub training_objective: DragonBrowserTrainingObjectiveConfig,

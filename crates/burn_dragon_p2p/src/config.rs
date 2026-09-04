@@ -37,6 +37,68 @@ pub fn dragon_model_schema_hash(model_config: &DragonConfig) -> burn_p2p::Conten
     burn_p2p::ContentId::new(format!("dragon-model-schema-{:x}", hasher.finalize()))
 }
 
+/// Lossless JSON representation for model configs that may cross a JavaScript boundary.
+///
+/// Dragon's canonical schema hash continues to use the ordinary `DragonConfig` serde
+/// representation. Browser-facing envelopes only stringify integer seeds that JavaScript cannot
+/// represent exactly, then restore them before deserializing the typed model config.
+#[cfg(any(feature = "wasm-peer", feature = "native"))]
+pub(crate) mod browser_model_config_serde {
+    use super::DragonConfig;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde_json::{Number, Value};
+
+    const JAVASCRIPT_MAX_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
+    const SEED_PATHS: &[&[&str]] = &[
+        &["initialization", "reservoir", "seed"],
+        &["random_scaffold", "seed"],
+    ];
+
+    pub fn serialize<S>(model_config: &DragonConfig, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut value = serde_json::to_value(model_config).map_err(serde::ser::Error::custom)?;
+        for path in SEED_PATHS {
+            let Some(seed) = value_at_path_mut(&mut value, path) else {
+                continue;
+            };
+            let Some(seed_value) = seed.as_u64() else {
+                continue;
+            };
+            if seed_value > JAVASCRIPT_MAX_SAFE_INTEGER {
+                *seed = Value::String(seed_value.to_string());
+            }
+        }
+        value.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<DragonConfig, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let mut value = Value::deserialize(deserializer)?;
+        for path in SEED_PATHS {
+            let Some(seed) = value_at_path_mut(&mut value, path) else {
+                continue;
+            };
+            let Value::String(seed_text) = seed else {
+                continue;
+            };
+            let seed_value = seed_text.parse::<u64>().map_err(serde::de::Error::custom)?;
+            *seed = Value::Number(Number::from(seed_value));
+        }
+        serde_json::from_value(value).map_err(serde::de::Error::custom)
+    }
+
+    fn value_at_path_mut<'a>(mut value: &'a mut Value, path: &[&str]) -> Option<&'a mut Value> {
+        for key in path {
+            value = value.as_object_mut()?.get_mut(*key)?;
+        }
+        Some(value)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DragonCapabilityPolicy {
     #[serde(default = "default_native_cpu_memory_budget_bytes")]
@@ -926,6 +988,7 @@ fn default_browser_fitness_scalar_encoding() -> burn_p2p::CompactScalarEncoding 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DragonBrowserTrainingConfig {
     pub experiment_kind: DragonExperimentKind,
+    #[serde(with = "browser_model_config_serde")]
     pub model_config: DragonConfig,
     #[serde(default)]
     pub training_objective: DragonBrowserTrainingObjectiveConfig,
@@ -993,6 +1056,101 @@ pub struct DragonManifestBundle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(feature = "wasm-peer", feature = "native"))]
+    fn browser_training_config_with_model(
+        model_config: DragonConfig,
+    ) -> DragonBrowserTrainingConfig {
+        DragonBrowserTrainingConfig {
+            experiment_kind: DragonExperimentKind::NcaPrepretraining,
+            model_config,
+            training_objective: DragonBrowserTrainingObjectiveConfig::default(),
+            optimizer: DragonBrowserOptimizerConfig::default(),
+            execution_backend: DragonBrowserExecutionBackend::default(),
+            block_size: 8,
+            tbptt_chunk_size: None,
+            tbptt_persist_across_steps: false,
+            learning_rate: 1.0e-3,
+            weight_decay: 0.0,
+            batch_size: 1,
+            max_train_batches: Some(1),
+            max_eval_batches: Some(1),
+            capability_policy: DragonCapabilityPolicy::default(),
+            training_lease: None,
+            train_source: DragonBrowserTokenSource::Inline {
+                records: Vec::new(),
+            },
+            eval_source: None,
+            live_participant: None,
+        }
+    }
+
+    #[cfg(any(feature = "wasm-peer", feature = "native"))]
+    #[test]
+    fn browser_model_config_preserves_unsafe_javascript_seeds() {
+        let mut model_config = DragonConfig::default();
+        model_config.initialization.reservoir.seed = 0x0BAD_C0FF_EEC0_2026;
+        model_config.random_scaffold.seed = u64::MAX - 17;
+        let expected_schema = dragon_model_schema_hash(&model_config);
+        let config = browser_training_config_with_model(model_config.clone());
+
+        let encoded = serde_json::to_value(&config).expect("serialize browser training config");
+        assert_eq!(
+            encoded.pointer("/model_config/initialization/reservoir/seed"),
+            Some(&serde_json::Value::String(
+                model_config.initialization.reservoir.seed.to_string()
+            ))
+        );
+        assert_eq!(
+            encoded.pointer("/model_config/random_scaffold/seed"),
+            Some(&serde_json::Value::String(
+                model_config.random_scaffold.seed.to_string()
+            ))
+        );
+
+        let decoded: DragonBrowserTrainingConfig =
+            serde_json::from_value(encoded).expect("deserialize browser training config");
+        assert_eq!(decoded.model_config, model_config);
+        assert_eq!(
+            dragon_model_schema_hash(&decoded.model_config),
+            expected_schema
+        );
+    }
+
+    #[cfg(any(feature = "wasm-peer", feature = "native"))]
+    #[test]
+    fn browser_model_config_keeps_safe_seeds_numeric_and_accepts_legacy_numbers() {
+        let mut model_config = DragonConfig::default();
+        model_config.initialization.reservoir.seed = (1_u64 << 53) - 1;
+        model_config.random_scaffold.seed = 1337;
+        let config = browser_training_config_with_model(model_config.clone());
+
+        let encoded = serde_json::to_value(&config).expect("serialize browser training config");
+        assert_eq!(
+            encoded
+                .pointer("/model_config/initialization/reservoir/seed")
+                .and_then(serde_json::Value::as_u64),
+            Some(model_config.initialization.reservoir.seed)
+        );
+        assert_eq!(
+            encoded
+                .pointer("/model_config/random_scaffold/seed")
+                .and_then(serde_json::Value::as_u64),
+            Some(model_config.random_scaffold.seed)
+        );
+
+        let mut legacy = serde_json::to_value(&config).expect("serialize browser config");
+        let legacy_seed = u64::MAX - 31;
+        *legacy
+            .pointer_mut("/model_config/initialization/reservoir/seed")
+            .expect("reservoir seed") = serde_json::Value::Number(legacy_seed.into());
+        let decoded: DragonBrowserTrainingConfig =
+            serde_json::from_value(legacy).expect("deserialize legacy numeric seed");
+        assert_eq!(
+            decoded.model_config.initialization.reservoir.seed,
+            legacy_seed
+        );
+    }
 
     #[test]
     fn synchronous_aggregation_defaults_to_full_federated_average() {

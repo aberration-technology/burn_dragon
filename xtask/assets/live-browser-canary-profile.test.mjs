@@ -15,6 +15,7 @@ function browserConfigFixture() {
       },
       training: {
         block_size: 256,
+        tbptt_chunk_size: 64,
         max_train_batches: 8,
         max_eval_batches: 4,
         model_config: {
@@ -68,6 +69,7 @@ test("lightweight training profile is bounded and detached from canonical partic
   const training = browserConfigTrainingConfig(profiled);
 
   assert.equal(training.block_size, 32);
+  assert.equal(training.tbptt_chunk_size, 32);
   assert.equal(training.max_train_batches, 1);
   assert.equal(training.max_eval_batches, 0);
   assert.equal(training.model_config.n_embd, 16);
@@ -95,6 +97,7 @@ test("production training profile preserves model and head loading while prevent
   assert.deepEqual(profiled, expected);
   assert.equal(training.live_participant.publish_canonical_update, false);
   assert.equal(training.live_participant.load_active_head_artifact, true);
+  assert.equal(training.tbptt_chunk_size, 64);
   assert.equal(source.config.training.live_participant.publish_canonical_update, true);
 });
 

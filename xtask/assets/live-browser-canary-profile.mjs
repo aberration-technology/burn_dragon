@@ -65,6 +65,10 @@ export function applyBrowserCanaryProfile(
   training.max_train_batches = 1;
   training.max_eval_batches = 0;
   training.block_size = Math.min(Number(training.block_size ?? 32) || 32, 32);
+  const tbpttChunkSize = Number(training.tbptt_chunk_size);
+  if (Number.isInteger(tbpttChunkSize) && tbpttChunkSize > 0) {
+    training.tbptt_chunk_size = Math.min(tbpttChunkSize, training.block_size);
+  }
   if (training.model_config && typeof training.model_config === "object") {
     training.model_config.n_embd = 16;
     training.model_config.n_head = 1;

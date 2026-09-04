@@ -373,7 +373,7 @@ impl BrowserCanaryLaneConfig {
             transport_mode: "webrtc-direct",
             expect_training: true,
             expect_checkpoint_sync: false,
-            min_accepted_receipts: 2,
+            min_accepted_receipts: 0,
             use_production_training_profile: false,
         }
     }

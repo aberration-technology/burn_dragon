@@ -2650,8 +2650,13 @@ fn resolve_browser_revision_contract(
     {
         bail!("browser revision contract does not match the selected experiment revision");
     }
-    if contract.training.model_schema_hash != dragon_model_schema_hash(&config.model_config) {
-        bail!("browser model config does not match the signed model schema");
+    let runtime_model_schema_hash = dragon_model_schema_hash(&config.model_config);
+    if contract.training.model_schema_hash != runtime_model_schema_hash {
+        bail!(
+            "browser model config schema {} does not match signed model schema {}",
+            runtime_model_schema_hash.as_str(),
+            contract.training.model_schema_hash.as_str(),
+        );
     }
     validate_browser_optimizer_contract(config, &contract)?;
     let authorized_execution = contract
@@ -2837,6 +2842,19 @@ mod tests {
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    fn browser_training_smoke_generated_nca_schema_is_cross_target_stable() {
+        let profile: crate::profile::DragonExperimentProfile =
+            serde_json::from_str(include_str!("../../deploy/profiles/nca-r1.profile.json"))
+                .expect("builtin NCA profile");
+        let model = profile.browser.expect("browser profile").model_config;
+
+        assert_eq!(
+            dragon_model_schema_hash(&model).as_str(),
+            "dragon-model-schema-6a8f14c9a0e1afe4e374998d879c730b385fc33f4b4746444c1d9cd0fc8bddc3"
+        );
+    }
 
     #[wasm_bindgen_test]
     fn browser_batches_preserve_native_shard_loss_masks() {

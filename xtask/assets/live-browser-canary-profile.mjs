@@ -9,6 +9,19 @@ export function browserConfigTrainingConfig(browserConfig) {
   return null;
 }
 
+export function validateBrowserCanaryTrainingPolicy({
+  expectTraining,
+  useProductionTrainingProfile,
+  minAcceptedReceipts,
+}) {
+  if (expectTraining && useProductionTrainingProfile && minAcceptedReceipts < 1) {
+    throw new Error("canonical training canary requires at least one accepted browser receipt");
+  }
+  if (expectTraining && !useProductionTrainingProfile && minAcceptedReceipts !== 0) {
+    throw new Error("local WebGPU training smoke cannot require canonical browser receipts");
+  }
+}
+
 export function applyBrowserCanaryProfile(
   browserConfig,
   {
@@ -42,8 +55,6 @@ export function applyBrowserCanaryProfile(
     return profiled;
   }
 
-  training.max_train_batches = 1;
-  training.max_eval_batches = 0;
   if (useProductionTrainingProfile) {
     if (training.live_participant && typeof training.live_participant === "object") {
       training.live_participant.publish_canonical_update = false;
@@ -51,6 +62,8 @@ export function applyBrowserCanaryProfile(
     return profiled;
   }
 
+  training.max_train_batches = 1;
+  training.max_eval_batches = 0;
   training.block_size = Math.min(Number(training.block_size ?? 32) || 32, 32);
   if (training.model_config && typeof training.model_config === "object") {
     training.model_config.n_embd = 16;
@@ -77,9 +90,8 @@ export function applyBrowserCanaryProfile(
       training.model_config.fused_kernels.enabled = false;
     }
   }
-  if (training.live_participant && typeof training.live_participant === "object") {
-    training.live_participant.publish_canonical_update = false;
-    training.live_participant.load_active_head_artifact = false;
-  }
+  // The bounded profile validates local WebGPU execution only. It must not pose
+  // as a participant in an authority-signed canonical revision.
+  training.live_participant = null;
   return profiled;
 }

@@ -768,7 +768,7 @@ Native peers can leave `training_config_paths` empty and rely on the published D
 
 Open the deployed `browser_app_url` in a browser, sign in with GitHub, and join the network from the published GitHub Pages shell.
 
-Browser peers can train directly from published Dragon profile metadata for experiments that include a browser-sized training profile. Production browser profiles are expected to load the active canonical head artifact and publish canonical browser updates through the p2p artifact/update path. The live browser canary checks those production profile flags in two lanes: a checkpoint-sync lane keeps the production profile and requires the active head artifact to arrive over browser P2P, while the receipt-training lane applies a tiny receipt-only override so the canary can verify the browser shell, auth, seed derivation, direct WebRTC connectivity, P2P checkpoint readiness, WebGPU training start, truthful work metrics, and durable receipt submission without pushing a synthetic canary model into the main network.
+Browser peers can train directly from published Dragon profile metadata for experiments that include a browser-sized training profile. Production browser profiles are expected to load the active canonical head artifact and publish canonical browser updates through the p2p artifact/update path. The browser gates keep two trust domains explicit: the bounded training lane removes `live_participant` and proves browser shell, auth, seed derivation, direct WebRTC connectivity, and local WebGPU execution without claiming canonical work; the production-profile lane preserves every authority-signed model and execution field, loads the active head over P2P, submits receipt-only contributions, and proves their durable acceptance without publishing a canary artifact as the canonical head.
 
 Before waiting for the full CI/deploy cycle, run:
 
@@ -789,9 +789,13 @@ export BURN_DRAGON_BROWSER_CANARY_EXPERIMENT_ID=nca-prepretraining
 cargo run -p xtask -- local-browser-e2e --lane canary-webrtc-direct-training --build-site
 ```
 
+The command above is the detached, bounded WebGPU execution lane. Run
+`--lane canary-production-profile-training` to exercise the unchanged signed
+profile and require accepted, durable live receipts.
+
 Use `--lane canary-auto-connect`, `--lane canary-webrtc-direct-connect`,
 `--lane canary-webrtc-direct-checkpoint`, or `--lane canary-all` to stop at the
-network/checkpoint boundary before spending time on receipt training. These
+network/checkpoint boundary before spending time on local WebGPU training. These
 lanes write replayable artifacts to `target/test-artifacts/browser-peer-e2e/`:
 the report JSON, console/network logs, trace, screenshot, effective canary
 config, portal snapshot, signed seed advertisement, and browser config.

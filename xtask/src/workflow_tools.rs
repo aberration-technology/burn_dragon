@@ -233,7 +233,7 @@ pub fn run_pages_predeploy_canary() -> Result<()> {
         ),
         (
             "BURN_DRAGON_BROWSER_CANARY_MIN_ACCEPTED_RECEIPTS",
-            "2".to_owned(),
+            "0".to_owned(),
         ),
         ("BURN_DRAGON_BROWSER_CANARY_SITE_OVERRIDE_DIR", site_dir),
         ("BURN_DRAGON_BROWSER_CANARY_ARTIFACT_DIR", artifact_dir),

@@ -453,8 +453,10 @@ fn browser_canary_contracts() -> Result<()> {
         "window.indexedDB.open(storageKey)",
         "durable_storage_backend: backend",
         "function durableBrowserCertificatePeerId(snapshot)",
+        "function canaryExpectsLiveReceipts(report)",
         "snapshot.session?.certificate?.body?.payload?.payload?.peer_id",
         "\"browser_session_enrolled_for_training\"",
+        "\"browser_training_window_completed\"",
         "function assertBrowserE2eContract(report)",
         "async function loadBrowserConfig()",
         "applyBrowserCanaryProfile(transportFilteredBrowserConfig, {",
@@ -484,8 +486,10 @@ fn browser_canary_contracts() -> Result<()> {
         "if (expectCheckpointSync)",
         "if (!expectTraining)",
         "training.live_participant.load_active_head_artifact = false;",
+        "export function validateBrowserCanaryTrainingPolicy({",
         "if (useProductionTrainingProfile)",
         "training.live_participant.publish_canonical_update = false;",
+        "training.live_participant = null;",
     ] {
         require_contains(
             &canary_profile,
@@ -552,6 +556,16 @@ fn browser_canary_contracts() -> Result<()> {
         ],
         "Pages verifies the live canonical contract before building or deploying",
     )?;
+    for snippet in [
+        "BURN_DRAGON_BROWSER_CANARY_MIN_ACCEPTED_RECEIPTS: \"0\"",
+        "use_production_training_profile: true",
+    ] {
+        require_contains(
+            &pages_workflow,
+            snippet,
+            "Pages separates local predeploy smoke from signed postdeploy training",
+        )?;
+    }
     Ok(())
 }
 

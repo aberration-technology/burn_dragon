@@ -109,6 +109,12 @@ the browser canary edge/principal/callback environment variables and run:
 cargo run -p xtask -- local-browser-e2e --lane canary-webrtc-direct-training --build-site
 ```
 
+That bounded lane detaches canonical participation and proves the built
+artifact can connect and execute a local WebGPU training window. Use
+`--lane canary-production-profile-training` when the edge has an
+authority-signed revision contract and you need to prove exact-profile P2P
+head loading plus durable receipt acceptance.
+
 Canary artifacts are written under `target/test-artifacts/browser-peer-e2e/`.
 If the local `../burn_p2p` checkout is on an in-flight branch that does not
 match Dragon's pinned CI version, use `cargo run -p xtask -- local-browser-e2e-ci-sibling`

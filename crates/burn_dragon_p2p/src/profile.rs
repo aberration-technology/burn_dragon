@@ -1881,6 +1881,29 @@ prompt = "[R2"
 
     #[cfg(feature = "native")]
     #[test]
+    fn builtin_nca_browser_model_matches_native_profile_schema() {
+        let profile: DragonExperimentProfile =
+            serde_json::from_str(BUILTIN_NCA_R1_PROFILE_JSON).expect("builtin NCA profile");
+        let native_config: TrainingConfig =
+            toml::from_str(&profile.native.training_toml).expect("native training config");
+        let tokenizer = native_config
+            .dataset
+            .tokenizer
+            .fit(std::iter::empty::<&str>())
+            .expect("native tokenizer");
+        let native_model = build_model_config_with_tokenizer(
+            &native_config.model,
+            native_config.training.block_size,
+            tokenizer.as_ref(),
+        )
+        .expect("native model config");
+        let browser_model = profile.browser.expect("browser profile").model_config;
+
+        assert_eq!(browser_model, native_model);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
     fn native_training_overrides_apply_to_builtin_profile() {
         use crate::config::{DragonNativeTrainingOverrides, DragonPeerNetworkConfig};
         use tempfile::tempdir;

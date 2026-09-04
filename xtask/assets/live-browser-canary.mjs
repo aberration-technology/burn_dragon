@@ -14,6 +14,7 @@ import {
 import {
   applyBrowserCanaryProfile,
   browserConfigTrainingConfig,
+  validateBrowserCanaryTrainingPolicy,
 } from "./live-browser-canary-profile.mjs";
 
 const SITE_BASE_URL = requiredEnv("BURN_DRAGON_BROWSER_CANARY_SITE_BASE_URL");
@@ -184,9 +185,11 @@ function validateCanaryMode() {
   if (EXPECT_CHECKPOINT_SYNC && BROWSER_NAME !== "chromium") {
     throw new Error("checkpoint-sync canary currently requires chromium");
   }
-  if (EXPECT_TRAINING && MIN_ACCEPTED_RECEIPTS < 1) {
-    throw new Error("training canary requires at least one accepted browser receipt");
-  }
+  validateBrowserCanaryTrainingPolicy({
+    expectTraining: EXPECT_TRAINING,
+    useProductionTrainingProfile: USE_PRODUCTION_TRAINING_PROFILE,
+    minAcceptedReceipts: MIN_ACCEPTED_RECEIPTS,
+  });
 }
 
 function ensureDir(dirPath) {
@@ -922,6 +925,10 @@ function canaryRequiresP2pCheckpoint(report) {
   );
 }
 
+function canaryExpectsLiveReceipts(report) {
+  return report.expect_training && report.min_accepted_receipts > 0;
+}
+
 function e2eInvariant(name, required, passed, detail = null) {
   return {
     name,
@@ -933,6 +940,7 @@ function e2eInvariant(name, required, passed, detail = null) {
 
 function buildBrowserE2eContract(report) {
   const requiresP2pCheckpoint = canaryRequiresP2pCheckpoint(report);
+  const expectsLiveReceipts = canaryExpectsLiveReceipts(report);
   const acceptedReceipts = acceptedReceiptCount(report);
   const artifactFallbackCount = report.artifact_http_fallback_requests?.length ?? 0;
   const certificatePeerId = durableBrowserCertificatePeerId(
@@ -974,8 +982,16 @@ function buildBrowserE2eContract(report) {
       },
     ),
     e2eInvariant(
-      "minimum_browser_receipts_accepted",
+      "browser_training_window_completed",
       report.expect_training,
+      report.training_completed === true,
+      {
+        training_action_detail: report.training_action_detail,
+      },
+    ),
+    e2eInvariant(
+      "minimum_browser_receipts_accepted",
+      expectsLiveReceipts,
       acceptedReceipts >= report.min_accepted_receipts,
       {
         accepted_receipts: acceptedReceipts,
@@ -984,7 +1000,7 @@ function buildBrowserE2eContract(report) {
     ),
     e2eInvariant(
       "accepted_receipts_reached_durable_edge_state",
-      report.expect_training,
+      expectsLiveReceipts,
       report.durable_receipt_snapshot != null,
       {
         durable_receipt_snapshot: report.durable_receipt_snapshot,
@@ -1445,7 +1461,7 @@ async function runCanary() {
       );
     }
   }
-  if (EXPECT_TRAINING && acceptedReceiptsBeforeTraining == null) {
+  if (EXPECT_TRAINING && MIN_ACCEPTED_RECEIPTS > 0 && acceptedReceiptsBeforeTraining == null) {
     fail("portal snapshot did not expose diagnostics.accepted_receipts before training");
   }
 
@@ -1519,6 +1535,7 @@ async function runCanary() {
     training_button_enabled: false,
     training_button_label: null,
     training_action_detail: null,
+    training_completed: false,
     training_p2p_checkpoint_ready: null,
     connect_button_visible: false,
     get_started_button_visible: false,
@@ -1902,24 +1919,34 @@ async function runCanary() {
       return report;
     }
 
-    const receiptResultPromise = waitForAcceptedReceiptSubmissions(
-      page,
-      MIN_ACCEPTED_RECEIPTS,
-      TRAIN_TIMEOUT_MS,
-    );
+    const receiptResultPromise =
+      MIN_ACCEPTED_RECEIPTS > 0
+        ? waitForAcceptedReceiptSubmissions(page, MIN_ACCEPTED_RECEIPTS, TRAIN_TIMEOUT_MS)
+        : null;
     await trainActionButton.click();
-    const receiptResult = await receiptResultPromise;
-    const acceptedReceiptIds = receiptResult.accepted_receipt_ids;
-    report.receipt_submission = {
-      submissions: receiptResult.submissions,
-      accepted_receipt_ids: acceptedReceiptIds,
-      accepted_receipt_count: acceptedReceiptIds.length,
-      minimum_accepted_receipts: MIN_ACCEPTED_RECEIPTS,
-    };
-    if (acceptedReceiptIds.length < MIN_ACCEPTED_RECEIPTS) {
-      fail(
-        `browser receipt submissions accepted ${acceptedReceiptIds.length} receipts; expected at least ${MIN_ACCEPTED_RECEIPTS}: ${JSON.stringify(receiptResult.submissions)}`,
-      );
+    let acceptedReceiptIds = [];
+    if (receiptResultPromise) {
+      const receiptResult = await receiptResultPromise;
+      acceptedReceiptIds = receiptResult.accepted_receipt_ids;
+      report.receipt_submission = {
+        submissions: receiptResult.submissions,
+        accepted_receipt_ids: acceptedReceiptIds,
+        accepted_receipt_count: acceptedReceiptIds.length,
+        minimum_accepted_receipts: MIN_ACCEPTED_RECEIPTS,
+      };
+      if (acceptedReceiptIds.length < MIN_ACCEPTED_RECEIPTS) {
+        fail(
+          `browser receipt submissions accepted ${acceptedReceiptIds.length} receipts; expected at least ${MIN_ACCEPTED_RECEIPTS}: ${JSON.stringify(receiptResult.submissions)}`,
+        );
+      }
+    } else {
+      report.receipt_submission = {
+        submissions: [],
+        accepted_receipt_ids: [],
+        accepted_receipt_count: 0,
+        minimum_accepted_receipts: 0,
+        local_only: true,
+      };
     }
     await page.waitForFunction(
       () =>
@@ -1928,14 +1955,17 @@ async function runCanary() {
         document.body.innerText.includes("train loss"),
       { timeout: TRAIN_TIMEOUT_MS },
     );
+    report.training_completed = true;
     await captureLiveStatus();
     if (report.training_button_enabled && report.training_button_label === "stop training") {
       await trainActionButton.click().catch(() => {});
     }
-    report.durable_receipt_snapshot = await waitForDurableReceiptCount(
-      acceptedReceiptIds,
-      acceptedReceiptsBeforeTraining,
-    );
+    if (MIN_ACCEPTED_RECEIPTS > 0) {
+      report.durable_receipt_snapshot = await waitForDurableReceiptCount(
+        acceptedReceiptIds,
+        acceptedReceiptsBeforeTraining,
+      );
+    }
     report.durable_browser_storage_snapshot = await durableBrowserStorageSnapshot(
       page,
       snapshot.network_id,

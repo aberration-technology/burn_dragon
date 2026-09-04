@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   applyBrowserCanaryProfile,
   browserConfigTrainingConfig,
+  validateBrowserCanaryTrainingPolicy,
 } from "./live-browser-canary-profile.mjs";
 
 function browserConfigFixture() {
@@ -59,7 +60,7 @@ test("checkpoint profile preserves production artifact loading policy", () => {
   assert.deepEqual(profiled, source);
 });
 
-test("lightweight training profile is bounded and avoids artifact traffic", () => {
+test("lightweight training profile is bounded and detached from canonical participation", () => {
   const source = browserConfigFixture();
   const profiled = applyBrowserCanaryProfile(source, {
     expectTraining: true,
@@ -78,24 +79,23 @@ test("lightweight training profile is bounded and avoids artifact traffic", () =
   assert.equal(training.model_config.attention_residual.enabled, false);
   assert.equal(training.model_config.block_attention_residual.enabled, false);
   assert.equal(training.model_config.fused_kernels.enabled, false);
-  assert.equal(training.live_participant.publish_canonical_update, false);
-  assert.equal(training.live_participant.load_active_head_artifact, false);
+  assert.equal(training.live_participant, null);
 });
 
 test("production training profile preserves model and head loading while preventing publication", () => {
   const source = browserConfigFixture();
+  const expected = browserConfigFixture();
+  expected.config.training.live_participant.publish_canonical_update = false;
   const profiled = applyBrowserCanaryProfile(source, {
     expectTraining: true,
     useProductionTrainingProfile: true,
   });
   const training = browserConfigTrainingConfig(profiled);
 
-  assert.equal(training.block_size, 256);
-  assert.equal(training.max_train_batches, 1);
-  assert.equal(training.max_eval_batches, 0);
-  assert.deepEqual(training.model_config, source.config.training.model_config);
+  assert.deepEqual(profiled, expected);
   assert.equal(training.live_participant.publish_canonical_update, false);
   assert.equal(training.live_participant.load_active_head_artifact, true);
+  assert.equal(source.config.training.live_participant.publish_canonical_update, true);
 });
 
 test("combined training and checkpoint expectations are rejected", () => {
@@ -106,5 +106,40 @@ test("combined training and checkpoint expectations are rejected", () => {
         expectCheckpointSync: true,
       }),
     /cannot train and verify checkpoint sync/,
+  );
+});
+
+test("training receipt policy separates local smoke from canonical participation", () => {
+  assert.doesNotThrow(() =>
+    validateBrowserCanaryTrainingPolicy({
+      expectTraining: true,
+      useProductionTrainingProfile: false,
+      minAcceptedReceipts: 0,
+    }),
+  );
+  assert.doesNotThrow(() =>
+    validateBrowserCanaryTrainingPolicy({
+      expectTraining: true,
+      useProductionTrainingProfile: true,
+      minAcceptedReceipts: 2,
+    }),
+  );
+  assert.throws(
+    () =>
+      validateBrowserCanaryTrainingPolicy({
+        expectTraining: true,
+        useProductionTrainingProfile: false,
+        minAcceptedReceipts: 1,
+      }),
+    /local WebGPU training smoke cannot require canonical browser receipts/,
+  );
+  assert.throws(
+    () =>
+      validateBrowserCanaryTrainingPolicy({
+        expectTraining: true,
+        useProductionTrainingProfile: true,
+        minAcceptedReceipts: 0,
+      }),
+    /canonical training canary requires at least one accepted browser receipt/,
   );
 });

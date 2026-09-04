@@ -12,11 +12,62 @@ mod workflow_tools;
 
 use std::ffi::OsString;
 use std::fs;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail, ensure};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum BrowserWebGpuDriver {
+    #[default]
+    Software,
+    Hardware,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum BrowserTrainingBenchmarkCondition {
+    Reference,
+    Fused,
+    FactorizedInput,
+    FactorizedFused,
+    DenseScore,
+    FactorizedDenseScore,
+    #[default]
+    Both,
+}
+
+impl BrowserWebGpuDriver {
+    const fn angle_backend(self) -> &'static str {
+        match self {
+            Self::Software => "swiftshader",
+            Self::Hardware => "vulkan",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+struct WasmTrainingBenchmarkArgs {
+    #[arg(long, value_enum, default_value_t)]
+    driver: BrowserWebGpuDriver,
+    #[arg(long, default_value_t = 3)]
+    samples: usize,
+    #[arg(long, value_enum, default_value_t)]
+    condition: BrowserTrainingBenchmarkCondition,
+    /// Exact per-step batch size to exercise in the browser runtime.
+    #[arg(long, default_value_t = 1)]
+    batch_size: usize,
+    /// Number of optimizer steps in each measured browser window.
+    #[arg(long, default_value_t = 8)]
+    train_batches: usize,
+    /// Through-time chunk size within each 256-token benchmark record.
+    #[arg(long, default_value_t = 64)]
+    tbptt_chunk_size: usize,
+    /// Reuse an already-built release WASM test artifact for repeated hardware sweeps.
+    #[arg(long, value_name = "PATH")]
+    wasm_artifact: Option<PathBuf>,
+}
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "burn_dragon p2p task runner")]
@@ -79,6 +130,7 @@ enum CommandKind {
     LocalBrowserE2e(local_browser_e2e::LocalBrowserE2eArgs),
     LocalBrowserE2eCiSibling(local_browser_e2e::LocalBrowserE2eCiSiblingArgs),
     WasmTrainingSmoke,
+    WasmTrainingBenchmark(WasmTrainingBenchmarkArgs),
     WasmSmoke,
     CudaCheck,
     Smoke,
@@ -175,6 +227,7 @@ fn main() -> Result<()> {
         }
         CommandKind::LocalBrowserE2eCiSibling(args) => local_browser_e2e::run_ci_sibling(&args),
         CommandKind::WasmTrainingSmoke => wasm_training_smoke(),
+        CommandKind::WasmTrainingBenchmark(args) => wasm_training_benchmark(&args),
         CommandKind::WasmSmoke => wasm_smoke(),
         CommandKind::CudaCheck => cuda_check(),
         CommandKind::Smoke => smoke(),
@@ -343,19 +396,232 @@ fn local_browser_e2e_runner() -> local_browser_e2e::LocalBrowserE2eRunner {
 }
 
 fn wasm_training_smoke() -> Result<()> {
-    wasm_browser_test(Some("browser_training_smoke_generated_"))
+    wasm_browser_test(
+        Some("browser_training_smoke_generated_"),
+        false,
+        BrowserWebGpuDriver::Software,
+    )
 }
 
 fn wasm_smoke() -> Result<()> {
-    wasm_browser_test(Some("browser_training_smoke"))
+    wasm_browser_test(
+        Some("browser_training_smoke"),
+        false,
+        BrowserWebGpuDriver::Software,
+    )
 }
 
-fn wasm_browser_test(filter: Option<&str>) -> Result<()> {
+fn wasm_training_benchmark(args: &WasmTrainingBenchmarkArgs) -> Result<()> {
+    ensure!(args.samples > 0, "--samples must be greater than zero");
+    ensure!(
+        (1..=8).contains(&args.batch_size),
+        "--batch-size must be between 1 and 8"
+    );
+    ensure!(
+        (1..=64).contains(&args.train_batches),
+        "--train-batches must be between 1 and 64"
+    );
+    ensure!(
+        (1..=256).contains(&args.tbptt_chunk_size)
+            && 256_usize.is_multiple_of(args.tbptt_chunk_size),
+        "--tbptt-chunk-size must be a divisor of 256"
+    );
+    let tests = match args.condition {
+        BrowserTrainingBenchmarkCondition::Reference => {
+            &["wasm::training::tests::browser_training_production_nca_window"] as &[&str]
+        }
+        BrowserTrainingBenchmarkCondition::Fused => {
+            &["wasm::training::tests::browser_training_production_nca_window_fused"]
+        }
+        BrowserTrainingBenchmarkCondition::FactorizedInput => {
+            &["wasm::training::tests::browser_training_production_nca_window_factorized_input"]
+        }
+        BrowserTrainingBenchmarkCondition::FactorizedFused => {
+            &["wasm::training::tests::browser_training_production_nca_window_factorized_fused"]
+        }
+        BrowserTrainingBenchmarkCondition::DenseScore => {
+            &["wasm::training::tests::browser_training_production_nca_window_dense_score"]
+        }
+        BrowserTrainingBenchmarkCondition::FactorizedDenseScore => &[
+            "wasm::training::tests::browser_training_production_nca_window_factorized_dense_score",
+        ],
+        BrowserTrainingBenchmarkCondition::Both => &[
+            "wasm::training::tests::browser_training_production_nca_window",
+            "wasm::training::tests::browser_training_production_nca_window_fused",
+        ],
+    };
+    if args.driver == BrowserWebGpuDriver::Hardware {
+        ensure!(
+            std::env::var_os("DISPLAY").is_some(),
+            "hardware browser benchmarking requires a graphical DISPLAY"
+        );
+        let wasm = match args.wasm_artifact.as_ref() {
+            Some(path) => {
+                ensure!(
+                    path.is_file(),
+                    "WASM benchmark artifact {} does not exist",
+                    path.display()
+                );
+                path.canonicalize().with_context(|| {
+                    format!("failed to canonicalize WASM artifact {}", path.display())
+                })?
+            }
+            None => build_wasm_training_benchmark_binary()?,
+        };
+        for sample in 0..args.samples {
+            for test in tests {
+                run_hardware_wasm_training_benchmark(
+                    &wasm,
+                    test,
+                    sample,
+                    args.batch_size,
+                    args.train_batches,
+                    args.tbptt_chunk_size,
+                )?;
+            }
+        }
+        return Ok(());
+    }
+    for _sample in 0..args.samples {
+        for test in tests {
+            wasm_browser_test(Some(test), true, args.driver)?;
+        }
+    }
+    Ok(())
+}
+
+fn build_wasm_training_benchmark_binary() -> Result<PathBuf> {
+    let features = format!("{},browser-benchmark", BrowserBuildTarget::Wgpu.features());
+    let cargo = cargo_bin();
+    run(
+        &cargo,
+        &[
+            "test",
+            "--release",
+            "-p",
+            P2P_PACKAGE,
+            "--target",
+            "wasm32-unknown-unknown",
+            "--no-default-features",
+            "--features",
+            &features,
+            "--lib",
+            "--no-run",
+        ],
+    )?;
+    let deps = workspace_root()
+        .join("target")
+        .join("wasm32-unknown-unknown")
+        .join("release")
+        .join("deps");
+    fs::read_dir(&deps)
+        .with_context(|| format!("failed to read {}", deps.display()))?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("burn_dragon_p2p-") && name.ends_with(".wasm")
+        })
+        .max_by_key(|entry| {
+            entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+        })
+        .map(|entry| entry.path())
+        .context("release WASM browser benchmark binary was not produced")
+}
+
+fn run_hardware_wasm_training_benchmark(
+    wasm: &Path,
+    test: &str,
+    sample: usize,
+    batch_size: usize,
+    train_batches: usize,
+    tbptt_chunk_size: usize,
+) -> Result<()> {
+    let chrome = resolve_chrome_path().context("could not find Chromium for hardware benchmark")?;
+    let runner = ensure_wasm_bindgen_test_runner()?;
+    let port = TcpListener::bind("127.0.0.1:0")
+        .context("failed to reserve browser benchmark port")?
+        .local_addr()?
+        .port();
+    let address = format!("127.0.0.1:{port}");
+    let mut server = Command::new(&runner)
+        .current_dir(workspace_root())
+        .env("NO_HEADLESS", "1")
+        .env("WASM_BINDGEN_TEST_ADDRESS", &address)
+        .arg(wasm)
+        .arg(test)
+        .arg("--exact")
+        .arg("--nocapture")
+        .stdout(Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to start {}", runner.display()))?;
+
+    let condition = if test.ends_with("_factorized_dense_score") {
+        "factorized-dense-score"
+    } else if test.ends_with("_dense_score") {
+        "dense-score"
+    } else if test.ends_with("_factorized_fused") {
+        "factorized-fused"
+    } else if test.ends_with("_factorized_input") {
+        "factorized-input"
+    } else if test.ends_with("_fused") {
+        "fused"
+    } else {
+        "reference"
+    };
+    let artifact_dir = workspace_root()
+        .join("target")
+        .join("test-artifacts")
+        .join("browser-training-benchmark");
+    fs::create_dir_all(&artifact_dir)
+        .with_context(|| format!("failed to create {}", artifact_dir.display()))?;
+    let run_label = format!(
+        "{condition}-b{}-n{}-c{}-s{sample}",
+        batch_size, train_batches, tbptt_chunk_size
+    );
+    let screenshot = artifact_dir.join(format!("{run_label}.png"));
+    let result = artifact_dir.join(format!("{run_label}.json"));
+    let status = Command::new("node")
+        .current_dir(workspace_root())
+        .arg("xtask/assets/wasm-browser-benchmark.mjs")
+        .arg("--url")
+        .arg(format!("http://{address}/"))
+        .arg("--chrome")
+        .arg(&chrome)
+        .arg("--screenshot")
+        .arg(&screenshot)
+        .arg("--result")
+        .arg(&result)
+        .arg("--batch-size")
+        .arg(batch_size.to_string())
+        .arg("--train-batches")
+        .arg(train_batches.to_string())
+        .arg("--tbptt-chunk-size")
+        .arg(tbptt_chunk_size.to_string())
+        .status();
+    let _ = server.kill();
+    let _ = server.wait();
+    let status = status.context("failed to launch hardware WebGPU benchmark browser")?;
+    ensure!(
+        status.success(),
+        "hardware WebGPU benchmark failed for {condition} sample {sample}"
+    );
+    Ok(())
+}
+
+fn wasm_browser_test(
+    filter: Option<&str>,
+    benchmark: bool,
+    driver: BrowserWebGpuDriver,
+) -> Result<()> {
     let chrome = resolve_chrome_path()
         .context("could not find Google Chrome; install it or set BURN_DRAGON_PLAYWRIGHT_CHROME")?;
     let chromedriver = ensure_chromedriver(&chrome)?;
     let wasm_bindgen_test_runner = ensure_wasm_bindgen_test_runner()?;
-    let webdriver_json = write_webdriver_config(&chrome)?;
+    let webdriver_json = write_webdriver_config(&chrome, driver)?;
     let mut envs = vec![
         (
             OsString::from("CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER"),
@@ -385,21 +651,32 @@ fn wasm_browser_test(filter: Option<&str>) -> Result<()> {
     if let Some(existing) = std::env::var_os("PATH") {
         envs.push((OsString::from("PATH"), existing));
     }
-    let mut args = vec![
-        "test",
+    let features = if benchmark {
+        format!("{},browser-benchmark", BrowserBuildTarget::Wgpu.features())
+    } else {
+        BrowserBuildTarget::Wgpu.features().to_owned()
+    };
+    let mut args = vec!["test"];
+    if benchmark {
+        args.push("--release");
+    }
+    args.extend([
         "-p",
         P2P_PACKAGE,
         "--target",
         "wasm32-unknown-unknown",
         "--no-default-features",
         "--features",
-        BrowserBuildTarget::Wgpu.features(),
+        features.as_str(),
         "--lib",
-    ];
+    ]);
     if let Some(filter) = filter {
         args.push(filter);
     }
     args.push("--");
+    if benchmark {
+        args.push("--exact");
+    }
     args.push("--nocapture");
     run_with_env("cargo", &args, &envs)
 }
@@ -723,7 +1000,7 @@ fn chrome_version(chrome: &Path) -> Result<String> {
         .context("failed to parse Chrome version")
 }
 
-fn write_webdriver_config(chrome: &Path) -> Result<PathBuf> {
+fn write_webdriver_config(chrome: &Path, driver: BrowserWebGpuDriver) -> Result<PathBuf> {
     let config_path = workspace_root()
         .join("target")
         .join("xtask")
@@ -736,6 +1013,7 @@ fn write_webdriver_config(chrome: &Path) -> Result<PathBuf> {
             )
         })?;
     }
+    let angle_backend = driver.angle_backend();
     let payload = format!(
         concat!(
             "{{\n",
@@ -743,12 +1021,14 @@ fn write_webdriver_config(chrome: &Path) -> Result<PathBuf> {
             "    \"binary\": \"{}\",\n",
             "    \"args\": [\n",
             "      \"--enable-unsafe-webgpu\",\n",
-            "      \"--use-angle=swiftshader\"\n",
+            "      \"--use-angle={}\",\n",
+            "      \"--enable-features=Vulkan,UseSkiaRenderer,WebGPU\"\n",
             "    ]\n",
             "  }}\n",
             "}}\n"
         ),
-        chrome.display()
+        chrome.display(),
+        angle_backend,
     );
     fs::write(&config_path, payload).with_context(|| {
         format!(

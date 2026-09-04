@@ -52,13 +52,21 @@ use crate::profile::{
 };
 #[cfg(feature = "wasm-peer")]
 use crate::wasm::training::{
-    DragonBrowserTrainingResult, DragonBrowserTrainingSession, run_browser_training_with_session,
+    DragonBrowserTrainingResult, DragonBrowserTrainingSession,
+    run_browser_training_with_session_and_observer,
 };
 
 #[cfg(feature = "wasm-peer")]
 pub mod training;
 
+mod training_progress;
+#[cfg(feature = "wasm-peer")]
+mod training_ui;
 mod ui_state;
+#[cfg(feature = "wasm-peer")]
+use training_progress::DragonBrowserTrainingUiState;
+#[cfg(feature = "wasm-peer")]
+use training_ui::browser_training_panel;
 #[cfg(test)]
 use ui_state::{
     DragonHeroTone, DragonReadinessStepId, DragonStepStatus, DragonUiEventCandidate,
@@ -1306,6 +1314,8 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     #[cfg(feature = "wasm-peer")]
     let local_training_state = use_signal(DragonLocalTrainingState::default);
     #[cfg(feature = "wasm-peer")]
+    let local_training_progress = use_signal(DragonBrowserTrainingUiState::default);
+    #[cfg(feature = "wasm-peer")]
     let local_training_stop_requested = use_signal(|| false);
 
     {
@@ -2185,16 +2195,19 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
             let mut current_view = current_view;
             let mut local_training = local_training;
             let mut local_training_state = local_training_state;
+            let mut local_training_progress = local_training_progress;
             let mut local_training_stop_requested = local_training_stop_requested;
             let mut session_state = session_state;
             if local_training_state.read().is_active() {
                 local_training_stop_requested.set(true);
                 local_training_state.set(DragonLocalTrainingState::Stopping);
-                status.set("Stopping browser training after the current window…".into());
+                local_training_progress.write().stopping();
                 return;
             }
             spawn(async move {
                 local_training_state.set(DragonLocalTrainingState::Starting);
+                local_training_progress.write().start_session();
+                local_training.set(None);
                 let release_manifest = match resolve_browser_release_manifest(
                     &next_config,
                     release_manifest.as_ref(),
@@ -2207,6 +2220,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         let message = error.to_string();
                         error!("browser training start failed: {message}");
                         status.set(message.clone());
+                        local_training_progress.write().fail(message.clone());
                         local_training_state.set(DragonLocalTrainingState::Failed { message });
                         return;
                     }
@@ -2218,6 +2232,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         let message = error.to_string();
                         error!("browser training edge resolution failed: {message}");
                         status.set(message.clone());
+                        local_training_progress.write().fail(message.clone());
                         local_training_state.set(DragonLocalTrainingState::Failed { message });
                         return;
                     }
@@ -2237,7 +2252,8 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                 "GitHub sign-in is required before browser training can start"
                                     .to_owned();
                             warn!("browser training auth missing: {message}");
-                            status.set(message);
+                            status.set(message.clone());
+                            local_training_progress.write().fail(message);
                             session_state.set(None);
                             local_training_state.set(DragonLocalTrainingState::Idle);
                             return;
@@ -2246,6 +2262,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                             let message = format!("failed to verify browser sign-in: {error}");
                             error!("browser training auth check failed: {message}");
                             status.set(message.clone());
+                            local_training_progress.write().fail(message.clone());
                             local_training_state.set(DragonLocalTrainingState::Failed { message });
                             return;
                         }
@@ -2258,6 +2275,8 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     if *local_training_stop_requested.read() {
                         break;
                     }
+                    let next_window = completed_windows.saturating_add(1);
+                    local_training_progress.write().start_window(next_window);
                     local_training_state.set(DragonLocalTrainingState::SyncingCheckpoint);
                     let training = match resolve_browser_training_config(
                         &bootstrap_config,
@@ -2272,36 +2291,32 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                             let message = error.to_string();
                             error!("browser training config resolution failed: {message}");
                             status.set(message.clone());
+                            local_training_progress.write().fail(message.clone());
                             local_training_state.set(DragonLocalTrainingState::Failed { message });
                             failed = true;
                             break;
                         }
                     };
-                    let next_window = completed_windows.saturating_add(1);
                     local_training_state.set(DragonLocalTrainingState::TrainingWindow);
-                    status.set(format!("Running browser training window {}…", next_window));
-                    match run_browser_training_with_session(
-                        &edge_base_url,
-                        &training,
-                        &release_manifest,
-                        &mut training_session,
-                    )
-                    .await
-                    {
+                    let training_result = {
+                        let mut observer = |progress| {
+                            local_training_progress.write().observe(progress);
+                        };
+                        run_browser_training_with_session_and_observer(
+                            &edge_base_url,
+                            &training,
+                            &release_manifest,
+                            &mut training_session,
+                            &mut observer,
+                        )
+                        .await
+                    };
+                    match training_result {
                         Ok(result) => {
                             completed_windows = completed_windows.saturating_add(1);
-                            let status_message = if result.train_loss_observed {
-                                format!(
-                                    "Browser training window {} complete: mean train loss {:.4}",
-                                    completed_windows, result.train_loss_mean
-                                )
-                            } else {
-                                format!(
-                                    "Browser training window {} complete: WebGPU window finished",
-                                    completed_windows
-                                )
-                            };
-                            status.set(status_message);
+                            local_training_progress
+                                .write()
+                                .complete_window(completed_windows);
                             local_training.set(Some(result));
                             if let Ok(view) = refresh_browser_app(
                                 &bootstrap_config,
@@ -2317,6 +2332,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         Err(error) => {
                             let message = error.to_string();
                             error!("browser training window failed: {message}");
+                            local_training_progress.write().fail(message.clone());
                             let auth_failure = browser_training_auth_failure_message(&message);
                             if auth_failure {
                                 status.set(
@@ -2349,17 +2365,11 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         }
                     }
                     #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
-                    gloo_timers::future::TimeoutFuture::new(25).await;
+                    gloo_timers::future::TimeoutFuture::new(0).await;
                 }
                 if *local_training_stop_requested.read() {
                     local_training_state.set(DragonLocalTrainingState::Stopped);
-                    if completed_windows == 0 {
-                        status.set("Browser training stopped before a window completed".into());
-                    } else {
-                        status.set(format!(
-                            "Browser training stopped after {completed_windows} window(s)"
-                        ));
-                    }
+                    local_training_progress.write().stopped();
                 } else if !failed {
                     local_training_state.set(DragonLocalTrainingState::Idle);
                 }
@@ -2460,118 +2470,10 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let train_button = rsx! {};
 
     #[cfg(feature = "wasm-peer")]
-    let local_training_section = if let Some(result) = local_training.read().clone() {
-        let eval_loss_label = result
-            .eval_loss
-            .map(|value| format!("{value:.4}"))
-            .unwrap_or_else(|| "n/a".into());
-        let train_loss_label = if result.train_loss_observed {
-            format!("{:.4}", result.train_loss_mean)
-        } else {
-            "not sampled".into()
-        };
-        let tokens_per_second_label = result
-            .tokens_per_second
-            .map(|value| format!("{value:.1}"))
-            .unwrap_or_else(|| "n/a".into());
-        let train_batches_label = result.train_batches.to_string();
-        let live_training_details = result.live_participant.map(|live| {
-            let receipt_state = if live.receipt_submission_accepted {
-                "accepted".to_owned()
-            } else if live.receipt_submission_deferred {
-                "pending retry".to_owned()
-            } else {
-                "not accepted".to_owned()
-            };
-            let artifact_state = if live.artifact_published {
-                "published"
-            } else {
-                "not published"
-            };
-            let update_state = if live.update_announced {
-                "announced"
-            } else {
-                "not announced"
-            };
-            (
-                receipt_state,
-                live.accepted_receipt_ids.join(", "),
-                live.pending_receipt_count,
-                live.receipt_submission_error,
-                live.runtime_state.unwrap_or_else(|| "n/a".into()),
-                artifact_state,
-                update_state,
-            )
-        });
-        rsx! {
-            section { class: "panel compact-panel",
-                SectionHeader {
-                    eyebrow: "local",
-                    title: "browser training",
-                    detail: "latest browser training window executed in this tab.",
-                }
-                div { class: "keyvalue-list",
-                    div { class: "keyvalue-row",
-                        span { "experiment" }
-                        strong { "{result.experiment_kind_label}" }
-                    }
-                    div { class: "keyvalue-row",
-                        span { "backend" }
-                        strong { "{result.backend}" }
-                    }
-                    div { class: "keyvalue-row",
-                        span { "train loss" }
-                        strong { "{train_loss_label}" }
-                    }
-                    div { class: "keyvalue-row",
-                        span { "eval loss" }
-                        strong { "{eval_loss_label}" }
-                    }
-                    div { class: "keyvalue-row",
-                        span { "train batches" }
-                        strong { "{train_batches_label}" }
-                    }
-                    div { class: "keyvalue-row",
-                        span { "tokens/sec" }
-                        strong { "{tokens_per_second_label}" }
-                    }
-                }
-                if let Some((receipt_state, accepted_receipts_label, pending_receipt_count, receipt_submission_error, runtime_state_label, artifact_state, update_state)) = live_training_details {
-                    div { class: "keyvalue-list",
-                        div { class: "keyvalue-row",
-                            span { "receipt state" }
-                            strong { "{receipt_state}" }
-                        }
-                        div { class: "keyvalue-row",
-                            span { "artifact" }
-                            strong { "{artifact_state}" }
-                        }
-                        div { class: "keyvalue-row",
-                            span { "p2p update" }
-                            strong { "{update_state}" }
-                        }
-                        div { class: "keyvalue-row",
-                            span { "accepted receipts" }
-                            strong { "{accepted_receipts_label}" }
-                        }
-                        div { class: "keyvalue-row",
-                            span { "pending receipts" }
-                            strong { "{pending_receipt_count}" }
-                        }
-                        if let Some(receipt_submission_error) = receipt_submission_error {
-                            div { class: "keyvalue-row",
-                                span { "receipt retry" }
-                                strong { "{receipt_submission_error}" }
-                            }
-                        }
-                        div { class: "keyvalue-row",
-                            span { "runtime state" }
-                            strong { "{runtime_state_label}" }
-                        }
-                    }
-                }
-            }
-        }
+    let local_training_section = if has_connected_view {
+        let progress = local_training_progress.read().clone();
+        let result = local_training.read().clone();
+        browser_training_panel(&progress, result.as_ref())
     } else {
         rsx! {}
     };

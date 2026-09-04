@@ -685,6 +685,12 @@ pub enum LanguageHeadConfig {
     NcaFactorizedPatch {
         state_count: usize,
         patch_size: usize,
+        /// Compose input embeddings from cell-position/state embeddings instead of allocating
+        /// one embedding row for every possible patch token.
+        ///
+        /// This is opt-in so existing model schemas and checkpoints remain unchanged.
+        #[serde(default, skip_serializing_if = "is_false")]
+        factorize_input_embedding: bool,
         #[serde(default)]
         frame_special_tokens: bool,
         #[serde(default)]
@@ -703,6 +709,7 @@ impl LanguageHeadConfig {
             Self::NcaFactorizedPatch {
                 state_count,
                 patch_size,
+                factorize_input_embedding: _,
                 frame_special_tokens,
                 eos_id,
             } => {
@@ -712,17 +719,29 @@ impl LanguageHeadConfig {
                 if *patch_size == 0 {
                     return Err("language_head.patch_size must be > 0".to_string());
                 }
-                let patch_cells = patch_size.saturating_mul(*patch_size);
+                let patch_cells = patch_size
+                    .checked_mul(*patch_size)
+                    .ok_or_else(|| "language_head patch cell count overflow".to_string())?;
+                let patch_exponent = u32::try_from(patch_cells)
+                    .map_err(|_| "language_head patch cell count exceeds u32".to_string())?;
                 let patch_vocab_size = state_count
-                    .checked_pow(patch_cells as u32)
+                    .checked_pow(patch_exponent)
                     .ok_or_else(|| "language_head patch vocabulary overflow".to_string())?;
                 let frame_special_budget = usize::from(*frame_special_tokens) * 2;
-                let special_budget = frame_special_budget + usize::from(eos_id.is_some());
-                if patch_vocab_size.saturating_add(special_budget) > vocab_size {
+                let eos_duplicates_frame_token = eos_id.is_some_and(|eos_id| {
+                    *frame_special_tokens
+                        && (eos_id as usize == patch_vocab_size
+                            || eos_id as usize == patch_vocab_size.saturating_add(1))
+                });
+                let special_budget = frame_special_budget
+                    + usize::from(eos_id.is_some() && !eos_duplicates_frame_token);
+                let required_vocab_size = patch_vocab_size
+                    .checked_add(special_budget)
+                    .ok_or_else(|| "language_head vocabulary size overflow".to_string())?;
+                if required_vocab_size > vocab_size {
                     return Err(format!(
                         "language_head requires vocab_size >= {} (got {})",
-                        patch_vocab_size + special_budget,
-                        vocab_size
+                        required_vocab_size, vocab_size
                     ));
                 }
                 if let Some(eos_id) = eos_id
@@ -737,6 +756,68 @@ impl LanguageHeadConfig {
             }
         }
     }
+
+    pub fn factorizes_input_embedding(&self) -> bool {
+        matches!(
+            self,
+            Self::NcaFactorizedPatch {
+                factorize_input_embedding: true,
+                ..
+            }
+        )
+    }
+
+    pub fn input_embedding_rows(&self, vocab_size: usize) -> Result<usize, String> {
+        if !self.factorizes_input_embedding() {
+            return Ok(vocab_size);
+        }
+        self.factorized_projection_rows(vocab_size)
+    }
+
+    pub fn output_projection_rows(&self, vocab_size: usize) -> Result<usize, String> {
+        match self {
+            Self::StandardTokenClassification => Ok(vocab_size),
+            Self::NcaFactorizedPatch { .. } => self.factorized_projection_rows(vocab_size),
+        }
+    }
+
+    fn factorized_projection_rows(&self, vocab_size: usize) -> Result<usize, String> {
+        let Self::NcaFactorizedPatch {
+            state_count,
+            patch_size,
+            frame_special_tokens,
+            eos_id,
+            ..
+        } = self
+        else {
+            unreachable!("factorized input embeddings require an NCA patch head");
+        };
+        self.validate_for_vocab_size(vocab_size)?;
+        let patch_cells = patch_size
+            .checked_mul(*patch_size)
+            .ok_or_else(|| "language_head patch cell count overflow".to_string())?;
+        let patch_exponent = u32::try_from(patch_cells)
+            .map_err(|_| "language_head patch cell count exceeds u32".to_string())?;
+        let patch_vocab_size = state_count
+            .checked_pow(patch_exponent)
+            .ok_or_else(|| "language_head patch vocabulary overflow".to_string())?;
+        let frame_special_budget = usize::from(*frame_special_tokens) * 2;
+        let eos_duplicates_frame_token = eos_id.is_some_and(|eos_id| {
+            *frame_special_tokens
+                && (eos_id as usize == patch_vocab_size
+                    || eos_id as usize == patch_vocab_size.saturating_add(1))
+        });
+        let special_budget =
+            frame_special_budget + usize::from(eos_id.is_some() && !eos_duplicates_frame_token);
+        patch_cells
+            .checked_mul(*state_count)
+            .and_then(|rows| rows.checked_add(special_budget))
+            .ok_or_else(|| "language_head factorized input row count overflow".to_string())
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -1272,7 +1353,49 @@ fn lcm(lhs: usize, rhs: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{DragonConfig, DragonRandomScaffoldConfig, LatentFanoutScheduleConfig};
+    use super::{
+        DragonConfig, DragonRandomScaffoldConfig, LanguageHeadConfig, LatentFanoutScheduleConfig,
+    };
+
+    #[test]
+    fn nca_factorized_input_is_opt_in_and_preserves_legacy_serialization() {
+        let legacy = LanguageHeadConfig::NcaFactorizedPatch {
+            state_count: 10,
+            patch_size: 2,
+            factorize_input_embedding: false,
+            frame_special_tokens: true,
+            eos_id: Some(50_256),
+        };
+        let encoded = serde_json::to_value(&legacy).expect("serialize language head");
+        assert!(encoded.get("factorize_input_embedding").is_none());
+        assert_eq!(legacy.input_embedding_rows(50_257), Ok(50_257));
+        assert_eq!(legacy.output_projection_rows(50_257), Ok(43));
+
+        let factorized = LanguageHeadConfig::NcaFactorizedPatch {
+            state_count: 10,
+            patch_size: 2,
+            factorize_input_embedding: true,
+            frame_special_tokens: true,
+            eos_id: Some(50_256),
+        };
+        assert_eq!(factorized.input_embedding_rows(50_257), Ok(43));
+        assert_eq!(factorized.output_projection_rows(50_257), Ok(43));
+    }
+
+    #[test]
+    fn nca_factorized_rows_deduplicate_frame_eos_token() {
+        let head = LanguageHeadConfig::NcaFactorizedPatch {
+            state_count: 2,
+            patch_size: 2,
+            factorize_input_embedding: true,
+            frame_special_tokens: true,
+            eos_id: Some(17),
+        };
+
+        assert_eq!(head.validate_for_vocab_size(18), Ok(()));
+        assert_eq!(head.input_embedding_rows(18), Ok(10));
+        assert_eq!(head.output_projection_rows(18), Ok(10));
+    }
 
     #[test]
     fn late_layer_schedule_uses_base_then_full_latent_total() {

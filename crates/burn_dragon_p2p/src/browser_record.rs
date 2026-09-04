@@ -152,6 +152,51 @@ where
     }
 }
 
+/// Encodes a complete Dragon model without issuing synchronous reads against the
+/// source backend. Browser WebGPU cannot use Burn's synchronous recorder, so the
+/// float tensors are read in one asynchronous transaction and reconstructed on
+/// the CPU before recording.
+pub(crate) async fn encode_browser_model_record_bytes_async<B>(
+    model: &DragonModel<B>,
+    model_config: &DragonConfig,
+    model_schema_hash: ContentId,
+    format: BrowserBurnRecordBytesFormat,
+    precision: BrowserBurnRecordPrecision,
+) -> Result<Vec<u8>>
+where
+    B: Backend,
+    DragonModel<B>: Module<B>,
+{
+    type RecordBackend = NdArray<f32>;
+
+    let source_catalog = burn_p2p::burn_module::module_float_parameter_subset_catalog::<B, _>(
+        model,
+        model_schema_hash.clone(),
+        |_| true,
+    )?;
+    let values = burn_p2p::burn_module::flatten_module_float_parameter_subset_async::<B, _>(
+        model,
+        &source_catalog,
+    )
+    .await?;
+
+    let device = burn::tensor::Device::<RecordBackend>::default();
+    let target = DragonModel::<RecordBackend>::new(model_config.clone(), &device);
+    let target_catalog = burn_p2p::burn_module::module_float_parameter_subset_catalog::<
+        RecordBackend,
+        _,
+    >(&target, model_schema_hash, |_| true)?;
+    if source_catalog != target_catalog {
+        bail!("browser asynchronous record reconstruction changed the model tensor layout");
+    }
+    let target = burn_p2p::burn_module::replace_module_float_parameter_subset::<RecordBackend, _>(
+        &target,
+        &target_catalog,
+        &values,
+    )?;
+    encode_browser_record_bytes::<RecordBackend, _>(target, format, precision)
+}
+
 fn record_browser_module<B, M, R>(module: M) -> Result<Vec<u8>>
 where
     B: Backend,
@@ -527,6 +572,87 @@ mod tests {
     }
 
     #[test]
+    fn browser_async_full_model_encoding_preserves_tensor_identity() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let mut model_config = tiny_factorized_nca_model_config();
+        let LanguageHeadConfig::NcaFactorizedPatch {
+            factorize_input_embedding,
+            ..
+        } = &mut model_config.language_head
+        else {
+            panic!("expected NCA language head");
+        };
+        *factorize_input_embedding = true;
+        let source = DragonModel::<TestBackend>::new(model_config.clone(), &device);
+        let schema = ContentId::new("async-browser-record-schema");
+        let format = BrowserBurnRecordBytesFormat::NamedMpk;
+        let precision = BrowserBurnRecordPrecision::Half;
+        let actual = futures::executor::block_on(encode_browser_model_record_bytes_async(
+            &source,
+            &model_config,
+            schema.clone(),
+            format,
+            precision,
+        ))
+        .expect("asynchronous browser record");
+        let catalog =
+            burn_p2p::burn_module::module_float_parameter_subset_catalog::<TestBackend, _>(
+                &source,
+                schema.clone(),
+                |_| true,
+            )
+            .expect("source catalog");
+        let expected_values = burn_p2p::burn_module::flatten_module_float_parameter_subset::<
+            TestBackend,
+            _,
+        >(&source, &catalog)
+        .expect("synchronous values");
+        let async_values = futures::executor::block_on(
+            burn_p2p::burn_module::flatten_module_float_parameter_subset_async::<TestBackend, _>(
+                &source, &catalog,
+            ),
+        )
+        .expect("asynchronous values");
+        assert_eq!(expected_values.len(), async_values.len());
+        assert_eq!(
+            expected_values
+                .iter()
+                .zip(&async_values)
+                .position(|(expected, actual)| expected != actual),
+            None,
+            "asynchronous parameter readback changed a tensor value"
+        );
+        let expected_bytes =
+            encode_browser_record_bytes::<TestBackend, _>(source.clone(), format, precision)
+                .expect("synchronous reference record");
+        let mut expected_descriptor = descriptor_for_bytes(&expected_bytes, format, precision);
+        expected_descriptor.model_schema_hash = schema.clone();
+        let expected_target = DragonModel::<TestBackend>::new(model_config.clone(), &device);
+        let expected_model = load_browser_active_head_model(
+            expected_target,
+            &expected_descriptor,
+            expected_bytes,
+            &device,
+        )
+        .expect("load synchronous reference record");
+        let expected_digest = burn_p2p::burn_module::module_tensor_digest::<TestBackend, _>(
+            &expected_model,
+            schema.clone(),
+        )
+        .expect("synchronous tensor digest");
+        let mut descriptor = descriptor_for_bytes(&actual, format, precision);
+        descriptor.model_schema_hash = schema.clone();
+        let target = DragonModel::<TestBackend>::new(model_config, &device);
+        let loaded = load_browser_active_head_model(target, &descriptor, actual, &device)
+            .expect("load asynchronous browser record");
+        let actual_digest =
+            burn_p2p::burn_module::module_tensor_digest::<TestBackend, _>(&loaded, schema)
+                .expect("loaded tensor digest");
+
+        assert_eq!(expected_digest, actual_digest);
+    }
+
+    #[test]
     fn browser_async_mutable_readback_matches_native_catalog_order_and_digest() {
         let device = burn::tensor::Device::<TestBackend>::default();
         let model_config = tiny_random_scaffold_model_config();
@@ -699,6 +825,7 @@ mod tests {
             language_head: LanguageHeadConfig::NcaFactorizedPatch {
                 state_count: 2,
                 patch_size: 2,
+                factorize_input_embedding: false,
                 frame_special_tokens: true,
                 eos_id: Some(255),
             },

@@ -1,0 +1,286 @@
+{
+  "version": 1,
+  "experiment_kind": "nca_prepretraining",
+  "native": {
+    "training_toml": "[dataset]\ncache_dir = \"__dragon_network_profile_cache__\"\ntrain_split_ratio = 0.8999999761581421\ntype = \"universality_nca\"\nconfig = \"nca-corpus.toml\"\n\n[dataset.tokenizer]\ntype = \"pretokenized\"\nvocab_size = 50257\neos_id = 50256\n\n[training]\nalgorithm = \"auto\"\nblock_size = 512\ntbptt_chunk_size = 64\ntbptt_persist_across_steps = false\nsequence_batching = \"auto\"\nretain_ephemeral_terminal_sequence_state = false\nbatch_size = 6\nseed = 1337\ngradient_accumulation_steps = 1\nmax_iters = 24\ncheckpoint_interval_iters = 8\nlog_frequency = 1\nlaunch_mode = \"fresh\"\nmodule_lr_scales = []\n\n[training.init_transfer]\npreserve_interface_input_embedding = false\npreserve_interface_output_head = false\npreserve_fresh_decoder = false\npreserve_fresh_norm = false\nmatch_fresh_rms = false\n\n[training.continual_backprop]\nenabled = true\ntarget = \"shared_lowrank_latents\"\nutility_decay = 0.9900000095367432\nreplacement_rate = 0.00009999999747378752\nmaturity_steps = 100\nsample_interval_steps = 8\nreplace_interval_steps = 64\nutility_epsilon = 0.0000009999999974752427\nlr_coupling = \"none\"\nlr_coupling_power = 1.0\nwarmup_steps = 1024\ncooldown_steps = 256\nmax_replacements_per_interval = 1\nregression_pause_steps = 1024\n\n[training.neuron_scaling]\nenabled = false\nmax_latent_total = 8192\ngrowth = \"double\"\nmin_steps_between_scales = 2000\nmax_scale_events = 4\ncapacity_patience_epochs = 2\nrequire_live_source_selection = true\n\n[training.neuron_scaling.stabilization]\nfreeze_base_steps = 256\nunfreeze_ramp_steps = 256\nnew_slice_lr_scale = 1.0\nbase_lr_scale_after_ramp = 1.0\n\n[training.auto_batch_size]\nenabled = false\nmin_batch_size = 1\ntarget_device_memory_mb = 0\nprobe_steps = 1\nbinary_search = true\nrecompute_on_neuron_scale = true\nscale_memory_exponent = 1.0\nmax_system_memory_fraction = 0.8999999761581421\nprobe_safety_margin = 1.149999976158142\n\n[training.input_corruption]\nenabled = false\nprobability = 0.0\nwarmup_steps = 0\nramp_steps = 0\n\n[training.logit_entropy_floor]\nenabled = false\nweight = 0.0\ntarget_entropy_bits = 0.0\nmarginal_weight = 0.0\ntarget_marginal_entropy_bits = 0.0\ntarget_coverage_weight = 0.0\ntarget_coverage_epsilon = 0.00000000999999993922529\nwarmup_steps = 0\nramp_steps = 0\nevery_steps = 1\n\n[training.repeat_unlikelihood]\nenabled = false\nweight = 0.0\ncycle_weight = 0.0\ncycle_margin_weight = 0.0\ncycle_margin = 0.0\ncycle_min_lag = 2\ncycle_max_lag = 64\ncycle_lags_per_step = 8\nwarmup_steps = 0\nramp_steps = 0\nevery_steps = 1\nhistory_lags = []\nepsilon = 0.00009999999747378752\n\n[training.greedy_rollout_unlikelihood]\nenabled = false\nrecovery_only = false\nweight = 0.0\nmargin_weight = 0.0\nmargin = 0.0\nrecovery_weight = 0.0\nsequence_recovery_weight = 0.0\nentropy_floor_weight = 0.0\ntarget_entropy_bits = 0.0\ncycle_weight = 0.0\ncycle_margin_weight = 0.0\ncycle_min_lag = 2\ncycle_max_lag = 64\nwarmup_steps = 0\nramp_steps = 0\nevery_steps = 128\nprompt_tokens = 32\nrollout_tokens = 8\nhistory_tokens = 8\nbatch_prompts = 1\nepsilon = 0.00009999999747378752\n\n[training.dynamics_anchor]\nenabled = false\nweight = 0.0\nteacher_update_rate = 0.009999999776482582\nkl = \"jensen_shannon\"\nmask = \"all_tokens\"\nwarmup_steps = 0\nramp_steps = 0\nevery_steps = 1\n\n[training.predictive_coding]\nenabled = false\nmode = \"recurrent_state\"\nstate_scope = \"core\"\nbackward_mode = \"chunked\"\nparameter_update = \"optimizer\"\nobservation_contract = \"observed_prefix\"\nallow_oracle_target_leak = false\nsteps = 1\nstep_size = 0.029999999329447746\nlatent_decay = 0.0\nmax_grad_norm = 1.0\ngradient_norm_scope = \"per_sample\"\neps = 0.00000000999999993922529\napply_every_chunks = 1\namortization_tolerance = 0.05000000074505806\namortization_max_state_slots = 128\nwarmup_steps = 0\nsync_diagnostics = false\n\n[training.local_predictive_coding]\nsolver = \"synchronous_equilibrium\"\nlearning_schedule = \"equilibrium\"\nprediction_precision = 1.0\nfactor_reduction = \"sum\"\nsync_diagnostics = false\n\n[training.local_predictive_coding.inference]\nsteps = 4\nstep_size = 0.05000000074505806\nlatent_decay = 0.0\nmax_grad_norm = 1.0\ngradient_norm_scope = \"per_row\"\neps = 0.00000000999999993922529\n\n[training.predictive_context_routing]\nenabled = false\nprobe_every_steps = 8\nprobe_tokens = 16\nnovelty_confirmations = 3\nactive_fraction = 0.25\n\n[training.predictive_context_routing.bank]\nmax_contexts = 8\nminimum_observations = 8\ncalibration_update_rate = 0.1\nnovelty_standard_deviations = 4.0\nnovelty_absolute_margin = 0.25\nminimum_loss_scale = 0.05\ncapacity_policy = \"replace_least_recently_used\"\n\n[training.latent_reasoning]\nenabled = false\nevery_steps = 1\nstart_after_capability_gate_passed = false\neval_step_sweep = []\njepa_future_offsets = [1, 2, 4, 8]\ntarget_encoder = \"detached_student\"\nteacher_update_rate = 0.009999999776482582\nnegative_source = \"in_batch_and_corrupt_answer\"\n\n[training.latent_reasoning.next_latent]\nenabled = false\nhorizon = 1\nregression_weight = 1.0\ntoken_kl_weight = 0.0\nsmooth_l1_beta = 1.0\ndetach_action_embedding = true\n\n[training.latent_reasoning.dragon_state]\nenabled = false\nrho_weight = 1.0\nrho_energy_weight = 0.25\nsmooth_l1_beta = 1.0\nmax_rho_slots = 64\n\n[training.latent_reasoning.energy_model]\nenabled = false\ncontrastive_weight = 1.0\nmonotonic_weight = 0.25\ncontractive_weight = 0.05000000074505806\nmargin = 1.0\nmonotonic_tolerance = 0.0\ntrust_radius = 1.0\nmax_rollout_steps_for_loss = 4\n\n[training.latent_reasoning.step_contract]\nenabled = false\nmax_rollout_steps_for_loss = 4\nce_weight = 0.0\ntoken_kl_weight = 0.0\nmonotonic_ce_weight = 1.0\ncontractive_weight = 0.05000000074505806\nce_tolerance = 0.0\ntrust_radius = 1.0\n\n[training.latent_reasoning.sigreg]\nenabled = true\nmode = \"weak_covariance\"\ntarget = \"hidden\"\ntarget_variance = 1.0\nmin_variance = 0.20000000298023224\nmean_tolerance = 0.05000000074505806\nmax_rho_slots = 128\n\n[training.latent_reasoning.constraint_balancer]\nenabled = true\nnormalized_aux_scale = 1.0\nstart_after_steps = 0\nwarmup_steps = 0\nstop_target_mean_steps = 2.0\nstop_tolerance_steps = 0.5\n\n[training.ruliad_supervision]\nmode = \"full_document\"\nmask_high_entropy_spans = false\nbalance_trace_answer_mass = false\nanswer_close_marker_stride = 1\nanswer_close_marker_weight = 1\nanswer_schema_token_weight = 1\nanswer_schema_start_token_weight = 1\nanswer_value_token_weight = 1\n\n[training.ruliad_supervision.answer_ranking]\nenabled = false\nweight = 0.25\nmargin = 0.5\ncorrupt_offset = 1\n\n[training.ruliad_supervision.answer_denoising]\nenabled = false\nweight = 0.5\nprobability = 1.0\ncorrupt_offset = 1\nstructured_recovery_weight = 0.0\nstructured_recovery_every_steps = 8\nstructured_recovery_start_after_steps = 0\nstructured_recovery_max_completion_tokens = 64\nstructured_recovery_negative_count = 0\nstructured_recovery_template_negative_count = 0\nstructured_recovery_schema_negative_count = 0\n\n[training.ruliad_supervision.answer_contract]\nenabled = false\nweight = 0.25\npremature_close_unlikelihood_weight = 0.0\nevery_steps = 1\nstart_after_steps = 0\nmax_completion_tokens = 64\nmax_rows_per_step = 16\nprompt_schema_max_rows_per_step = 0\nschema_token_weight = 2.0\nschema_start_token_weight = 0.0\nvalue_token_weight = 1.0\nother_token_weight = 1.0\nprompt_schema_value_weight = 0.0\n\n[training.ruliad_supervision.verifier_reward]\nenabled = false\nmode = \"scalar\"\nweight = 0.05000000074505806\ngroup_size = 4\nmax_completion_tokens = 64\nevery_steps = 16\nstart_after_steps = 0\ntemperature = 0.800000011920929\ntop_k = 64\nkl_weight = 0.009999999776482582\nclip_range = 0.20000000298023224\npositive_advantage_requires_correctness = false\npositive_advantage_min_partial_progress_ppm = 0\npositive_advantage_min_completion_quality_ppm = 0\nadvantage_epsilon = 0.0000009999999974752427\nvpo_scalarizations = 16\nvpo_correctness_mass_floor = 0.699999988079071\nvpo_schema_quality_mass_floor = 0.10000000149011612\nvpo_completion_health_mass_floor = 0.10000000149011612\nvpo_compactness_max_weight = 0.05000000074505806\ninclude_oracle_candidate = false\ninclude_structured_negative_candidates = false\nstructured_negative_count = 2\nstructured_template_negative_count = 0\nstructured_schema_negative_count = 0\nstructured_contrast_weight = 0.0\nstructured_contrast_every_steps = 8\nstructured_contrast_start_after_steps = 0\nstructured_contrast_margin = 0.25\nfield_binding_contrast_weight = 0.0\nfield_binding_contrast_every_steps = 8\nfield_binding_contrast_start_after_steps = 0\nfield_binding_contrast_margin = 0.25\nfield_binding_contrast_pair_weight = 0.0\nfield_binding_contrast_max_pairs = 16\nfield_binding_contrast_rank_metric_every_steps = 8\nfield_binding_contrast_replay_capacity = 0\ngenerated_attractor_replay_capacity = 0\ngenerated_attractor_replay_min_count = 2\ngenerated_attractor_replay_max_candidates = 4\ngenerated_attractor_replay_min_distinct_answers = 2\ngenerated_attractor_replay_max_dominant_fraction = 0.5\nrollout_imitation_weight = 0.0\nrollout_imitation_every_steps = 16\nrollout_imitation_start_after_steps = 0\nrollout_imitation_min_partial_progress_ppm = 500000\nrollout_imitation_min_completion_quality_ppm = 750000\nrollout_imitation_min_verifier_rate_ppm = 100000\nrollout_imitation_max_schema_wrong_rate_ppm = 250000\nrollout_imitation_max_malformed_rate_ppm = 250000\nrollout_imitation_max_rows_per_step = 16\nrollout_recovery_weight = 0.0\n\n[training.ruliad_supervision.verifier_reward.reward]\nverifier_match = 1.0\nsemantic_match = 0.8500000238418579\npartial_progress = 0.3499999940395355\nfield_accuracy = 0.3499999940395355\ncertificate_prefix = 0.15000000596046448\ncompactness = 0.0\nmalformed_penalty = -0.3499999940395355\nmissing_penalty = -0.5\nschema_wrong_penalty = -0.15000000596046448\nhash_canary_wrong_penalty = -0.3499999940395355\n\n[training.ruliad_supervision.proof_policy]\nenabled = false\nmode = \"dagger\"\nscoring = \"completion_likelihood\"\ngradient_scope = \"full_model\"\nnormalization = \"candidate_conditional\"\ncandidate_symmetry = \"canonical\"\npresentation_risk = \"mean\"\nweight = 1.0\nevery_steps = 16\nstart_after_steps = 256\ndagger_start_after_steps = 512\nstratified_difficulty_levels = 0\nrollout_steps = 8\nmax_rows_per_update = 32\nmax_presentation_rows_per_update = 32\ncounterfactual_targets_per_state = 0\ncandidates = 4\nmax_completion_tokens = 16\n\n[training.ruliad_probe_generation]\nenabled = true\nmax_batch_rows = 32\nminimum_batch_rows = 2\nmaximum_prompt_position_span = 32\ndevice_buffer_tokens = 4\nmax_in_flight_rows = 16\n\n[training.ruliad_policy_probe]\nenabled = false\nscoring = \"completion_likelihood\"\nevery_epochs = 1\nitems = 4\nmax_steps = 256\ncandidates = 4\nbeam_width = 1\nscoring_batch_rows = 4\nscoring_token_budget = 32768\nscoring_pipeline_depth = 2\nstratified_difficulty_levels = 0\ncandidate_symmetry = \"balanced_rotation\"\n\n[training.ruliad_policy_probe.promotion_gate]\nenabled = false\nminimum_items = 16\nminimum_solve_rate = 0.5\nminimum_goal_completion_rate = 0.8\nminimum_valid_action_rate = 0.95\nmaximum_invalid_action_rate = 0.05\nmaximum_repeated_state_rate = 0.35\nmaximum_backtrack_rate = 0.25\n\n[training.context_strategy]\ntype = \"infinite\"\n\n[training.sequence_kernel_override]\nmemory_system = \"linear_attention\"\nexecutor = \"dense_score_short_context\"\ndense_score_row_chunk = 512\n\n[training.objective]\ntype = \"next_token\"\n\n[training.events]\nenabled = true\njsonl_path = \"events/training_events.jsonl\"\nsource_selection_jsonl_path = \"events/source_selection.jsonl\"\ncapability_probe_jsonl_path = \"events/capability_probe.jsonl\"\ncapacity_scaling_jsonl_path = \"events/capacity_scaling.jsonl\"\nmarkdown_dashboard_path = \"dashboard.md\"\nflush_every_steps = 50\nsource_selection_every_steps = 1\ncontinual_backprop_every_steps = 64\ndegeneracy_probe_every_epochs = 1\ndegeneracy_probe_tokens = 128\nruliad_correctness_probe_every_epochs = 1\nruliad_correctness_probe_items = 4\nruliad_correctness_probe_tokens = 64\nruliad_correctness_probe_adaptive_answer_budget = true\nruliad_correctness_probe_hard_token_cap = 4096\nruliad_contract_probe_enabled = false\nsource_weighted_validation_batches = 4\ncapability_probe_example_count = 4\nsource_selection_capability_feedback = true\npersist_step_events = false\nretained_metric_epochs = 64\nretained_gate_epochs = 256\nrecent_dashboard_events = 32\n\n[training.validation]\nexecution = \"local\"\nsampling = \"fixed_holdout\"\nseed = 3509215397\n\n[training.sequence_state_probe]\nenabled = false\npaired_batches = 4\nmax_rho_slots = 64\n\n[training.gates]\nenabled = true\nfatal_stop = true\nplateau_patience_epochs = 4\nplateau_min_relative_improvement = 0.005\nvalidation_regression_patience_epochs = 2\nvalidation_regression_max_relative = 0.05\nsource_entropy_min_bits = 1.0\nsource_entropy_min_active_fraction = 0.6\nsource_entropy_patience = 2\nsource_hash_noise_max_probability = 0.2\nsource_learning_progress_min = 0.001\nsource_capability_feedback_min_probability = 0.05\nsource_capability_lagging_max_probability = 0.5\nsource_capability_patience = 1\ndifficulty_patience = 2\ntoo_easy_valid_loss = 0.35\ntoo_hard_valid_loss = 5.0\ndegeneracy_entropy_min_bits = 1.0\ndegeneracy_max_probability_max = 0.98\ndegeneracy_argmax_unique_min_fraction = 0.02\ndegeneracy_distinct_2_min_fraction = 0.02\ndegeneracy_repetition_max_fraction = 0.95\ndegeneracy_eos_max_fraction = 0.98\ndegeneracy_period_2_max_fraction = 0.95\ndegeneracy_period_3_max_fraction = 0.95\ndegeneracy_period_2_to_16_max_fraction = 0.95\ndegeneracy_period_2_to_64_max_fraction = 0.95\ndegeneracy_patience = 2\ncontinual_backprop_max_replacements_per_epoch = 16\ncontinual_backprop_budget_max = 8.0\ncapability_zero_verifier_patience_epochs = 8\ncapability_grace_epochs = 3\ncapability_regression_patience_epochs = 2\ncapability_required_after_first_pass = true\ncapability_schema_wrong_max_rate = 0.5\ncapability_malformed_max_rate = 0.02\ncapability_missing_max_rate = 0.02\ncapability_completion_health_min_rate = 0.4\ncapability_output_entropy_min_bits = 1.25\ncapability_distinct_2_min_fraction = 0.3\ncapability_answer_distinct_min_fraction = 0.2\ncapability_field_value_distinct_ratio_min = 0.35\ncapability_field_value_dominance_max = 0.85\n\n[training.dynamics]\nenabled = true\nhard_collapse_rollback_attempts = 2\nminimum_continual_backprop_scale = 0.25\nsource_capability_recovery_lr_scale = 1.0\nsoft_recovery_lr_scale = 0.5\nvalidation_recovery_lr_scale = 0.5\nhard_recovery_lr_scale = 0.25\nsource_capability_recovery_continual_backprop_scale = 1.0\nsoft_recovery_continual_backprop_scale = 2.0\nvalidation_recovery_continual_backprop_scale = 1.25\nhard_recovery_continual_backprop_scale = 1.25\nstable_source_difficulty_pressure = 1.0\nsource_capability_recovery_source_difficulty_pressure = 1.0\nrecovery_source_difficulty_pressure = 0.75\ndifficulty_advance_source_pressure = 1.5\nstable_hash_noise_max_probability = 0.01\nsource_capability_recovery_hash_noise_max_probability = 0.01\nrecovery_hash_noise_max_probability = 0.0\n\n[optimizer]\nname = \"adamw\"\nlearning_rate = 0.001\nweight_decay = 0.0\nschedule_mode = \"dragon_reference\"\n\n[optimizer.eggroll]\nsigma = 0.0010000000474974513\nsigma_decay = 1.0\ninterval_steps = 1\nfitness_normalization = \"rank\"\ncoefficient_clip = 128.0\n\n[optimizer.eggroll.population]\npopulation_size = 64\npopulation_chunk_size = 16\nrank = 1\nseed = 1337\nmatrix_noise = \"orthogonal_spectral\"\n\n[optimizer.eggroll.update]\nkind = \"sgd\"\nlearning_rate = 0.001\nweight_decay = 0.0\nbeta_1 = 0.8999999761581421\nbeta_2 = 0.9990000128746033\nepsilon = 0.00000000999999993922529\nmax_delta_rms = 0.019999999552965164\n\n[optimizer.eggroll_population_execution]\nbackend = \"auto\"\nperturbation_scope = \"dragon_core_projection\"\n\n[optimizer.eggroll_auto_population]\nenabled = false\nmin_population_size = 8\nmax_population_size = 4096\npopulation_per_batch = 128\nprefer_power_of_two = true\n\n[optimizer.eggroll_auto_population.chunk_autotune]\nenabled = false\ncandidates = []\nmax_probe_population_size = 128\n\n[optimizer.predictive_coding]\ntransform = \"sgd\"\nmomentum = 0.8999999761581421\nfisher_decay = 0.949999988079071\ndamping = 0.0010000000474974513\nnesterov = false\n\n[parallel]\nmode = \"single\"\nworld_size = 1\n\n[parallel.data]\nsize = 1\nbackend = \"auto\"\nfind_unused_parameters = false\ngradient_as_bucket_view = true\n\n[parallel.tensor]\nsize = 1\naxis = \"neuron\"\npartition = \"contiguous\"\nsequence_parallel = false\n\n[parallel.fsdp]\nenabled = false\nreshard_after_forward = false\ncpu_offload = false\nmixed_precision = \"disabled\"\n\n[parallel.checkpoint]\nformat = \"unsharded_v1\"\nasync_write = false\n\n[parallel.pipeline]\nenabled = false\nstage_count = 1\nvirtual_stages_per_rank = 1\nschedule = \"interleaved_1f1b\"\nmicrobatches = 1\npartition = \"layer_contiguous\"\nactivation_checkpointing = false\nshared_weight_sync = \"all_reduce_per_step\"\ncommunication = \"activation_tensor\"\n\n[parallel.pipeline.cache]\nenabled = false\npolicy = \"disabled\"\nreuse_across_backward = true\nmax_inflight_microbatches = 1\neviction = \"step_boundary\"\ntransport_dtype = \"auto\"\n\n[generation]\nprompt = \"0 0 0\"\ntemperature = 1.0\noutput_format = \"auto\"\n\n[generation.context_strategy]\ntype = \"infinite\"\n\n[generation.prompt_tokenizer]\nsource = \"dataset\"\n\n[generation.decode_tokenizer]\nsource = \"dataset\"\n\n[wgpu]\nbackend = \"auto\"\nmemory = \"subslices\"\n\n[wgpu.training.startup_autotune]\nenabled = false\ntarget_device_memory_mb = 0\nmin_batch_size = 1\nprobe_steps = 1\nbinary_search = true\n\n[wgpu.inference]\ngeneration_executor = \"baseline\"\ngeneration_chunk_tokens = 8\ngeneration_device_buffer_tokens = 64\n\n[run_layout]\nmirror_config_path = true\n\n[model]\nn_layer = 8\nn_embd = 512\nn_head = 8\nlatent_total = 1024\n\n[model.language_head]\ntype = \"nca_factorized_patch\"\nstate_count = 10\npatch_size = 2\nfactorize_input_embedding = true\nframe_special_tokens = true\neos_id = 50256\n",
+    "nca_corpus_toml": "output_dir = \"./generated/nca-r1\"\nseed = 1337\nname = \"burn-dragon-mainnet-nca-r1\"\ntrain_samples = 256\nvalidation_samples = 64\nchunk_token_capacity = 4096\n",
+    "ruliad_corpus_toml": null
+  },
+  "browser": {
+    "model_config": {
+      "attention_residual": {
+        "dropout": 0.0,
+        "enabled": false,
+        "history_window": null,
+        "last_layers": null,
+        "num_heads": 4,
+        "recency_bias": 2.0
+      },
+      "block_attention_residual": {
+        "block_history_window": null,
+        "cache_block_summaries": true,
+        "dropout": 0.0,
+        "enabled": false,
+        "intra_block_history_window": null,
+        "last_layers": null,
+        "layers_per_block": 2,
+        "num_heads": 4,
+        "recency_bias": 2.0,
+        "summary_mode": "learned_projection",
+        "two_phase_compute": true
+      },
+      "clocked_slow_memory": {
+        "chunk_tokens": 4,
+        "enabled": false,
+        "last_layers": null,
+        "residual_scale": 1.0
+      },
+      "dropout": 0.1,
+      "fused_kernels": {
+        "alibi_slopes": null,
+        "attention_executor": "attention_context",
+        "block_sparse": {
+          "latent": {
+            "active_blocks": null,
+            "block_size": 512
+          },
+          "time": {
+            "active_pairs": null,
+            "block_size": 512
+          }
+        },
+        "enabled": false,
+        "lowrank_grad_input_executor": "auto",
+        "projection_executor": "both",
+        "relu_threshold": 0.0,
+        "rope_theta": 65536.0,
+        "rotary_embedding": "alibi",
+        "wgpu_recurrent_kernel": true,
+        "wgpu_rollout_fused": false
+      },
+      "gated_deltanet2": {
+        "allow_neg_eigval": false,
+        "chunk_size": 64,
+        "decay_gate": "channel",
+        "erase_gate": "channel",
+        "implementation": "bdh_adapter_legacy",
+        "output_scale": 1.0,
+        "qk_l2_norm": true,
+        "state_epsilon": 9.999999974752427e-7,
+        "state_precision": "f32",
+        "write_gate": "channel"
+      },
+      "hierarchical_dragon": {
+        "enabled": false,
+        "fast_cycles": 3,
+        "fast_to_slow_scale": 0.25,
+        "last_layers": null,
+        "rho_sharing": "shared",
+        "slow_cycles": 2,
+        "slow_to_fast_scale": 0.25,
+        "weight_sharing": "shared"
+      },
+      "initialization": {
+        "firing_targets": {
+          "kind": "disabled",
+          "x_target": 0.15,
+          "x_threshold": 0.0,
+          "y_target": 0.05,
+          "y_threshold": 0.0
+        },
+        "kind": "simple_normal",
+        "neuron_gains": {
+          "kind": "heavy_tailed_log_normal",
+          "log_sigma": 0.75,
+          "max_gain": 4.0
+        },
+        "reservoir": {
+          "decoder_scale": 1.0,
+          "density": 0.08,
+          "encoder_value_scale": 0.7,
+          "seed": "841540910842912806"
+        },
+        "residual_scaling": {
+          "gain": 1.0,
+          "kind": "depth_scaled"
+        },
+        "simple_normal_std": 0.02,
+        "topology_prior": {
+          "bridge_fraction": 0.05,
+          "bridge_gain": 1.0,
+          "community_count": 4,
+          "inter_community_gain": 0.5,
+          "intra_community_gain": 1.5,
+          "kind": "iid"
+        }
+      },
+      "language_head": {
+        "eos_id": 50256,
+        "factorize_input_embedding": true,
+        "frame_special_tokens": true,
+        "patch_size": 2,
+        "state_count": 10,
+        "type": "nca_factorized_patch"
+      },
+      "latent_fanout_schedule": null,
+      "latent_reasoning": {
+        "adaptive_halting": false,
+        "enabled": false,
+        "energy_head": false,
+        "energy_margin": 1.0,
+        "halt_threshold": 0.550000011920929,
+        "max_steps": 1,
+        "min_steps": 1,
+        "normalize_steps": false,
+        "refiner_hidden_multiplier": 1,
+        "residual_refinement_gate": false,
+        "residual_refinement_gate_init": 0.25,
+        "step_conditioned_decoder": false,
+        "step_conditioned_decoder_scale": 1.0,
+        "stop_bias_init": -2.0
+      },
+      "mamba": {
+        "a_floor": 0.00009999999747378752,
+        "a_init_max": 16.0,
+        "a_init_min": 1.0,
+        "chunk_size": 64,
+        "conv_bias": true,
+        "d_conv": 4,
+        "d_state": 16,
+        "dt_init_floor": 0.00009999999747378752,
+        "dt_max": 0.10000000149011612,
+        "dt_min": 0.0010000000474974513,
+        "dt_rank": null,
+        "dt_scale": 1.0,
+        "expand": 2,
+        "headdim": 128,
+        "is_mimo": false,
+        "is_outproj_norm": false,
+        "mimo_rank": 1,
+        "ngroups": 1,
+        "norm_eps": 9.999999747378752e-6,
+        "rope_fraction": 0.5,
+        "use_fast_path": true
+      },
+      "mhc": {
+        "add_branch_out_to_residual": true,
+        "coefficient_policy": "static_sinkhorn",
+        "dropout": 0.0,
+        "enabled": false,
+        "last_layers": null,
+        "mhc_iters": 10,
+        "mhc_tau": 0.05000000074505806,
+        "num_streams": 1,
+        "num_views": 1
+      },
+      "mlp_internal_dim_multiplier": 2,
+      "n_embd": 512,
+      "n_expert": 1,
+      "n_head": 8,
+      "n_layer": 8,
+      "next_latent_transition": {
+        "enabled": false,
+        "hidden_multiplier": 2,
+        "normalize_input": true,
+        "zero_init_output": true
+      },
+      "normalization": {
+        "alpha_init": null,
+        "eps": 9.999999747378752e-6,
+        "kind": "layer_norm",
+        "shift_init": null
+      },
+      "random_scaffold": {
+        "alpha": 16.0,
+        "distribution": "gaussian_clt12",
+        "enabled": false,
+        "rank": 8,
+        "scaling": "standard",
+        "seed": 1337,
+        "trainable_gain": true
+      },
+      "residual_connector": "vanilla",
+      "rollout_fast_steps_per_slow_step": 1,
+      "sequence_kernel": {
+        "dense_score_row_chunk": 512,
+        "executor": "dense_score_short_context",
+        "memory_system": "linear_attention"
+      },
+      "sequence_score_head": {
+        "enabled": false,
+        "projection_dim": 64
+      },
+      "summary_memory": {
+        "chunk_tokens": 32,
+        "enabled": false,
+        "last_layers": null,
+        "residual_scale": 0.25,
+        "state_decay": 0.75,
+        "state_update_scale": 0.5,
+        "surprise_gate_sharpness": 8.0,
+        "surprise_gate_threshold": 0.0,
+        "write_trigger_text": null,
+        "write_trigger_token_ids": null
+      },
+      "tie_input_output_embeddings": false,
+      "vocab_size": 50257,
+      "y_neuron_recurrence": {
+        "carry_in_scale": 0.125,
+        "chunk_tokens": 1,
+        "enabled": false,
+        "last_layers": null,
+        "state_decay": 0.5,
+        "state_rms_cap": 1.0,
+        "state_update_scale": 1.0
+      }
+    },
+    "training_objective": {
+      "type": "next_token"
+    },
+    "optimizer": {
+      "type": "adamw"
+    },
+    "execution_backend": "auto",
+    "block_size": 256,
+    "tbptt_chunk_size": 64,
+    "tbptt_persist_across_steps": false,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0,
+    "batch_size": 4,
+    "max_train_batches": 8,
+    "max_eval_batches": 1,
+    "capability_policy": {
+      "native_cpu_memory_budget_bytes": 8589934592,
+      "native_wgpu_memory_budget_bytes": 4294967296,
+      "native_cuda_memory_budget_bytes": 6442450944,
+      "native_rocm_memory_budget_bytes": 6442450944,
+      "browser_wgpu_memory_budget_bytes": 6442450944,
+      "allow_native_validator_fallback": false,
+      "allow_browser_verifier_fallback": false,
+      "native_reprobe": {
+        "enabled": true,
+        "cooldown_secs": 30,
+        "interval_secs": 15,
+        "max_interval_secs": 300,
+        "required_successes": 2,
+        "memory_headroom_percent": 125,
+        "min_available_memory_bytes": 536870912
+      }
+    },
+    "trainer_support": {
+      "status": "supported"
+    },
+    "train_source": {
+      "type": "generated_nca",
+      "corpus_toml": "output_dir = \"./generated/nca-r1\"\nseed = 1337\nname = \"burn-dragon-mainnet-nca-r1\"\ntrain_samples = 256\nvalidation_samples = 64\nchunk_token_capacity = 4096\n",
+      "split": "train",
+      "max_documents": 144
+    },
+    "eval_source": {
+      "type": "generated_nca",
+      "corpus_toml": "output_dir = \"./generated/nca-r1\"\nseed = 1337\nname = \"burn-dragon-mainnet-nca-r1\"\ntrain_samples = 256\nvalidation_samples = 64\nchunk_token_capacity = 4096\n",
+      "split": "validation",
+      "max_documents": 8
+    }
+  }
+}

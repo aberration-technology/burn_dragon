@@ -45,6 +45,9 @@ const MIN_ACCEPTED_RECEIPTS = parseNonnegativeIntegerEnv(
 const BROWSER_NAME = (
   process.env.BURN_DRAGON_BROWSER_CANARY_BROWSER ?? "chromium"
 ).trim().toLowerCase();
+const WEBGPU_DRIVER = (
+  process.env.BURN_DRAGON_BROWSER_WEBGPU_DRIVER ?? "software"
+).trim().toLowerCase();
 const TRANSPORT_MODE = (
   process.env.BURN_DRAGON_BROWSER_CANARY_TRANSPORT_MODE ?? "auto"
 ).trim().toLowerCase();
@@ -165,6 +168,11 @@ function parseBooleanEnv(name, fallback) {
 function validateCanaryMode() {
   if (!["chromium", "firefox", "webkit"].includes(BROWSER_NAME)) {
     throw new Error(`unsupported browser ${BROWSER_NAME}; expected chromium, firefox, or webkit`);
+  }
+  if (!["software", "hardware"].includes(WEBGPU_DRIVER)) {
+    throw new Error(
+      `unsupported WebGPU driver ${WEBGPU_DRIVER}; expected software or hardware`,
+    );
   }
   if (!["auto", "webrtc-direct", "webtransport", "wss"].includes(TRANSPORT_MODE)) {
     throw new Error(
@@ -1064,6 +1072,8 @@ function summarizeBrowserTrainingProfile(browserConfig) {
   }
   return {
     block_size: training.block_size ?? null,
+    tbptt_chunk_size: training.tbptt_chunk_size ?? null,
+    batch_size: training.batch_size ?? null,
     max_train_batches: training.max_train_batches ?? null,
     max_eval_batches: training.max_eval_batches ?? null,
     publish_canonical_update: training.live_participant?.publish_canonical_update ?? null,
@@ -1072,6 +1082,9 @@ function summarizeBrowserTrainingProfile(browserConfig) {
     model_n_head: training.model_config?.n_head ?? null,
     model_n_layer: training.model_config?.n_layer ?? null,
     model_language_head: training.model_config?.language_head?.type ?? null,
+    fused_kernels_enabled: training.model_config?.fused_kernels?.enabled ?? null,
+    random_scaffold_enabled: training.model_config?.random_scaffold?.enabled ?? false,
+    optimizer: training.optimizer?.type ?? training.optimizer ?? null,
   };
 }
 
@@ -1490,7 +1503,7 @@ async function runCanary() {
           headless: HEADLESS,
           args: [
             "--enable-unsafe-webgpu",
-            "--use-angle=swiftshader",
+            `--use-angle=${WEBGPU_DRIVER === "hardware" ? "vulkan" : "swiftshader"}`,
             "--enable-features=Vulkan,UseSkiaRenderer,WebGPU",
           ],
         }
@@ -1513,6 +1526,8 @@ async function runCanary() {
     principal_id: PRINCIPAL_ID,
     experiment_id: EXPERIMENT_ID,
     browser_name: BROWSER_NAME,
+    webgpu_driver: WEBGPU_DRIVER,
+    webgpu_adapter: null,
     transport_mode: TRANSPORT_MODE,
     expect_training: EXPECT_TRAINING,
     use_production_training_profile: USE_PRODUCTION_TRAINING_PROFILE,
@@ -1536,6 +1551,8 @@ async function runCanary() {
     training_button_label: null,
     training_action_detail: null,
     training_completed: false,
+    training_panel: null,
+    training_layout_shift_score: null,
     training_p2p_checkpoint_ready: null,
     connect_button_visible: false,
     get_started_button_visible: false,
@@ -1705,6 +1722,21 @@ async function runCanary() {
         trustedCallbackTokenKey: TRUSTED_CALLBACK_TOKEN_KEY,
       },
     );
+    await context.addInitScript(() => {
+      window.__burnDragonTrainingLayoutShifts = [];
+      if (typeof PerformanceObserver !== "undefined") {
+        const observer = new PerformanceObserver((list) => {
+          for (const entry of list.getEntries()) {
+            if (!entry.hadRecentInput) {
+              window.__burnDragonTrainingLayoutShifts.push(entry.value);
+            }
+          }
+        });
+        try {
+          observer.observe({ type: "layout-shift", buffered: true });
+        } catch {}
+      }
+    });
 
     const page = await context.newPage();
     page.setDefaultTimeout(CONNECT_TIMEOUT_MS);
@@ -1739,6 +1771,23 @@ async function runCanary() {
     });
 
     await page.goto(callbackUrl, { waitUntil: "domcontentloaded" });
+    report.webgpu_adapter = await page.evaluate(async () => {
+      if (!navigator.gpu) {
+        return null;
+      }
+      const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+      if (!adapter) {
+        return null;
+      }
+      const info = adapter.info ?? {};
+      return {
+        vendor: info.vendor ?? null,
+        architecture: info.architecture ?? null,
+        device: info.device ?? null,
+        description: info.description ?? null,
+        is_fallback_adapter: info.isFallbackAdapter ?? null,
+      };
+    }).catch(() => null);
 
     const connectButton = page.locator('button:has-text("connect")').first();
     const trainActionButton = page.locator(".dragon-live-actions button").first();
@@ -1803,6 +1852,16 @@ async function runCanary() {
           ),
         )
         .catch(() => []);
+      report.training_panel = await page
+        .locator(".dragon-training-panel")
+        .first()
+        .evaluate((node) => ({
+          phase: node.getAttribute("data-training-phase"),
+          completed_windows: Number(node.getAttribute("data-training-completed-windows") ?? "0"),
+          text: node.textContent?.trim() ?? "",
+          bounds: node.getBoundingClientRect().toJSON(),
+        }))
+        .catch(() => null);
       report.live_status_label =
         statTileValue(report.live_stat_tiles, "status") ??
         labeledRowsValue(report.live_metric_cards, "mode");
@@ -1923,6 +1982,9 @@ async function runCanary() {
       MIN_ACCEPTED_RECEIPTS > 0
         ? waitForAcceptedReceiptSubmissions(page, MIN_ACCEPTED_RECEIPTS, TRAIN_TIMEOUT_MS)
         : null;
+    await page.evaluate(() => {
+      window.__burnDragonTrainingLayoutShifts = [];
+    });
     await trainActionButton.click();
     let acceptedReceiptIds = [];
     if (receiptResultPromise) {
@@ -1950,13 +2012,27 @@ async function runCanary() {
     }
     await page.waitForFunction(
       () =>
-        document.body.innerText.includes("Browser training complete:") ||
-        document.body.innerText.includes("Browser training window") ||
-        document.body.innerText.includes("train loss"),
+        Number(
+          document
+            .querySelector(".dragon-training-panel")
+            ?.getAttribute("data-training-completed-windows") ?? "0",
+        ) >= 1,
       { timeout: TRAIN_TIMEOUT_MS },
     );
     report.training_completed = true;
+    await page.waitForTimeout(250);
     await captureLiveStatus();
+    report.training_layout_shift_score = await page.evaluate(() =>
+      (window.__burnDragonTrainingLayoutShifts ?? []).reduce(
+        (total, value) => total + Number(value || 0),
+        0,
+      ),
+    );
+    if (report.training_layout_shift_score > 0.05) {
+      fail(
+        `browser training caused excessive layout shift: ${report.training_layout_shift_score}`,
+      );
+    }
     if (report.training_button_enabled && report.training_button_label === "stop training") {
       await trainActionButton.click().catch(() => {});
     }

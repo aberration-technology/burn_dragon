@@ -30,6 +30,8 @@ wasm-peer = [
   "dep:burn_dragon_universality",
 ]
 wgpu = ["dep:burn-wgpu"]
+# Keeps production-scale browser probes out of ordinary WASM test runs.
+browser-benchmark = []
 cuda = [
   "native",
   "burn_dragon_language/cuda",

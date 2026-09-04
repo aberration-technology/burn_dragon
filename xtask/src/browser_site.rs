@@ -346,7 +346,9 @@ body {
 }
 
 .dragon-live-actions {
+  min-height: 92px;
   display: grid;
+  align-content: start;
   gap: 10px;
   padding-top: 2px;
   justify-items: start;
@@ -423,6 +425,127 @@ body {
   max-width: 64%;
   overflow-wrap: anywhere;
   word-break: break-word;
+}
+
+.dragon-training-panel {
+  height: 460px;
+  display: grid;
+  grid-template-rows: auto auto 6px 1fr auto;
+  gap: 14px;
+  align-content: start;
+  border-radius: 8px;
+  contain: layout;
+}
+
+.dragon-training-batch-progress {
+  width: 100%;
+  height: 6px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--accent);
+  accent-color: var(--accent);
+}
+
+.dragon-training-batch-progress::-webkit-progress-bar {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.dragon-training-batch-progress::-webkit-progress-value {
+  background: var(--accent);
+}
+
+.dragon-training-batch-progress::-moz-progress-bar {
+  background: var(--accent);
+}
+
+.dragon-training-header {
+  min-height: 54px;
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.dragon-training-header .browser-focus-title {
+  margin-top: 4px;
+  font-size: 1.15rem;
+}
+
+.dragon-training-phase {
+  min-width: 11rem;
+  min-height: 32px;
+  display: grid;
+  place-items: center;
+  padding: 5px 9px;
+  border: 1px solid rgba(216, 124, 124, 0.3);
+  border-radius: 6px;
+  color: var(--accent);
+  background: rgba(216, 124, 124, 0.08);
+  font-family: ui-monospace, monospace;
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.dragon-training-progress {
+  min-height: 76px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.dragon-training-progress-item {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 7px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.018);
+}
+
+.dragon-training-progress-item span {
+  color: var(--muted);
+  font-size: 0.7rem;
+  text-transform: lowercase;
+}
+
+.dragon-training-progress-item strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, monospace;
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.dragon-training-last-window {
+  min-height: 128px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: 24px;
+  align-content: start;
+}
+
+.dragon-training-last-window .keyvalue-row {
+  min-height: 32px;
+}
+
+.dragon-training-last-window strong {
+  max-width: 66%;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+
+.dragon-training-detail {
+  min-height: 2.8rem;
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  overflow-y: auto;
 }
 
 .dragon-live-shell .section-detail {
@@ -1061,6 +1184,42 @@ main.dragon-browser-shell {
     grid-template-columns: 1fr;
   }
 
+  .dragon-training-panel {
+    height: 780px;
+  }
+
+  .dragon-training-header {
+    display: grid;
+  }
+
+  .dragon-training-phase {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .dragon-training-progress {
+    min-height: 180px;
+    grid-template-columns: 1fr;
+  }
+
+  .dragon-training-last-window {
+    min-height: 360px;
+    grid-template-columns: 1fr;
+    grid-auto-rows: minmax(40px, auto);
+  }
+
+  .dragon-training-last-window .keyvalue-row {
+    min-height: 40px;
+    flex-direction: row;
+    align-items: baseline;
+  }
+
+  .dragon-training-last-window strong {
+    max-width: 62%;
+    text-align: right;
+    line-height: 1.25;
+  }
+
   .dragon-activity-event {
     grid-template-columns: 1fr;
     gap: 4px;
@@ -1647,6 +1806,16 @@ mod tests {
         assert!(EXTRA_STYLESHEET.contains("width: 1.2ch;"));
         assert!(EXTRA_STYLESHEET.contains("visibility: hidden;"));
         assert!(!EXTRA_STYLESHEET.contains("display: none;"));
+    }
+
+    #[test]
+    fn browser_training_surface_reserves_stable_layout_space() {
+        assert!(EXTRA_STYLESHEET.contains(".dragon-training-panel {\n  height: 460px;"));
+        assert!(EXTRA_STYLESHEET.contains(".dragon-live-actions {\n  min-height: 92px;"));
+        assert!(EXTRA_STYLESHEET.contains(".dragon-training-last-window"));
+        assert!(EXTRA_STYLESHEET.contains("height: 780px;"));
+        assert!(EXTRA_STYLESHEET.contains("grid-auto-rows: minmax(40px, auto);"));
+        assert!(EXTRA_STYLESHEET.contains("font-variant-numeric: tabular-nums;"));
     }
 
     #[test]

@@ -7,7 +7,7 @@ impl<B: Backend> DragonModel<B> {
         tokens: Tensor<B, 2, Int>,
         state: &mut ModelState<B>,
     ) -> Vec<LanguageMhcLayerDiagnostics> {
-        let embedded = self.embed.forward(tokens);
+        let embedded = self.embed_tokens(tokens);
         self.collect_language_mhc_diagnostics_from_embedded(embedded, state, None)
     }
 
@@ -17,7 +17,7 @@ impl<B: Backend> DragonModel<B> {
         summary_event_mask: Tensor<B, 2, Int>,
         state: &mut ModelState<B>,
     ) -> Vec<LanguageMhcLayerDiagnostics> {
-        let embedded = self.embed.forward(tokens);
+        let embedded = self.embed_tokens(tokens);
         self.collect_language_mhc_diagnostics_from_embedded(
             embedded,
             state,
@@ -31,7 +31,7 @@ impl<B: Backend> DragonModel<B> {
         tokens: Tensor<B, 2, Int>,
         state: &mut ModelState<B>,
     ) -> Vec<LanguageDragonInitLayerDiagnostics> {
-        let embedded = self.embed.forward(tokens);
+        let embedded = self.embed_tokens(tokens);
         self.collect_language_dragon_init_diagnostics_from_embedded(embedded, state, None)
     }
 
@@ -42,7 +42,7 @@ impl<B: Backend> DragonModel<B> {
         summary_event_mask: Tensor<B, 2, Int>,
         state: &mut ModelState<B>,
     ) -> Vec<LanguageDragonInitLayerDiagnostics> {
-        let embedded = self.embed.forward(tokens);
+        let embedded = self.embed_tokens(tokens);
         self.collect_language_dragon_init_diagnostics_from_embedded(
             embedded,
             state,

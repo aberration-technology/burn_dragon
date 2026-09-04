@@ -10,7 +10,7 @@ use crate::workflow_tools::BootstrapStackSettingsMode;
 
 const BOOTSTRAP_HEAD_MIRROR_ADMIN_CAPABILITIES: &str =
     "register_live_head,rollout_auth_policy,rollout_revision_contracts";
-pub(crate) const DEFAULT_NCA_REVISION_ID: &str = "nca-r2";
+pub(crate) const DEFAULT_NCA_REVISION_ID: &str = "nca-r3";
 
 pub fn resolve(mode: BootstrapStackSettingsMode) -> Result<()> {
     match mode {

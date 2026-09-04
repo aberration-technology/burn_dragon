@@ -198,13 +198,20 @@ pub fn estimate_language_training_footprint(
     let latent_per_head = model_config.latent_per_head() as u64;
     let layers = model_config.n_layer.max(1) as u64;
     let heads = model_config.n_head.max(1) as u64;
-    let vocab = model_config.vocab_size.max(1) as u64;
     let batch = batch_size.max(1) as u64;
     let block = block_size.max(1) as u64;
     let tokens = batch * block;
 
-    let embedding_params = vocab * embed;
-    let output_head_params = vocab * embed;
+    let embedding_rows = model_config
+        .language_head
+        .input_embedding_rows(model_config.vocab_size)
+        .unwrap_or(model_config.vocab_size.max(1)) as u64;
+    let output_rows = model_config
+        .language_head
+        .output_projection_rows(model_config.vocab_size)
+        .unwrap_or(model_config.vocab_size.max(1)) as u64;
+    let embedding_params = embedding_rows * embed;
+    let output_head_params = output_rows * embed;
     let norm_params = 2 * embed + 2;
     let shared_lowrank_params = 3 * embed * latent_total;
     let sequence_params = match model_config.sequence_kernel.memory_system {
@@ -496,6 +503,7 @@ fn browser_trainer_memory_budget_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use burn_dragon_core::LanguageHeadConfig;
     #[cfg(all(not(feature = "native"), feature = "wasm-peer"))]
     use burn_dragon_core::SequenceKernelConfig;
     #[cfg(feature = "native")]
@@ -568,6 +576,47 @@ mod tests {
         );
         assert!(deep_fp.estimated_activation_bytes > shallow_fp.estimated_activation_bytes);
         assert!(deep_fp.estimated_training_bytes > shallow_fp.estimated_training_bytes);
+    }
+
+    #[test]
+    fn estimated_training_footprint_accounts_for_factorized_nca_surfaces() {
+        let mut flat = DragonConfig {
+            n_layer: 1,
+            n_embd: 16,
+            n_head: 2,
+            vocab_size: 32,
+            ..DragonConfig::default()
+        };
+        flat.language_head = LanguageHeadConfig::NcaFactorizedPatch {
+            state_count: 2,
+            patch_size: 2,
+            factorize_input_embedding: false,
+            frame_special_tokens: true,
+            eos_id: Some(31),
+        };
+        let mut factorized = flat.clone();
+        let LanguageHeadConfig::NcaFactorizedPatch {
+            factorize_input_embedding,
+            ..
+        } = &mut factorized.language_head
+        else {
+            unreachable!();
+        };
+        *factorize_input_embedding = true;
+
+        let flat =
+            estimate_language_training_footprint(&flat, 1, 8, DragonCapabilityClass::BrowserWgpu);
+        let factorized = estimate_language_training_footprint(
+            &factorized,
+            1,
+            8,
+            DragonCapabilityClass::BrowserWgpu,
+        );
+
+        assert_eq!(
+            flat.estimated_parameter_bytes - factorized.estimated_parameter_bytes,
+            ((32 - 11) * 16 * core::mem::size_of::<f32>()) as u64
+        );
     }
 
     #[cfg(feature = "native")]

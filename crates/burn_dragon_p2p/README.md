@@ -279,7 +279,9 @@ Generated Ruliad uses the same semantic contract, deterministic proof source,
 native path. The real Chrome/WebGPU gate runs two train and two evaluation
 batches and checks formal-family metadata plus block/TBPTT behavior. AdamW loss
 scalars remain on the GPU through the browser window and are read once at the
-window boundary, avoiding a per-step WebGPU synchronization.
+window boundary, avoiding a per-step WebGPU synchronization. Generated NCA
+documents are retained in a bounded, run-local cache so rotating leases reuse
+overlapping deterministic samples instead of rebuilding them between windows.
 
 For ClimbMix, the intended browser path is the shard-manifest form. The browser fetches
 `fetch-manifest.json`, selects a bounded per-peer shard subset from the full shard pool,
@@ -431,7 +433,7 @@ burn_dragon_p2p_native run-peer
 
 With no `--config`, the binary uses the public Dragon edge at
 `https://edge.dragon.aberration.technology`, DNS TCP/QUIC seeds for that edge,
-the `burn-dragon-mainnet` / `nca-prepretraining` / `nca-r3` experiment ids, and
+the `burn-dragon-mainnet` / `nca-prepretraining` / `nca-r4` experiment ids, and
 a storage root under `$XDG_DATA_HOME/burn_dragon_p2p/mainnet-native` or
 `~/.local/share/burn_dragon_p2p/mainnet-native`. Override the storage root with
 `BURN_DRAGON_P2P_NATIVE_STORAGE_ROOT` when running multiple peers on one host.
@@ -610,10 +612,10 @@ Generate a network-publishable Dragon profile from a local training config:
 ```bash
 cargo run -p burn_dragon_p2p --features native --bin burn_dragon_p2p_native -- \
   build-profile \
-  --training-config crates/burn_dragon_p2p/deploy/profiles/nca-r3.training.toml \
+  --training-config crates/burn_dragon_p2p/deploy/profiles/nca-r4.training.toml \
   --experiment-kind nca \
-  --revision-id nca-r3 \
-  --output /tmp/nca-r3.profile.json
+  --revision-id nca-r4 \
+  --output /tmp/nca-r4.profile.json
 ```
 
 Inspect the current network directory:

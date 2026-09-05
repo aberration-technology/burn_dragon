@@ -46,7 +46,8 @@ use crate::auth::{
     browser_github_enrollment_config, fetch_edge_snapshot, load_or_enroll_browser_session,
 };
 use crate::browser_data::{
-    GeneratedRecordSelection, generated_nca_records, generated_ruliad_records,
+    BrowserGeneratedNcaCache, GeneratedRecordSelection, generated_nca_records_cached,
+    generated_ruliad_records,
 };
 use crate::browser_record::{
     BrowserBurnRecordBytesFormat, BrowserBurnRecordPrecision, browser_random_scaffold_contract,
@@ -57,7 +58,7 @@ use crate::browser_record::{
 };
 use crate::capability::{
     DragonCapabilityClass, decide_browser_capability, detect_browser_host_capabilities,
-    estimate_language_training_footprint,
+    detect_browser_host_capabilities_async, estimate_language_training_footprint,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::capability_state::{
@@ -89,6 +90,9 @@ const BROWSER_ASYNC_FULL_HEAD_MAX_PARAMETER_BYTES: u64 = 16 * 1024 * 1024;
 const BROWSER_WINDOW_FINALIZATION_RESERVE_DIVISOR: u64 = 5;
 const BROWSER_WINDOW_FINALIZATION_RESERVE_MIN_MS: u64 = 1_000;
 const BROWSER_WINDOW_FINALIZATION_RESERVE_MAX_MS: u64 = 10_000;
+const BROWSER_WINDOW_TIMING_SAFETY_NUMERATOR: u64 = 5;
+const BROWSER_WINDOW_TIMING_SAFETY_DENOMINATOR: u64 = 4;
+const BROWSER_TRAINING_PROGRESS_BATCH_CADENCE: usize = 4;
 #[cfg(feature = "wgpu")]
 type BrowserWgpuEvalBackend = burn_wgpu::Wgpu<f32>;
 #[cfg(feature = "wgpu")]
@@ -118,6 +122,8 @@ pub struct DragonBrowserTrainingResult {
     pub train_loss_mean: f64,
     #[serde(default)]
     pub train_loss_observed: bool,
+    #[serde(default)]
+    pub learning_rate: f64,
     pub eval_examples: usize,
     pub eval_loss: Option<f64>,
     pub setup_time_ms: u64,
@@ -125,6 +131,8 @@ pub struct DragonBrowserTrainingResult {
     pub eval_time_ms: u64,
     pub total_time_ms: u64,
     pub tokens_per_second: Option<f64>,
+    #[serde(default)]
+    pub training_duty_percent: Option<f64>,
     #[serde(default)]
     pub phase_timings: DragonBrowserTrainingPhaseTimings,
     #[serde(default)]
@@ -490,6 +498,87 @@ struct LiveBrowserParticipantHandle {
 pub(crate) struct DragonBrowserTrainingSession {
     live_browser_session: Option<BrowserSessionState>,
     live_participant: Option<LiveBrowserParticipantHandle>,
+    performance: BrowserTrainingPerformanceState,
+    generated_nca_cache: BrowserGeneratedNcaCache,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct BrowserTrainingPerformanceState {
+    execution_contract_hash: Option<ContentId>,
+    measured_batch_ms: Option<u64>,
+    measured_finalization_ms: Option<u64>,
+    completed_windows: u64,
+}
+
+impl BrowserTrainingPerformanceState {
+    fn bind(&mut self, execution_contract_hash: ContentId) {
+        if self.execution_contract_hash.as_ref() != Some(&execution_contract_hash) {
+            *self = Self {
+                execution_contract_hash: Some(execution_contract_hash),
+                ..Self::default()
+            };
+        }
+    }
+
+    fn observe_batch(&mut self, elapsed_ms: u64) {
+        self.measured_batch_ms = Some(smoothed_duration_ms(
+            self.measured_batch_ms,
+            elapsed_ms.max(1),
+        ));
+    }
+
+    fn observe_finalization(&mut self, elapsed_ms: u64) {
+        self.measured_finalization_ms = Some(smoothed_duration_ms(
+            self.measured_finalization_ms,
+            elapsed_ms.max(1),
+        ));
+        self.completed_windows = self.completed_windows.saturating_add(1);
+    }
+
+    fn observe_window_batch_average(&mut self, training_wall_ms: u64, completed_batches: usize) {
+        let completed_batches = u64::try_from(completed_batches).unwrap_or(u64::MAX).max(1);
+        let average_ms = training_wall_ms.div_ceil(completed_batches).max(1);
+        self.measured_batch_ms = Some(if self.completed_windows == 0 {
+            average_ms
+        } else {
+            smoothed_duration_ms(self.measured_batch_ms, average_ms)
+        });
+    }
+
+    fn guarded_batch_ms(&self) -> Option<u64> {
+        self.measured_batch_ms.map(guarded_duration_ms)
+    }
+
+    fn finalization_reserve_ms(&self, budget_ms: u64) -> u64 {
+        let static_reserve = (budget_ms / BROWSER_WINDOW_FINALIZATION_RESERVE_DIVISOR).clamp(
+            BROWSER_WINDOW_FINALIZATION_RESERVE_MIN_MS,
+            BROWSER_WINDOW_FINALIZATION_RESERVE_MAX_MS,
+        );
+        self.measured_finalization_ms
+            .map(guarded_duration_ms)
+            .unwrap_or_default()
+            .max(static_reserve)
+            .min(budget_ms)
+    }
+}
+
+fn smoothed_duration_ms(previous: Option<u64>, observed: u64) -> u64 {
+    previous
+        .map(|previous| {
+            previous
+                .saturating_mul(3)
+                .saturating_add(observed)
+                .div_ceil(4)
+        })
+        .unwrap_or(observed)
+        .max(1)
+}
+
+fn guarded_duration_ms(duration_ms: u64) -> u64 {
+    duration_ms
+        .saturating_mul(BROWSER_WINDOW_TIMING_SAFETY_NUMERATOR)
+        .div_ceil(BROWSER_WINDOW_TIMING_SAFETY_DENOMINATOR)
+        .max(1)
 }
 
 impl DragonBrowserTrainingSession {
@@ -697,25 +786,22 @@ fn browser_uses_compact_update(config: &DragonBrowserTrainingConfig) -> bool {
 }
 
 fn projected_browser_window_ms_after_next_batch(
-    budget_ms: u64,
     total_elapsed_ms: u64,
-    training_elapsed_ms: u64,
-    completed_batches: usize,
-) -> Option<u64> {
-    if completed_batches == 0 {
-        return None;
-    }
-    let completed_batches = u64::try_from(completed_batches).unwrap_or(u64::MAX);
-    let average_batch_ms = training_elapsed_ms.div_ceil(completed_batches).max(1);
-    let finalization_reserve_ms = (budget_ms / BROWSER_WINDOW_FINALIZATION_RESERVE_DIVISOR).clamp(
-        BROWSER_WINDOW_FINALIZATION_RESERVE_MIN_MS,
-        BROWSER_WINDOW_FINALIZATION_RESERVE_MAX_MS,
-    );
-    Some(
-        total_elapsed_ms
-            .saturating_add(average_batch_ms)
-            .saturating_add(finalization_reserve_ms),
-    )
+    estimated_gpu_ready_ms: Option<u64>,
+    guarded_batch_ms: u64,
+    finalization_reserve_ms: u64,
+) -> u64 {
+    estimated_gpu_ready_ms
+        .unwrap_or(total_elapsed_ms)
+        .max(total_elapsed_ms)
+        .saturating_add(guarded_batch_ms)
+        .saturating_add(finalization_reserve_ms)
+}
+
+fn browser_training_progress_update_due(completed_batches: usize, planned_batches: usize) -> bool {
+    completed_batches == 1
+        || completed_batches == planned_batches
+        || completed_batches.is_multiple_of(BROWSER_TRAINING_PROGRESS_BATCH_CADENCE)
 }
 
 fn browser_canonical_artifact_publication_decision_for_platform(
@@ -825,11 +911,12 @@ pub(crate) async fn run_browser_training_with_session_and_observer(
         #[cfg(feature = "wgpu")]
         BrowserTrainingBackendKind::Wgpu => "wgpu",
     };
-    let browser_training_requires_webgpu = match backend_kind {
-        BrowserTrainingBackendKind::Cpu => false,
-        #[cfg(feature = "wgpu")]
-        BrowserTrainingBackendKind::Wgpu => true,
-    };
+    let browser_live_training_requires_webgpu = config.live_participant.is_some()
+        && match backend_kind {
+            BrowserTrainingBackendKind::Cpu => false,
+            #[cfg(feature = "wgpu")]
+            BrowserTrainingBackendKind::Wgpu => true,
+        };
     info!(
         "browser training start: experiment={} backend={} block_size={} batch_size={} max_train_batches={:?} max_eval_batches={:?} live_participant={}",
         config.experiment_kind.workload_slug(),
@@ -840,13 +927,14 @@ pub(crate) async fn run_browser_training_with_session_and_observer(
         config.max_eval_batches,
         config.live_participant.is_some(),
     );
+    let browser_host_capabilities = detect_browser_host_capabilities_async().await;
     let browser_capability_decision = apply_browser_downgrade_state(
         edge_base_url,
         config,
         backend_label,
-        decide_browser_capability(Some(config), &detect_browser_host_capabilities()),
+        decide_browser_capability(Some(config), &browser_host_capabilities),
     );
-    if browser_training_requires_webgpu && !browser_capability_decision.can_train {
+    if browser_live_training_requires_webgpu && !browser_capability_decision.can_train {
         bail!(
             "{}",
             browser_capability_decision
@@ -860,6 +948,9 @@ pub(crate) async fn run_browser_training_with_session_and_observer(
         .ensure_live_participant(edge_base_url, config, release_manifest)
         .await?;
     let live_session_principal_id = session.live_session_principal_id().map(str::to_owned);
+    let live_participant = &mut session.live_participant;
+    let performance = &mut session.performance;
+    let generated_nca_cache = &mut session.generated_nca_cache;
     let result = match backend_kind {
         BrowserTrainingBackendKind::Cpu => {
             let setup_started_at = Instant::now();
@@ -883,7 +974,9 @@ pub(crate) async fn run_browser_training_with_session_and_observer(
                             progress,
                         },
                         &device,
-                        session.live_participant.as_mut(),
+                        live_participant.as_mut(),
+                        performance,
+                        generated_nca_cache,
                         |_model, _contract| {
                             Ok(BrowserAdamwKernel::<BrowserCpuTrainBackend>::new(
                                 config.learning_rate,
@@ -918,7 +1011,9 @@ pub(crate) async fn run_browser_training_with_session_and_observer(
                             progress,
                         },
                         &device,
-                        session.live_participant.as_mut(),
+                        live_participant.as_mut(),
+                        performance,
+                        generated_nca_cache,
                         |model, contract| {
                             let optimizer_hash = contract
                                 .map(|contract| contract.training.optimizer_hash.clone())
@@ -962,7 +1057,9 @@ pub(crate) async fn run_browser_training_with_session_and_observer(
                             progress,
                         },
                         &device,
-                        session.live_participant.as_mut(),
+                        live_participant.as_mut(),
+                        performance,
+                        generated_nca_cache,
                         |_model, _contract| {
                             Ok(BrowserAdamwKernel::<BrowserWgpuTrainBackend>::new(
                                 config.learning_rate,
@@ -998,7 +1095,9 @@ pub(crate) async fn run_browser_training_with_session_and_observer(
                             progress,
                         },
                         &device,
-                        session.live_participant.as_mut(),
+                        live_participant.as_mut(),
+                        performance,
+                        generated_nca_cache,
                         |model, contract| {
                             let optimizer_hash = contract
                                 .map(|contract| contract.training.optimizer_hash.clone())
@@ -1022,11 +1121,11 @@ pub(crate) async fn run_browser_training_with_session_and_observer(
 
     #[cfg(target_arch = "wasm32")]
     match &result {
-        Ok(_) if browser_training_requires_webgpu => {
+        Ok(_) if browser_live_training_requires_webgpu => {
             let _ = clear_browser_downgrade(edge_base_url, config, backend_label);
         }
         Err(error)
-            if browser_training_requires_webgpu
+            if browser_live_training_requires_webgpu
                 && is_probable_trainer_fit_failure(&error.to_string()) =>
         {
             let _ = persist_browser_downgrade(
@@ -1085,6 +1184,8 @@ async fn run_browser_training_inner<B, K, F>(
     mut context: BrowserTrainingRunContext<'_>,
     device: &B::Device,
     mut live_participant: Option<&mut LiveBrowserParticipantHandle>,
+    performance: &mut BrowserTrainingPerformanceState,
+    generated_nca_cache: &mut BrowserGeneratedNcaCache,
     kernel_factory: F,
 ) -> Result<DragonBrowserTrainingResult>
 where
@@ -1095,6 +1196,7 @@ where
 {
     validate_browser_training_config(context.config)?;
     validate_live_training_backend(context.config, context.backend_kind)?;
+    performance.bind(browser_runtime_execution_contract_hash(context.config)?);
 
     let total_started_at = Instant::now();
     context
@@ -1103,6 +1205,7 @@ where
         ))
         .await;
     let data_loading_started_at = Instant::now();
+    let nca_cache_before = generated_nca_cache.stats();
 
     let train_record_limit = if context.config.training_lease.is_some()
         && matches!(
@@ -1122,6 +1225,7 @@ where
             train_record_limit,
             context.config.training_lease.clone(),
         ),
+        generated_nca_cache,
     )
     .await?;
     if train_records.is_empty() {
@@ -1138,15 +1242,25 @@ where
                     max_record_limit(context.config.batch_size, context.config.max_eval_batches),
                     None,
                 ),
+                generated_nca_cache,
             )
             .await?
         }
         None => Vec::new(),
     };
     info!(
-        "browser training records loaded: train_examples={} eval_examples={}",
+        "browser training records loaded: train_examples={} eval_examples={} nca_cache_hits={} nca_cache_misses={} nca_cache_bytes={}",
         train_records.len(),
         eval_records.len(),
+        generated_nca_cache
+            .stats()
+            .hits
+            .saturating_sub(nca_cache_before.hits),
+        generated_nca_cache
+            .stats()
+            .misses
+            .saturating_sub(nca_cache_before.misses),
+        generated_nca_cache.stats().bytes,
     );
     let data_loading_ms = elapsed_ms(data_loading_started_at);
 
@@ -1326,7 +1440,7 @@ where
     let collect_loss_scalars = kernel.observes_loss();
     if kernel.defers_loss_readback() {
         info!(
-            "browser training loss scalar readback deferred for backend={}; one GPU fence occurs at the window boundary",
+            "browser training loss scalar readback deferred for backend={}; live windows measure the first batch before dense submission and synchronize once more at the boundary",
             context.backend_label,
         );
     }
@@ -1344,6 +1458,7 @@ where
         .map(|lease| lease.window_id.0.checked_shl(32).unwrap_or(u64::MAX))
         .unwrap_or(0);
     let training_started_at = Instant::now();
+    let mut estimated_gpu_ready_ms = None;
     context
         .report_progress(DragonBrowserTrainingProgress::training(
             0,
@@ -1353,21 +1468,30 @@ where
         .await;
     for (batch_index, batch) in train_batches.into_iter().enumerate() {
         if let Some(budget_ms) = training_window_budget_ms
-            && let Some(projected_ms) = projected_browser_window_ms_after_next_batch(
-                budget_ms,
+            && let Some(guarded_batch_ms) = performance.guarded_batch_ms()
+            && projected_browser_window_ms_after_next_batch(
                 context
                     .setup_time_ms
                     .saturating_add(elapsed_ms(total_started_at)),
-                elapsed_ms(training_started_at),
-                train_batch_count,
-            )
-            && projected_ms >= budget_ms
+                estimated_gpu_ready_ms,
+                guarded_batch_ms,
+                performance.finalization_reserve_ms(budget_ms),
+            ) >= budget_ms
         {
+            let projected_ms = projected_browser_window_ms_after_next_batch(
+                context
+                    .setup_time_ms
+                    .saturating_add(elapsed_ms(total_started_at)),
+                estimated_gpu_ready_ms,
+                guarded_batch_ms,
+                performance.finalization_reserve_ms(budget_ms),
+            );
             info!(
-                "browser training window stopping before batch {}: projected_total_ms={} budget_ms={} completed_batches={}",
+                "browser training window stopping before batch {}: projected_total_ms={} budget_ms={} guarded_batch_ms={} completed_batches={}",
                 batch_index + 1,
                 projected_ms,
                 budget_ms,
+                guarded_batch_ms,
                 train_batch_count,
             );
             break;
@@ -1388,6 +1512,7 @@ where
         let generation = generation_base
             .checked_add(batch_index as u64)
             .ok_or_else(|| anyhow!("browser optimizer generation overflowed"))?;
+        let batch_wall_started_at = Instant::now();
         let submission_started_at = Instant::now();
         let step = kernel.step(model, &batch, generation).await?;
         training_submission_ms =
@@ -1404,13 +1529,79 @@ where
         );
         train_token_count = train_token_count.saturating_add(batch.token_count);
         train_batch_count = train_batch_count.saturating_add(1);
-        context
-            .report_progress(DragonBrowserTrainingProgress::training(
-                train_batch_count,
-                train_batches_len,
-                train_token_count,
-            ))
-            .await;
+        let calibrate_live_adapter = batch_index == 0
+            && training_window_budget_ms.is_some()
+            && kernel.defers_loss_readback();
+        if calibrate_live_adapter {
+            context
+                .report_progress(DragonBrowserTrainingProgress::measuring_adapter(
+                    train_batch_count,
+                    train_batches_len,
+                    train_token_count,
+                ))
+                .await;
+            let synchronization_started_at = Instant::now();
+            let observation = kernel.synchronize_loss_observation().await?;
+            loss_synchronization_ms =
+                loss_synchronization_ms.saturating_add(elapsed_ms(synchronization_started_at));
+            train_loss_sum += observation.sum;
+            train_loss_count = train_loss_count.saturating_add(observation.count);
+            let measured_batch_ms = elapsed_ms(batch_wall_started_at).max(1);
+            performance.observe_batch(measured_batch_ms);
+            estimated_gpu_ready_ms = Some(
+                context
+                    .setup_time_ms
+                    .saturating_add(elapsed_ms(total_started_at)),
+            );
+            let budget_ms = training_window_budget_ms.expect("live calibration budget");
+            let elapsed_total_ms = context
+                .setup_time_ms
+                .saturating_add(elapsed_ms(total_started_at));
+            let finalization_reserve_ms = performance.finalization_reserve_ms(budget_ms);
+            info!(
+                "browser live adapter measured: first_batch_ms={} guarded_batch_ms={} elapsed_total_ms={} finalization_reserve_ms={} budget_ms={}",
+                measured_batch_ms,
+                performance.guarded_batch_ms().unwrap_or(measured_batch_ms),
+                elapsed_total_ms,
+                finalization_reserve_ms,
+                budget_ms,
+            );
+            if elapsed_total_ms.saturating_add(finalization_reserve_ms) >= budget_ms {
+                bail!(
+                    "browser trainer performance cannot satisfy the signed training window: first completed batch and setup consumed {elapsed_total_ms}ms with {finalization_reserve_ms}ms required for finalization inside a {budget_ms}ms budget"
+                );
+            }
+            context
+                .progress
+                .on_progress(DragonBrowserTrainingProgress::training(
+                    train_batch_count,
+                    train_batches_len,
+                    train_token_count,
+                ));
+        } else {
+            if kernel.defers_loss_readback()
+                && let Some(guarded_batch_ms) = performance.guarded_batch_ms()
+            {
+                let elapsed_total_ms = context
+                    .setup_time_ms
+                    .saturating_add(elapsed_ms(total_started_at));
+                estimated_gpu_ready_ms = Some(
+                    estimated_gpu_ready_ms
+                        .unwrap_or(elapsed_total_ms)
+                        .max(elapsed_total_ms)
+                        .saturating_add(guarded_batch_ms),
+                );
+            }
+            if browser_training_progress_update_due(train_batch_count, train_batches_len) {
+                context
+                    .report_progress(DragonBrowserTrainingProgress::training(
+                        train_batch_count,
+                        train_batches_len,
+                        train_token_count,
+                    ))
+                    .await;
+            }
+        }
         if batch_index == 0 {
             info!("browser training first batch complete");
         }
@@ -1432,8 +1623,11 @@ where
     train_loss_sum += observation.sum;
     train_loss_count = train_loss_count.saturating_add(observation.count);
     let compact_trace = kernel.compact_trace().cloned();
-    let training_time_ms = training_submission_ms.saturating_add(loss_synchronization_ms);
     let training_wall_ms = elapsed_ms(training_started_at);
+    let training_time_ms = training_wall_ms;
+    if training_window_budget_ms.is_some() {
+        performance.observe_window_batch_average(training_wall_ms, train_batch_count);
+    }
     let train_loss_mean = if train_loss_count > 0 {
         train_loss_sum / train_loss_count as f64
     } else {
@@ -1450,6 +1644,7 @@ where
         training_wall_ms,
     );
 
+    let finalization_started_at = Instant::now();
     context
         .report_progress(DragonBrowserTrainingProgress::phase(
             DragonBrowserTrainingPhase::Evaluating,
@@ -1611,6 +1806,9 @@ where
     }
 
     let total_time_ms = context.setup_time_ms + elapsed_ms(total_started_at);
+    if training_window_budget_ms.is_some() {
+        performance.observe_finalization(elapsed_ms(finalization_started_at));
+    }
     let result = DragonBrowserTrainingResult {
         backend: context.backend_label.into(),
         experiment_kind_label: context.config.experiment_kind.display_name().into(),
@@ -1620,14 +1818,17 @@ where
         train_tokens: train_token_count,
         train_loss_mean,
         train_loss_observed: train_loss_count > 0,
+        learning_rate: context.config.learning_rate,
         eval_examples: eval_records.len(),
         eval_loss,
         setup_time_ms: context.setup_time_ms,
         training_time_ms,
         eval_time_ms,
         total_time_ms,
-        tokens_per_second: (training_time_ms > 0)
-            .then_some(train_token_count as f64 / (training_time_ms as f64 / 1000.0)),
+        tokens_per_second: (training_wall_ms > 0)
+            .then_some(train_token_count as f64 / (training_wall_ms as f64 / 1000.0)),
+        training_duty_percent: (total_time_ms > 0)
+            .then_some(100.0 * training_wall_ms as f64 / total_time_ms as f64),
         phase_timings: DragonBrowserTrainingPhaseTimings {
             runtime_setup_ms: context.setup_time_ms,
             data_loading_ms,
@@ -1741,12 +1942,10 @@ fn browser_shard_selection_key(
     }
 
     format!(
-        "local|{}|{}|{}|{}|{}|{}",
+        "local|{}|{}|{}|{}",
         edge_base_url.trim_end_matches('/'),
         config.experiment_kind.workload_slug(),
         config.block_size,
-        config.batch_size,
-        config.max_train_batches.unwrap_or(0),
         stage,
     )
 }
@@ -1756,6 +1955,7 @@ async fn load_token_records(
     source: &DragonBrowserTokenSource,
     block_size: usize,
     policy: TokenRecordLoadPolicy,
+    generated_nca_cache: &mut BrowserGeneratedNcaCache,
 ) -> Result<Vec<TokenWindowRecord>> {
     let records = match source {
         DragonBrowserTokenSource::Inline { records } => records.clone(),
@@ -1798,7 +1998,8 @@ async fn load_token_records(
             corpus,
             split,
             max_documents,
-        } => generated_nca_records(
+        } => generated_nca_records_cached(
+            generated_nca_cache,
             corpus,
             *split,
             block_size,
@@ -3126,6 +3327,30 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    fn browser_training_smoke_r4_dense_window_is_cross_target_stable() {
+        let profile: crate::profile::DragonExperimentProfile =
+            serde_json::from_str(include_str!("../../deploy/profiles/nca-r4.profile.json"))
+                .expect("builtin NCA R4 profile");
+        let wire_json = serde_json::to_string(&profile).expect("serialize browser profile");
+        let javascript_value =
+            js_sys::JSON::parse(&wire_json).expect("parse profile in JavaScript");
+        let javascript_json = js_sys::JSON::stringify(&javascript_value)
+            .expect("stringify profile in JavaScript")
+            .as_string()
+            .expect("JavaScript profile JSON string");
+        let profile: crate::profile::DragonExperimentProfile =
+            serde_json::from_str(&javascript_json).expect("decode JavaScript profile round trip");
+        let browser = profile.browser.expect("browser profile");
+
+        assert_eq!(browser.max_train_batches, Some(64));
+        assert_eq!(browser.learning_rate, 3.125e-5);
+        assert_eq!(
+            dragon_model_schema_hash(&browser.model_config).as_str(),
+            "dragon-model-schema-ae55218ef919feac071f796de8c74560917ae03119b8624614d3407e9f1fb042"
+        );
+    }
+
+    #[wasm_bindgen_test]
     fn browser_batches_preserve_native_shard_loss_masks() {
         let device = burn::tensor::Device::<NdArray<f32>>::default();
         let masked = TokenWindowRecord {
@@ -3189,20 +3414,60 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn browser_window_budget_reserves_time_for_eval_and_publication() {
+    fn browser_training_smoke_window_budget_reserves_time_for_eval_and_publication() {
         assert_eq!(
-            projected_browser_window_ms_after_next_batch(30_000, 8_000, 7_000, 0),
-            None,
-            "the first batch establishes the runtime estimate"
+            projected_browser_window_ms_after_next_batch(8_000, None, 7_000, 6_000),
+            21_000,
         );
         assert_eq!(
-            projected_browser_window_ms_after_next_batch(30_000, 16_500, 16_000, 2),
-            Some(30_500),
+            projected_browser_window_ms_after_next_batch(16_500, None, 8_000, 6_000),
+            30_500,
         );
-        assert!(
-            projected_browser_window_ms_after_next_batch(30_000, 10_500, 10_000, 8)
-                .is_some_and(|projected_ms| projected_ms < 30_000)
+        assert!(projected_browser_window_ms_after_next_batch(10_500, None, 10_000, 6_000) < 30_000);
+        assert_eq!(
+            projected_browser_window_ms_after_next_batch(10_500, Some(18_000), 4_000, 6_000),
+            28_000,
+            "deferred command submission must reserve time for work already queued on the GPU",
         );
+
+        let mut queue_tail_ms = Some(10_000);
+        for _ in 0..27 {
+            let projected =
+                projected_browser_window_ms_after_next_batch(10_000, queue_tail_ms, 500, 6_000);
+            assert!(projected < 30_000);
+            queue_tail_ms = Some(queue_tail_ms.unwrap_or(10_000).saturating_add(500));
+        }
+        assert_eq!(
+            projected_browser_window_ms_after_next_batch(10_000, queue_tail_ms, 500, 6_000,),
+            30_000,
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn browser_training_smoke_window_performance_state_is_guarded_and_contract_scoped() {
+        let mut state = BrowserTrainingPerformanceState::default();
+        state.bind(ContentId::new("execution-a"));
+        state.observe_batch(400);
+        state.observe_window_batch_average(2_400, 8);
+        state.observe_finalization(2_000);
+
+        assert_eq!(state.guarded_batch_ms(), Some(375));
+        assert_eq!(state.finalization_reserve_ms(30_000), 6_000);
+        assert_eq!(state.completed_windows, 1);
+
+        state.bind(ContentId::new("execution-a"));
+        assert_eq!(state.guarded_batch_ms(), Some(375));
+        state.bind(ContentId::new("execution-b"));
+        assert_eq!(state.guarded_batch_ms(), None);
+        assert_eq!(state.completed_windows, 0);
+    }
+
+    #[wasm_bindgen_test]
+    fn browser_training_smoke_progress_is_throttled_without_hiding_boundaries() {
+        assert!(browser_training_progress_update_due(1, 64));
+        assert!(browser_training_progress_update_due(4, 64));
+        assert!(!browser_training_progress_update_due(5, 64));
+        assert!(browser_training_progress_update_due(64, 64));
     }
 
     #[wasm_bindgen_test]
@@ -3299,8 +3564,8 @@ mod tests {
     #[wasm_bindgen_test(async)]
     async fn browser_webgpu_production_factorized_record_is_bounded() {
         let profile: crate::profile::DragonExperimentProfile =
-            serde_json::from_str(include_str!("../../deploy/profiles/nca-r3.profile.json"))
-                .expect("builtin NCA R3 profile");
+            serde_json::from_str(include_str!("../../deploy/profiles/nca-r4.profile.json"))
+                .expect("builtin NCA R4 profile");
         let model_config = profile.browser.expect("browser profile").model_config;
         let device = BrowserWgpuTrainDevice::default();
         ensure_webgpu_runtime_ready(&device).await;
@@ -3439,6 +3704,20 @@ mod tests {
         assert!(default_key.contains("browser-live-session"));
     }
 
+    #[wasm_bindgen_test]
+    fn browser_training_smoke_local_selection_is_invariant_to_optimizer_geometry() {
+        let mut config = sample_browser_training_config();
+        let baseline =
+            browser_shard_selection_key("https://edge.example.invalid", &config, None, "train");
+
+        config.batch_size = config.batch_size.saturating_add(7);
+        config.max_train_batches = Some(64);
+        let resized =
+            browser_shard_selection_key("https://edge.example.invalid", &config, None, "train");
+
+        assert_eq!(baseline, resized);
+    }
+
     #[wasm_bindgen_test(async)]
     async fn browser_training_smoke_generated_nca() {
         #[cfg(feature = "wgpu")]
@@ -3497,13 +3776,16 @@ mod tests {
         wasm_bindgen_test::console_log!(
             "BROWSER_TRAINING_BENCHMARK_START reference {started_at_ms:.0}"
         );
-        let (batch_size, train_batches, tbptt_chunk_size) = production_benchmark_window_shape();
+        let (batch_size, train_batches, eval_batches, learning_rate, tbptt_chunk_size) =
+            production_benchmark_window_shape();
         let config = production_nca_training_config(
             false,
             false,
             false,
             batch_size,
             train_batches,
+            eval_batches,
+            learning_rate,
             tbptt_chunk_size,
         );
         let result = run_browser_training_with_release_manifest(
@@ -3518,7 +3800,7 @@ mod tests {
             js_sys::Date::now(),
             serde_json::to_string(&result).expect("serialize reference benchmark result")
         );
-        assert_production_nca_result(&result, batch_size, train_batches);
+        assert_production_nca_result(&result, batch_size, train_batches, eval_batches);
     }
 
     #[cfg(feature = "browser-benchmark")]
@@ -3528,13 +3810,16 @@ mod tests {
         wasm_bindgen_test::console_log!(
             "BROWSER_TRAINING_BENCHMARK_START fused {started_at_ms:.0}"
         );
-        let (batch_size, train_batches, tbptt_chunk_size) = production_benchmark_window_shape();
+        let (batch_size, train_batches, eval_batches, learning_rate, tbptt_chunk_size) =
+            production_benchmark_window_shape();
         let config = production_nca_training_config(
             true,
             false,
             false,
             batch_size,
             train_batches,
+            eval_batches,
+            learning_rate,
             tbptt_chunk_size,
         );
         let result = run_browser_training_with_release_manifest(
@@ -3549,7 +3834,7 @@ mod tests {
             js_sys::Date::now(),
             serde_json::to_string(&result).expect("serialize fused benchmark result")
         );
-        assert_production_nca_result(&result, batch_size, train_batches);
+        assert_production_nca_result(&result, batch_size, train_batches, eval_batches);
     }
 
     #[cfg(feature = "browser-benchmark")]
@@ -3559,13 +3844,16 @@ mod tests {
         wasm_bindgen_test::console_log!(
             "BROWSER_TRAINING_BENCHMARK_START factorized-input {started_at_ms:.0}"
         );
-        let (batch_size, train_batches, tbptt_chunk_size) = production_benchmark_window_shape();
+        let (batch_size, train_batches, eval_batches, learning_rate, tbptt_chunk_size) =
+            production_benchmark_window_shape();
         let config = production_nca_training_config(
             false,
             true,
             false,
             batch_size,
             train_batches,
+            eval_batches,
+            learning_rate,
             tbptt_chunk_size,
         );
         let result = run_browser_training_with_release_manifest(
@@ -3580,7 +3868,7 @@ mod tests {
             js_sys::Date::now(),
             serde_json::to_string(&result).expect("serialize factorized-input benchmark result")
         );
-        assert_production_nca_result(&result, batch_size, train_batches);
+        assert_production_nca_result(&result, batch_size, train_batches, eval_batches);
     }
 
     #[cfg(feature = "browser-benchmark")]
@@ -3590,13 +3878,16 @@ mod tests {
         wasm_bindgen_test::console_log!(
             "BROWSER_TRAINING_BENCHMARK_START factorized-fused {started_at_ms:.0}"
         );
-        let (batch_size, train_batches, tbptt_chunk_size) = production_benchmark_window_shape();
+        let (batch_size, train_batches, eval_batches, learning_rate, tbptt_chunk_size) =
+            production_benchmark_window_shape();
         let config = production_nca_training_config(
             true,
             true,
             false,
             batch_size,
             train_batches,
+            eval_batches,
+            learning_rate,
             tbptt_chunk_size,
         );
         let result = run_browser_training_with_release_manifest(
@@ -3611,7 +3902,7 @@ mod tests {
             js_sys::Date::now(),
             serde_json::to_string(&result).expect("serialize factorized fused benchmark result")
         );
-        assert_production_nca_result(&result, batch_size, train_batches);
+        assert_production_nca_result(&result, batch_size, train_batches, eval_batches);
     }
 
     #[cfg(feature = "browser-benchmark")]
@@ -3637,13 +3928,16 @@ mod tests {
         wasm_bindgen_test::console_log!(
             "BROWSER_TRAINING_BENCHMARK_START {condition} {started_at_ms:.0}"
         );
-        let (batch_size, train_batches, tbptt_chunk_size) = production_benchmark_window_shape();
+        let (batch_size, train_batches, eval_batches, learning_rate, tbptt_chunk_size) =
+            production_benchmark_window_shape();
         let config = production_nca_training_config(
             fused,
             factorize_input_embedding,
             dense_score,
             batch_size,
             train_batches,
+            eval_batches,
+            learning_rate,
             tbptt_chunk_size,
         );
         let result = run_browser_training_with_release_manifest(
@@ -3658,10 +3952,11 @@ mod tests {
             js_sys::Date::now(),
             serde_json::to_string(&result).expect("serialize production NCA benchmark result")
         );
-        assert_production_nca_result(&result, batch_size, train_batches);
+        assert_production_nca_result(&result, batch_size, train_batches, eval_batches);
     }
 
-    fn production_benchmark_window_shape() -> (usize, usize, usize) {
+    #[cfg(feature = "browser-benchmark")]
+    fn production_benchmark_window_shape() -> (usize, usize, usize, Option<f64>, usize) {
         let search = web_sys::window()
             .and_then(|window| window.location().search().ok())
             .unwrap_or_default();
@@ -3674,6 +3969,10 @@ mod tests {
                 .unwrap_or(default)
                 .clamp(1, max)
         };
+        let learning_rate = values
+            .get("learning_rate")
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0);
         let tbptt_chunk_size = values
             .get("tbptt_chunk_size")
             .and_then(|value| value.parse::<usize>().ok())
@@ -3682,30 +3981,38 @@ mod tests {
         (
             read("batch_size", 1, 8),
             read("train_batches", 8, 64),
+            read("eval_batches", 1, 32),
+            learning_rate,
             tbptt_chunk_size,
         )
     }
 
+    #[cfg(feature = "browser-benchmark")]
     fn production_nca_training_config(
         fused: bool,
         factorize_input_embedding: bool,
         dense_score: bool,
         batch_size: usize,
         train_batches: usize,
+        eval_batches: usize,
+        learning_rate: Option<f64>,
         tbptt_chunk_size: usize,
     ) -> DragonBrowserTrainingConfig {
         let profile: crate::profile::DragonExperimentProfile =
-            serde_json::from_str(include_str!("../../deploy/profiles/nca-r2.profile.json"))
-                .expect("builtin NCA R2 profile");
+            serde_json::from_str(include_str!("../../deploy/profiles/nca-r4.profile.json"))
+                .expect("builtin NCA R4 profile");
         let browser = profile.browser.expect("browser profile");
         let train_document_limit = batch_size
             .checked_mul(train_batches)
+            .expect("bounded benchmark shape should not overflow");
+        let eval_document_limit = batch_size
+            .checked_mul(eval_batches)
             .expect("bounded benchmark shape should not overflow");
         let train_source =
             production_nca_runtime_source(browser.train_source, Some(train_document_limit));
         let eval_source = browser
             .eval_source
-            .map(|source| production_nca_runtime_source(source, Some(batch_size)));
+            .map(|source| production_nca_runtime_source(source, Some(eval_document_limit)));
         let mut model_config = browser.model_config;
         model_config.fused_kernels.enabled = fused;
         model_config.fused_kernels.set_wgpu_recurrent_kernel(fused);
@@ -3730,11 +4037,11 @@ mod tests {
             block_size: browser.block_size,
             tbptt_chunk_size: Some(tbptt_chunk_size),
             tbptt_persist_across_steps: browser.tbptt_persist_across_steps,
-            learning_rate: browser.learning_rate,
+            learning_rate: learning_rate.unwrap_or(browser.learning_rate),
             weight_decay: browser.weight_decay,
             batch_size,
             max_train_batches: Some(train_batches),
-            max_eval_batches: Some(1),
+            max_eval_batches: Some(eval_batches),
             capability_policy: browser.capability_policy,
             training_lease: None,
             train_source,
@@ -3743,14 +4050,17 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "browser-benchmark")]
     fn assert_production_nca_result(
         result: &DragonBrowserTrainingResult,
         batch_size: usize,
         train_batches: usize,
+        eval_batches: usize,
     ) {
         assert_eq!(result.backend, "burn-webgpu-wasm");
         assert_eq!(result.train_batches, train_batches);
         assert_eq!(result.train_tokens, batch_size * train_batches * 256);
+        assert_eq!(result.eval_examples, batch_size * eval_batches);
         assert!(result.train_loss_mean.is_finite());
         assert!(result.eval_loss.is_some_and(f64::is_finite));
         assert!(result.phase_timings.training_submission_ms > 0);
@@ -4309,6 +4619,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "browser-benchmark")]
     fn production_nca_runtime_source(
         source: crate::profile::DragonBrowserProfileTokenSource,
         max_documents_override: Option<usize>,

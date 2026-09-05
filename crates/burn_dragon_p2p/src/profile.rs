@@ -57,7 +57,7 @@ const DEFAULT_BROWSER_CLIMBMIX_MAX_SHARDS_PER_WINDOW: usize = 4;
 #[cfg(feature = "native")]
 const NCA_BROWSER_WGPU_BATCH_SIZE_CAP: usize = 6;
 #[cfg(feature = "native")]
-const NCA_BROWSER_WGPU_MAX_TRAIN_BATCHES_CAP: usize = 8;
+const NCA_BROWSER_WGPU_MAX_TRAIN_BATCHES_CAP: usize = 64;
 #[cfg(feature = "native")]
 const NCA_BROWSER_WGPU_BLOCK_SIZE_CAP: usize = 256;
 #[cfg(feature = "native")]
@@ -80,6 +80,8 @@ const BUILTIN_NCA_R1_PROFILE_JSON: &str = include_str!("../deploy/profiles/nca-r
 const BUILTIN_NCA_R2_PROFILE_JSON: &str = include_str!("../deploy/profiles/nca-r2.profile.json");
 #[cfg(feature = "native")]
 const BUILTIN_NCA_R3_PROFILE_JSON: &str = include_str!("../deploy/profiles/nca-r3.profile.json");
+#[cfg(feature = "native")]
+const BUILTIN_NCA_R4_PROFILE_JSON: &str = include_str!("../deploy/profiles/nca-r4.profile.json");
 
 #[cfg(feature = "native")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1081,6 +1083,7 @@ fn builtin_nca_profile_json(revision_id: &str) -> Option<&'static str> {
         "nca-r1" => Some(BUILTIN_NCA_R1_PROFILE_JSON),
         "nca-r2" => Some(BUILTIN_NCA_R2_PROFILE_JSON),
         "nca-r3" => Some(BUILTIN_NCA_R3_PROFILE_JSON),
+        "nca-r4" => Some(BUILTIN_NCA_R4_PROFILE_JSON),
         _ => None,
     }
 }
@@ -1981,6 +1984,7 @@ prompt = "[R2"
             }
         ));
         assert_eq!(browser.batch_size, 6);
+        assert_eq!(browser.max_train_batches, Some(8));
         let footprint = crate::capability::estimate_language_training_footprint(
             &browser.model_config,
             browser.batch_size,
@@ -1989,6 +1993,29 @@ prompt = "[R2"
         );
         assert!(footprint.estimated_parameter_bytes <= 16 * 1024 * 1024);
         assert!(builtin_nca_profile_json("nca-r3").is_some());
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn builtin_nca_r4_fills_measured_browser_windows() {
+        let profile: DragonExperimentProfile =
+            serde_json::from_str(BUILTIN_NCA_R4_PROFILE_JSON).expect("builtin NCA R4 profile");
+        let browser = profile.browser.expect("browser profile");
+
+        assert_eq!(browser.batch_size, 6);
+        assert_eq!(browser.block_size, 256);
+        assert_eq!(browser.tbptt_chunk_size, Some(64));
+        assert_eq!(browser.max_train_batches, Some(64));
+        assert_eq!(browser.max_eval_batches, Some(1));
+        assert_eq!(browser.learning_rate, 3.125e-5);
+        assert!(matches!(
+            browser.train_source,
+            DragonBrowserProfileTokenSource::GeneratedNca {
+                max_documents: Some(384),
+                ..
+            }
+        ));
+        assert!(builtin_nca_profile_json("nca-r4").is_some());
     }
 
     #[cfg(feature = "native")]

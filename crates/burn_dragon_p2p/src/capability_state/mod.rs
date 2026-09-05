@@ -31,6 +31,8 @@ pub struct DragonCapabilityDowngradeRecord {
     pub reason: String,
     pub source: String,
     pub observed_at: DateTime<Utc>,
+    #[serde(default)]
+    pub retry_after: Option<DateTime<Utc>>,
     pub failure_count: u32,
 }
 
@@ -70,6 +72,12 @@ fn record_is_still_binding(
     if !is_probable_trainer_fit_failure(&record.reason) {
         return false;
     }
+    if record
+        .retry_after
+        .is_some_and(|retry_after| Utc::now() >= retry_after)
+    {
+        return false;
+    }
     let failed_budget_bytes = record
         .trainer_budget_bytes
         .unwrap_or(record.observed_training_bytes)
@@ -100,6 +108,7 @@ pub(crate) fn is_probable_trainer_fit_failure(message: &str) -> bool {
         "cuda error",
         "wgpu error",
         "webgpu device lost",
+        "browser trainer performance cannot satisfy the signed training window",
     ]
     .iter()
     .any(|needle| message.contains(needle))
@@ -152,6 +161,7 @@ mod tests {
             reason: reason.into(),
             source: "runtime".into(),
             observed_at: Utc::now(),
+            retry_after: None,
             failure_count: 1,
         }
     }
@@ -196,9 +206,24 @@ mod tests {
         assert!(is_probable_trainer_fit_failure(
             "webgpu device lost after failed to allocate buffer"
         ));
+        assert!(is_probable_trainer_fit_failure(
+            "browser trainer performance cannot satisfy the signed training window"
+        ));
         assert!(record_is_still_binding(
             &record_with_reason("webgpu device lost after failed to allocate buffer"),
             Some(512),
         ));
+    }
+
+    #[test]
+    fn temporary_performance_downgrade_expires() {
+        let mut record = record_with_reason(
+            "browser trainer performance cannot satisfy the signed training window",
+        );
+        record.retry_after = Some(Utc::now() + chrono::Duration::minutes(1));
+        assert!(record_is_still_binding(&record, Some(512)));
+
+        record.retry_after = Some(Utc::now() - chrono::Duration::seconds(1));
+        assert!(!record_is_still_binding(&record, Some(512)));
     }
 }

@@ -11,10 +11,14 @@ use burn_p2p_browser::{
     BrowserWorkerSupport,
 };
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
-use js_sys::Reflect;
+use js_sys::{Function, Object, Promise, Reflect};
 use serde::{Deserialize, Serialize};
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
-use wasm_bindgen::JsValue;
+use std::cell::RefCell;
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+use wasm_bindgen::{JsCast, JsValue};
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+use wasm_bindgen_futures::JsFuture;
 
 #[cfg(feature = "wasm-peer")]
 use crate::config::DragonBrowserTrainingConfig;
@@ -125,6 +129,65 @@ impl DragonNativeTargetDecision {
 
 #[cfg(feature = "wasm-ui")]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DragonBrowserGpuAdapterProbe {
+    pub completed: bool,
+    pub available: bool,
+    pub is_fallback_adapter: bool,
+    pub vendor: Option<String>,
+    pub architecture: Option<String>,
+    pub description: Option<String>,
+}
+
+#[cfg(feature = "wasm-ui")]
+impl DragonBrowserGpuAdapterProbe {
+    pub fn is_software_adapter(&self) -> bool {
+        if !self.completed || !self.available {
+            return false;
+        }
+        self.is_fallback_adapter
+            || [&self.vendor, &self.architecture, &self.description]
+                .into_iter()
+                .flatten()
+                .any(|value| {
+                    let value = value.to_ascii_lowercase();
+                    value.contains("swiftshader")
+                        || value.contains("llvmpipe")
+                        || value.contains("software rasterizer")
+                })
+    }
+
+    pub fn label(&self) -> String {
+        if !self.completed {
+            return "not measured".into();
+        }
+        if !self.available {
+            return "unavailable".into();
+        }
+        let identity = [
+            self.vendor.as_deref(),
+            self.architecture.as_deref(),
+            self.description.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" / ");
+        let class = if self.is_software_adapter() {
+            "software fallback"
+        } else {
+            "hardware"
+        };
+        if identity.is_empty() {
+            class.into()
+        } else {
+            format!("{class}: {identity}")
+        }
+    }
+}
+
+#[cfg(feature = "wasm-ui")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DragonBrowserHostCapabilityProbe {
     pub navigator_gpu_exposed: bool,
     pub worker_gpu_exposed: bool,
@@ -133,6 +196,13 @@ pub struct DragonBrowserHostCapabilityProbe {
     pub web_transport_exposed: bool,
     pub web_rtc_exposed: bool,
     pub system_memory_bytes: Option<u64>,
+    pub gpu_adapter: DragonBrowserGpuAdapterProbe,
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+thread_local! {
+    static BROWSER_GPU_ADAPTER_PROBE: RefCell<DragonBrowserGpuAdapterProbe> =
+        RefCell::new(DragonBrowserGpuAdapterProbe::default());
 }
 
 #[cfg(feature = "wasm-ui")]
@@ -184,6 +254,94 @@ pub fn detect_browser_host_capabilities() -> DragonBrowserHostCapabilityProbe {
         web_transport_exposed: has_web_transport,
         web_rtc_exposed: has_webrtc,
         system_memory_bytes,
+        gpu_adapter: BROWSER_GPU_ADAPTER_PROBE.with(|probe| probe.borrow().clone()),
+    }
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+pub async fn detect_browser_host_capabilities_async() -> DragonBrowserHostCapabilityProbe {
+    let mut host = detect_browser_host_capabilities();
+    if host.gpu_adapter.completed || !host.navigator_gpu_exposed {
+        if !host.navigator_gpu_exposed {
+            host.gpu_adapter = DragonBrowserGpuAdapterProbe {
+                completed: true,
+                ..DragonBrowserGpuAdapterProbe::default()
+            };
+        }
+        return host;
+    }
+
+    let adapter = request_browser_gpu_adapter().await;
+    BROWSER_GPU_ADAPTER_PROBE.with(|cached| *cached.borrow_mut() = adapter.clone());
+    host.gpu_adapter = adapter;
+    host
+}
+
+#[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
+async fn request_browser_gpu_adapter() -> DragonBrowserGpuAdapterProbe {
+    let unavailable = || DragonBrowserGpuAdapterProbe {
+        completed: true,
+        ..DragonBrowserGpuAdapterProbe::default()
+    };
+    let Some(window) = web_sys::window() else {
+        return unavailable();
+    };
+    let Ok(navigator) = Reflect::get(&JsValue::from(window), &JsValue::from_str("navigator"))
+    else {
+        return unavailable();
+    };
+    let Ok(gpu) = Reflect::get(&navigator, &JsValue::from_str("gpu")) else {
+        return unavailable();
+    };
+    if gpu.is_null() || gpu.is_undefined() {
+        return unavailable();
+    }
+    let Ok(request_adapter) = Reflect::get(&gpu, &JsValue::from_str("requestAdapter"))
+        .and_then(|value| value.dyn_into::<Function>())
+    else {
+        return unavailable();
+    };
+    let options = Object::new();
+    let _ = Reflect::set(
+        &options,
+        &JsValue::from_str("powerPreference"),
+        &JsValue::from_str("high-performance"),
+    );
+    let Ok(promise) = request_adapter
+        .call1(&gpu, &options)
+        .and_then(|value| value.dyn_into::<Promise>())
+    else {
+        return unavailable();
+    };
+    let Ok(adapter) = JsFuture::from(promise).await else {
+        return unavailable();
+    };
+    if adapter.is_null() || adapter.is_undefined() {
+        return unavailable();
+    }
+    let info = Reflect::get(&adapter, &JsValue::from_str("info")).unwrap_or(JsValue::UNDEFINED);
+    let string_property = |name: &str| {
+        Reflect::get(&info, &JsValue::from_str(name))
+            .ok()
+            .and_then(|value| value.as_string())
+            .filter(|value| !value.trim().is_empty())
+    };
+    let is_fallback_adapter = Reflect::get(&adapter, &JsValue::from_str("isFallbackAdapter"))
+        .ok()
+        .and_then(|value| value.as_bool())
+        .or_else(|| {
+            Reflect::get(&info, &JsValue::from_str("isFallbackAdapter"))
+                .ok()
+                .and_then(|value| value.as_bool())
+        })
+        .unwrap_or(false);
+    DragonBrowserGpuAdapterProbe {
+        completed: true,
+        available: true,
+        is_fallback_adapter,
+        vendor: string_property("vendor"),
+        architecture: string_property("architecture"),
+        description: string_property("description"),
     }
 }
 
@@ -430,7 +588,9 @@ pub fn decide_browser_capability(
 
     let trainer_memory_budget_bytes =
         browser_trainer_memory_budget_bytes(&config.capability_policy, host);
-    let gpu_ready = host.navigator_gpu_exposed && host.worker_gpu_exposed;
+    let adapter_ready = !host.gpu_adapter.completed
+        || (host.gpu_adapter.available && !host.gpu_adapter.is_software_adapter());
+    let gpu_ready = host.navigator_gpu_exposed && host.worker_gpu_exposed && adapter_ready;
     let worker_ready = host.dedicated_worker_exposed;
     let can_train = gpu_ready
         && worker_ready
@@ -454,6 +614,10 @@ pub fn decide_browser_capability(
 
     capability.gpu_support = if gpu_ready {
         BrowserGpuSupport::Available
+    } else if host.gpu_adapter.is_software_adapter() {
+        BrowserGpuSupport::Unavailable(
+            "software WebGPU adapters cannot satisfy signed training windows".into(),
+        )
     } else {
         BrowserGpuSupport::Unavailable("webgpu unavailable".into())
     };
@@ -462,7 +626,12 @@ pub fn decide_browser_capability(
     );
     capability.recommended_role = recommended_role;
     let connect_target = browser_app_target_for_role(&capability.recommended_role);
-    let downgrade_reason = Some(if !gpu_ready {
+    let downgrade_reason = Some(if host.gpu_adapter.is_software_adapter() {
+        format!(
+            "{} cannot finish useful work inside the signed training window; downgrading this peer to a read-only role",
+            host.gpu_adapter.label()
+        )
+    } else if !gpu_ready {
         "webgpu unavailable; downgrading browser peer to verifier/observer".into()
     } else if !worker_ready {
         "dedicated worker unavailable; downgrading browser peer to observer".into()
@@ -721,6 +890,11 @@ mod tests {
             web_transport_exposed: true,
             web_rtc_exposed: true,
             system_memory_bytes: Some(system_memory_bytes),
+            gpu_adapter: DragonBrowserGpuAdapterProbe {
+                completed: true,
+                available: true,
+                ..DragonBrowserGpuAdapterProbe::default()
+            },
         }
     }
 
@@ -743,5 +917,45 @@ mod tests {
             low_memory.trainer_memory_budget_bytes,
             Some(2 * 1024 * 1024 * 1024)
         );
+    }
+
+    #[cfg(all(feature = "wasm-ui", feature = "wasm-peer"))]
+    #[test]
+    fn browser_training_rejects_software_webgpu_adapters() {
+        let config = browser_training_config_with_budget(6 * 1024 * 1024 * 1024);
+        let mut probe = browser_probe(32 * 1024 * 1024 * 1024);
+        probe.gpu_adapter = DragonBrowserGpuAdapterProbe {
+            completed: true,
+            available: true,
+            is_fallback_adapter: true,
+            vendor: Some("Google".into()),
+            architecture: Some("SwiftShader".into()),
+            description: None,
+        };
+
+        let decision = decide_browser_capability(Some(&config), &probe);
+
+        assert!(!decision.can_train, "{decision:?}");
+        assert!(
+            decision
+                .downgrade_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("software fallback"))
+        );
+    }
+
+    #[cfg(all(feature = "wasm-ui", feature = "wasm-peer", target_arch = "wasm32"))]
+    #[wasm_bindgen_test::wasm_bindgen_test(async)]
+    async fn browser_training_smoke_gpu_adapter_probe_completes_and_is_cached() {
+        let measured = detect_browser_host_capabilities_async().await;
+
+        assert!(measured.gpu_adapter.completed);
+        assert_eq!(
+            detect_browser_host_capabilities().gpu_adapter,
+            measured.gpu_adapter
+        );
+        if measured.navigator_gpu_exposed {
+            assert!(measured.gpu_adapter.available);
+        }
     }
 }

@@ -10,6 +10,7 @@ use crate::config::DragonBrowserTrainingConfig;
 use crate::p2p_adapter::browser_non_trainer_role_target;
 
 const BROWSER_STATE_PREFIX: &str = "burn-dragon-p2p.capability-downgrade.v1";
+const BROWSER_PERFORMANCE_RETRY_SECS: i64 = 300;
 
 fn browser_storage() -> Result<web_sys::Storage> {
     web_sys::window()
@@ -92,6 +93,7 @@ pub fn persist_browser_downgrade(
             reason: reason.to_owned(),
             source: source.to_owned(),
             observed_at: chrono::Utc::now(),
+            retry_after: None,
             failure_count: 0,
         });
     record.downgrade_to = "browser_verifier".into();
@@ -100,6 +102,10 @@ pub fn persist_browser_downgrade(
     record.reason = reason.to_owned();
     record.source = source.to_owned();
     record.observed_at = chrono::Utc::now();
+    record.retry_after = reason
+        .to_ascii_lowercase()
+        .contains("performance cannot satisfy the signed training window")
+        .then(|| record.observed_at + chrono::Duration::seconds(BROWSER_PERFORMANCE_RETRY_SECS));
     record.failure_count = record.failure_count.saturating_add(1);
     browser_storage()?
         .set_item(&storage_key, &serde_json::to_string(&record)?)
@@ -145,9 +151,13 @@ pub fn apply_browser_downgrade_state(
     let (recommended_role, connect_target) = browser_non_trainer_role_target(can_verifier);
     decision.capability.recommended_role = recommended_role;
     decision.connect_target = connect_target;
+    let retry_condition = record.retry_after.map_or_else(
+        || "until the trainer budget increases or the workload changes".to_owned(),
+        |retry_after| format!("until the automatic retry at {retry_after}"),
+    );
     decision.downgrade_reason = Some(format!(
-        "persisted trainer failure for this workload fingerprint at {}: {}; holding browser verifier/observer role until the trainer budget increases or the workload changes",
-        record.observed_at, record.reason
+        "trainer capability failure for this workload at {}: {}; holding a read-only role {}",
+        record.observed_at, record.reason, retry_condition
     ));
     decision
 }
@@ -201,6 +211,11 @@ mod tests {
             web_transport_exposed: true,
             web_rtc_exposed: true,
             system_memory_bytes: Some(8 * 1024 * 1024 * 1024),
+            gpu_adapter: crate::capability::DragonBrowserGpuAdapterProbe {
+                completed: true,
+                available: true,
+                ..crate::capability::DragonBrowserGpuAdapterProbe::default()
+            },
         };
         let edge_base_url = "https://edge.example";
         let decision: DragonBrowserCapabilityDecision =

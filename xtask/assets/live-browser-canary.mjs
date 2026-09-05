@@ -38,6 +38,10 @@ const DURABLE_RECEIPT_TIMEOUT_MS = parseIntegerEnv(
   30_000,
 );
 const EXPECT_TRAINING = parseBooleanEnv("BURN_DRAGON_BROWSER_CANARY_EXPECT_TRAINING", true);
+const EXPECT_TRAINING_DOWNGRADE = parseBooleanEnv(
+  "BURN_DRAGON_BROWSER_CANARY_EXPECT_TRAINING_DOWNGRADE",
+  false,
+);
 const MIN_ACCEPTED_RECEIPTS = parseNonnegativeIntegerEnv(
   "BURN_DRAGON_BROWSER_CANARY_MIN_ACCEPTED_RECEIPTS",
   EXPECT_TRAINING ? 1 : 0,
@@ -179,6 +183,9 @@ function validateCanaryMode() {
       `unsupported transport mode ${TRANSPORT_MODE}; expected auto, webrtc-direct, webtransport, or wss`,
     );
   }
+  if (EXPECT_TRAINING && EXPECT_TRAINING_DOWNGRADE) {
+    throw new Error("training and expected training downgrade are mutually exclusive");
+  }
   if (
     EXPECT_CONNECTED_TRANSPORT != null &&
     !["webrtc-direct", "webtransport", "wss", "ws"].includes(EXPECT_CONNECTED_TRANSPORT)
@@ -198,6 +205,20 @@ function validateCanaryMode() {
     useProductionTrainingProfile: USE_PRODUCTION_TRAINING_PROFILE,
     minAcceptedReceipts: MIN_ACCEPTED_RECEIPTS,
   });
+}
+
+function webGpuAdapterIsSoftware(adapter) {
+  if (!adapter) {
+    return false;
+  }
+  const identity = [adapter.vendor, adapter.architecture, adapter.description]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  return Boolean(adapter.is_fallback_adapter) ||
+    identity.includes("swiftshader") ||
+    identity.includes("llvmpipe") ||
+    identity.includes("software rasterizer");
 }
 
 function ensureDir(dirPath) {
@@ -1530,6 +1551,7 @@ async function runCanary() {
     webgpu_adapter: null,
     transport_mode: TRANSPORT_MODE,
     expect_training: EXPECT_TRAINING,
+    expect_training_downgrade: EXPECT_TRAINING_DOWNGRADE,
     use_production_training_profile: USE_PRODUCTION_TRAINING_PROFILE,
     min_accepted_receipts: MIN_ACCEPTED_RECEIPTS,
     expected_connected_transport: expectedTransport,
@@ -1550,6 +1572,7 @@ async function runCanary() {
     training_button_enabled: false,
     training_button_label: null,
     training_action_detail: null,
+    training_action_status_label: null,
     training_completed: false,
     training_panel: null,
     training_layout_shift_score: null,
@@ -1785,7 +1808,7 @@ async function runCanary() {
         architecture: info.architecture ?? null,
         device: info.device ?? null,
         description: info.description ?? null,
-        is_fallback_adapter: info.isFallbackAdapter ?? null,
+        is_fallback_adapter: adapter.isFallbackAdapter ?? info.isFallbackAdapter ?? null,
       };
     }).catch(() => null);
 
@@ -1816,6 +1839,9 @@ async function runCanary() {
         : null;
       report.training_action_detail = await optionalVisibleText(
         page.locator(".dragon-live-action-note"),
+      ) ?? await optionalVisibleText(page.locator(".dragon-live-action-status p"));
+      report.training_action_status_label = await optionalVisibleText(
+        page.locator(".dragon-live-action-status span"),
       );
       report.connect_button_visible = await isVisible(connectButton);
       report.get_started_button_visible = await isVisible(getStartedButton);
@@ -1934,6 +1960,26 @@ async function runCanary() {
       fail(
         `browser canary did not sync active head checkpoint over P2P: machine=${JSON.stringify(report.browser_machine_state)} artifact_fallback_requests=${JSON.stringify(report.artifact_http_fallback_requests)}`,
       );
+    }
+    if (EXPECT_TRAINING_DOWNGRADE) {
+      if (!webGpuAdapterIsSoftware(report.webgpu_adapter)) {
+        fail(
+          `expected a software WebGPU downgrade but selected adapter was ${JSON.stringify(report.webgpu_adapter)}`,
+        );
+      }
+      if (
+        report.training_action_status_label !== "trainer downgraded" ||
+        report.training_button_enabled
+      ) {
+        fail(
+          `software WebGPU peer did not settle in a read-only role: status=${report.training_action_status_label ?? "missing"} detail=${report.training_action_detail ?? "missing"} button_enabled=${report.training_button_enabled}`,
+        );
+      }
+      if (!report.training_action_detail?.toLowerCase().includes("software")) {
+        fail(
+          `software WebGPU downgrade did not expose a useful reason: ${report.training_action_detail ?? "missing"}`,
+        );
+      }
     }
     if (!EXPECT_TRAINING && !EXPECT_CHECKPOINT_SYNC && !reportConnectedForMode(report, TRANSPORT_MODE)) {
       report.artifact_http_fallback_requests = requests.filter((entry) => entry.artifactFallback);

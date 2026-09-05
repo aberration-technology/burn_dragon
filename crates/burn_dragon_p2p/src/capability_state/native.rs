@@ -99,6 +99,7 @@ pub fn persist_native_downgrade<M: serde::Serialize>(
                 reason: observation.reason.to_owned(),
                 source: observation.source.to_owned(),
                 observed_at: chrono::Utc::now(),
+                retry_after: None,
                 failure_count: 0,
             });
     record.downgrade_to = observation.downgrade_to.to_owned();
@@ -107,6 +108,7 @@ pub fn persist_native_downgrade<M: serde::Serialize>(
     record.reason = observation.reason.to_owned();
     record.source = observation.source.to_owned();
     record.observed_at = chrono::Utc::now();
+    record.retry_after = None;
     record.failure_count = record.failure_count.saturating_add(1);
     state.insert(scope_fingerprint, record.clone());
     persist_native_state_map(scope.storage_root, &state)?;

@@ -36,7 +36,7 @@ use crate::auth::{
 use crate::build_info;
 use crate::capability::{
     DragonBrowserCapabilityDecision, DragonBrowserHostCapabilityProbe, decide_browser_capability,
-    detect_browser_host_capabilities,
+    detect_browser_host_capabilities, detect_browser_host_capabilities_async,
 };
 use crate::capability_state::apply_browser_downgrade_state;
 #[cfg(all(feature = "wasm-ui", target_arch = "wasm32"))]
@@ -246,7 +246,7 @@ fn browser_scope_summary(scopes: &BTreeSet<ExperimentScope>) -> String {
 
 fn browser_host_capability_summary(probe: &DragonBrowserHostCapabilityProbe) -> String {
     format!(
-        "navigator_gpu={} worker_gpu={} dedicated_worker={} persistent_storage={} web_rtc={} web_transport={} system_memory_mib={}",
+        "navigator_gpu={} worker_gpu={} dedicated_worker={} persistent_storage={} web_rtc={} web_transport={} system_memory_mib={} adapter={}",
         probe.navigator_gpu_exposed,
         probe.worker_gpu_exposed,
         probe.dedicated_worker_exposed,
@@ -254,6 +254,7 @@ fn browser_host_capability_summary(probe: &DragonBrowserHostCapabilityProbe) -> 
         probe.web_rtc_exposed,
         probe.web_transport_exposed,
         probe.system_memory_bytes.unwrap_or_default() / (1024 * 1024),
+        probe.gpu_adapter.label(),
     )
 }
 
@@ -661,38 +662,17 @@ async fn resolve_browser_release_manifest(
 }
 
 #[cfg(feature = "wasm-peer")]
-async fn resolve_browser_training_config(
-    bootstrap_config: &DragonBrowserAppConfig,
+async fn resolve_browser_training_template(
     config: &DragonBrowserAppConfig,
     edge_snapshot: Option<&BrowserEdgeSnapshot>,
-    signed_seed_advertisement: Option<&SignedPayload<SchemaEnvelope<BrowserSeedAdvertisement>>>,
 ) -> Result<crate::config::DragonBrowserTrainingConfig> {
-    if let Some(mut training) = config.training.clone() {
-        if training.training_lease.is_none() {
-            training.training_lease = active_training_lease(
-                bootstrap_config,
-                config,
-                edge_snapshot,
-                signed_seed_advertisement,
-            )
-            .await?;
-        }
+    if let Some(training) = config.training.clone() {
         return Ok(training);
     }
 
-    let mut training = resolve_browser_training_config_from_directory(config, edge_snapshot)
+    resolve_browser_training_config_from_directory(config, edge_snapshot)
         .await?
-        .ok_or_else(|| {
-            anyhow!("selected experiment does not publish a browser training profile")
-        })?;
-    training.training_lease = active_training_lease(
-        bootstrap_config,
-        config,
-        edge_snapshot,
-        signed_seed_advertisement,
-    )
-    .await?;
-    Ok(training)
+        .ok_or_else(|| anyhow!("selected experiment does not publish a browser training profile"))
 }
 
 #[cfg(feature = "wasm-peer")]
@@ -994,8 +974,16 @@ pub async fn connect_browser_app(
     )
     .await?;
     let edge_base_url = resolved_edge_base_url(&effective_config)?;
-    let (browser_host_capabilities, browser_capability_decision) =
-        browser_capability_decision_for_config(&effective_config);
+    let browser_host_capabilities = detect_browser_host_capabilities_async().await;
+    let browser_capability_decision = match effective_config.training.as_ref() {
+        Some(training) => apply_browser_downgrade_state(
+            &edge_base_url,
+            training,
+            browser_backend_label(training),
+            decide_browser_capability(Some(training), &browser_host_capabilities),
+        ),
+        None => decide_browser_capability(None, &browser_host_capabilities),
+    };
     info!(
         "browser capability assessment: edge_url={} requested_scopes=[{}] {} {}",
         edge_base_url,
@@ -1975,6 +1963,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
         "not available"
     }
     .to_owned();
+    let capability_adapter_label = browser_host_capabilities.gpu_adapter.label();
     let active_head_label = view
         .as_ref()
         .and_then(|view| {
@@ -2182,7 +2171,7 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     let train_action = {
         let props = props.clone();
         move |_| {
-            let mut next_config = props.config.clone();
+            let mut next_config = runtime_config.read().clone();
             next_config = next_config.with_network_overrides(
                 Some(edge_url.read().clone()),
                 DragonPeerNetworkConfig::parse_seed_node_list(&seed_node_urls.read()),
@@ -2268,6 +2257,29 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                         }
                     }
                 }
+                let training_template =
+                    match resolve_browser_training_template(&next_config, edge_snapshot.as_ref())
+                        .await
+                    {
+                        Ok(training) => training,
+                        Err(error) => {
+                            let message = error.to_string();
+                            error!("browser training profile resolution failed: {message}");
+                            status.set(message.clone());
+                            local_training_progress.write().fail(message.clone());
+                            local_training_state.set(DragonLocalTrainingState::Failed { message });
+                            return;
+                        }
+                    };
+                let runtime_managed_training_lease = training_template.training_lease.is_none();
+                info!(
+                    "browser training profile pinned for session: experiment={} batch_size={} block_size={} max_train_batches={:?} runtime_managed_lease={}",
+                    training_template.experiment_kind.workload_slug(),
+                    training_template.batch_size,
+                    training_template.block_size,
+                    training_template.max_train_batches,
+                    runtime_managed_training_lease,
+                );
                 let mut completed_windows = 0_u64;
                 let mut failed = false;
                 let mut training_session = DragonBrowserTrainingSession::default();
@@ -2278,25 +2290,29 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     let next_window = completed_windows.saturating_add(1);
                     local_training_progress.write().start_window(next_window);
                     local_training_state.set(DragonLocalTrainingState::SyncingCheckpoint);
-                    let training = match resolve_browser_training_config(
-                        &bootstrap_config,
-                        &next_config,
-                        edge_snapshot.as_ref(),
-                        signed_seed_advertisement.as_ref(),
-                    )
-                    .await
-                    {
-                        Ok(training) => training,
-                        Err(error) => {
-                            let message = error.to_string();
-                            error!("browser training config resolution failed: {message}");
-                            status.set(message.clone());
-                            local_training_progress.write().fail(message.clone());
-                            local_training_state.set(DragonLocalTrainingState::Failed { message });
-                            failed = true;
-                            break;
-                        }
-                    };
+                    let mut training = training_template.clone();
+                    if runtime_managed_training_lease {
+                        training.training_lease = match active_training_lease(
+                            &bootstrap_config,
+                            &next_config,
+                            edge_snapshot.as_ref(),
+                            signed_seed_advertisement.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok(lease) => lease,
+                            Err(error) => {
+                                let message = error.to_string();
+                                error!("browser training lease resolution failed: {message}");
+                                status.set(message.clone());
+                                local_training_progress.write().fail(message.clone());
+                                local_training_state
+                                    .set(DragonLocalTrainingState::Failed { message });
+                                failed = true;
+                                break;
+                            }
+                        };
+                    }
                     local_training_state.set(DragonLocalTrainingState::TrainingWindow);
                     let training_result = {
                         let mut observer = |progress| {
@@ -2431,6 +2447,10 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
     #[cfg(feature = "wasm-peer")]
     let train_button = {
         let training_action_state = training_action_state.clone();
+        let unavailable_detail = browser_capability_decision
+            .downgrade_reason
+            .clone()
+            .unwrap_or_else(|| "Waiting for a training assignment and compatible runtime".into());
         if has_connected_view {
             if let Some(training_action_state) = training_action_state {
                 let button_label = training_action_state.label;
@@ -2460,7 +2480,12 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     }
                 }
             } else {
-                rsx! {}
+                rsx! {
+                    div { class: "dragon-live-action-status",
+                        span { "training unavailable" }
+                        p { "{unavailable_detail}" }
+                    }
+                }
             }
         } else {
             rsx! {}
@@ -2565,13 +2590,6 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                     label: String::from("status"),
                     detail: status_message.clone(),
                     tone: "accent",
-                }
-            }
-            if debug_controls_enabled && (has_session || has_connected_view) && browser_capability_decision.downgrade_reason.is_some() {
-                ActivityNotice {
-                    label: String::from("capability policy"),
-                    detail: browser_capability_decision.downgrade_reason.clone().unwrap_or_default(),
-                    tone: "neutral",
                 }
             }
             if has_connected_view {
@@ -2757,6 +2775,10 @@ pub fn DragonBrowserApp(props: DragonBrowserAppProps) -> Element {
                                 div { class: "keyvalue-row",
                                     span { "worker webgpu" }
                                     strong { "{capability_worker_gpu_label}" }
+                                }
+                                div { class: "keyvalue-row",
+                                    span { "gpu adapter" }
+                                    strong { "{capability_adapter_label}" }
                                 }
                                 div { class: "keyvalue-row",
                                     span { "dedicated worker" }

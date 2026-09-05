@@ -485,6 +485,7 @@ fn browser_canary_contracts() -> Result<()> {
     let script = read("xtask/assets/live-browser-canary.mjs")?;
     for snippet in [
         "const EXPECT_TRAINING = parseBooleanEnv(\"BURN_DRAGON_BROWSER_CANARY_EXPECT_TRAINING\", true);",
+        "BURN_DRAGON_BROWSER_CANARY_EXPECT_TRAINING_DOWNGRADE",
         "\"BURN_DRAGON_BROWSER_CANARY_EXPECT_CHECKPOINT_SYNC\"",
         "expect_checkpoint_sync: EXPECT_CHECKPOINT_SYNC",
         "{ Archive: { experiment_id: experimentId } }",
@@ -569,13 +570,14 @@ fn browser_canary_contracts() -> Result<()> {
         "BURN_DRAGON_BROWSER_CANARY_TRAIN_TIMEOUT_MS: \"300000\"",
         "chromium-webrtc-direct-connect",
         "chromium-webrtc-direct-checkpoint",
-        "chromium-webrtc-direct-training",
+        "chromium-webrtc-direct-production-capability",
         "firefox-webrtc-direct-connect",
         "firefox-webrtc-direct-connect\n            browser: firefox\n            transport_mode: webrtc-direct\n            expect_training: \"0\"\n            expect_checkpoint_sync: \"0\"\n            min_accepted_receipts: \"0\"\n            required: \"0\"",
         "continue-on-error: ${{ matrix.required == '0' }}",
         "BURN_DRAGON_BROWSER_CANARY_BROWSER: ${{ matrix.browser }}",
         "BURN_DRAGON_BROWSER_CANARY_TRANSPORT_MODE: ${{ matrix.transport_mode }}",
         "BURN_DRAGON_BROWSER_CANARY_EXPECT_TRAINING: ${{ matrix.expect_training }}",
+        "BURN_DRAGON_BROWSER_CANARY_EXPECT_TRAINING_DOWNGRADE:",
         "BURN_DRAGON_BROWSER_CANARY_EXPECT_CHECKPOINT_SYNC: ${{ matrix.expect_checkpoint_sync }}",
         "BURN_DRAGON_BROWSER_CANARY_USE_PRODUCTION_TRAINING_PROFILE:",
         "BURN_DRAGON_BROWSER_CANARY_MIN_ACCEPTED_RECEIPTS: ${{ matrix.min_accepted_receipts }}",
@@ -841,24 +843,24 @@ fn production_profile_contracts() -> Result<()> {
     )?;
     require_contains(
         &bootstrap_settings,
-        "DEFAULT_NCA_REVISION_ID: &str = \"nca-r3\"",
+        "DEFAULT_NCA_REVISION_ID: &str = \"nca-r4\"",
         "deployment settings share the active immutable NCA revision",
     )?;
     require_contains(
         &main_tf,
-        "profiles/nca-r3.profile.json",
-        "terraform publishes the active NCA R3 profile",
+        "profiles/nca-r4.profile.json",
+        "terraform publishes the active NCA R4 profile",
     )?;
     require_contains(
         &main_tf,
-        "current_revision_id = \"nca-r3\"",
-        "terraform advertises NCA R3 as the active revision",
+        "current_revision_id = \"nca-r4\"",
+        "terraform advertises NCA R4 as the active revision",
     )?;
     let pages_workflow = read(".github/workflows/deploy-pages.yml")?;
     require_contains(
         &pages_workflow,
-        "default: nca-r3",
-        "Pages selects the active NCA R3 revision by default",
+        "default: nca-r4",
+        "Pages selects the active NCA R4 revision by default",
     )?;
     let runtime = read("xtask/src/bootstrap_runtime.rs")?;
     require_contains(
@@ -917,7 +919,7 @@ fn production_profile_contracts() -> Result<()> {
         "deploy probes the signed browser-direct seed",
     )?;
 
-    let profile = read("crates/burn_dragon_p2p/deploy/profiles/nca-r3.profile.json")?;
+    let profile = read("crates/burn_dragon_p2p/deploy/profiles/nca-r4.profile.json")?;
     let profile: Value = serde_json::from_str(&profile)?;
     let browser = profile
         .get("browser_training")
@@ -936,8 +938,16 @@ fn production_profile_contracts() -> Result<()> {
         "browser WebGPU TBPTT chunk size drifted from the production-scale readiness probe"
     );
     ensure!(
-        browser["max_train_batches"] == json!(8),
+        browser["max_train_batches"] == json!(64),
         "browser max train batches drifted"
+    );
+    ensure!(
+        browser["learning_rate"] == json!(0.00003125),
+        "browser learning rate drifted from the measured stable WebGPU setting"
+    );
+    ensure!(
+        browser["train_source"]["max_documents"] == json!(384),
+        "browser train document pool drifted from the dense-window profile"
     );
     ensure!(
         browser["max_eval_batches"].as_u64().unwrap_or(u64::MAX) <= 1,

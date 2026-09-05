@@ -135,7 +135,7 @@ Native peer config points to the same bundle with:
 
 ```toml
 [manifest]
-revision_contract_path = "/etc/burn_dragon_p2p/nca-r3.revision-contract.json"
+revision_contract_path = "/etc/burn_dragon_p2p/nca-r4.revision-contract.json"
 require_signed_revision_contracts = true
 ```
 
@@ -149,13 +149,13 @@ Build and verify a bundle from explicit authority material:
 
 ```bash
 cargo run -p xtask -- build-revision-contract \
-  --spec /secure/nca-r3.contract-spec.json \
+  --spec /secure/nca-r4.contract-spec.json \
   --artifact-store-root /var/lib/burn-p2p/artifacts \
   --authority-key /secure/authority.key \
-  --output /secure/nca-r3.revision-contract.json
+  --output /secure/nca-r4.revision-contract.json
 
 cargo run -p xtask -- verify-revision-contract \
-  --bundle /secure/nca-r3.revision-contract.json \
+  --bundle /secure/nca-r4.revision-contract.json \
   --trust-bundle /secure/trust-bundle.json \
   --artifact-store-root /var/lib/burn-p2p/artifacts
 ```
@@ -170,13 +170,13 @@ them out through the authenticated live admin API:
 
 ```bash
 cargo run -p xtask -- rotate-revision-contracts \
-  --bundle /secure/nca-r3.revision-contract.json \
+  --bundle /secure/nca-r4.revision-contract.json \
   --new-authority-key /secure/next-authority.key \
   --output-dir /secure/contracts-next
 
 cargo run -p xtask -- rollout-revision-contracts \
   --edge-url https://edge.dragon.aberration.technology \
-  --bundle /secure/contracts-next/nca-r3.revision-contract.json \
+  --bundle /secure/contracts-next/nca-r4.revision-contract.json \
   --session-id "$BURN_P2P_ADMIN_SESSION_ID" \
   --allow-signature-rotation
 ```
@@ -316,7 +316,7 @@ Optional GitHub repository variables for the Pages workflow:
 - `BURN_DRAGON_P2P_PAGES_SELECTED_EXPERIMENT_ID`
 - `BURN_DRAGON_P2P_PAGES_SELECTED_REVISION_ID`
 
-None of those values are secrets. If they are omitted, the Pages workflow defaults to `https://edge.dragon.aberration.technology`, `nca-prepretraining`, and `nca-r3`, then derives browser-capable bootstrap material from the live edge before publishing. Operators can still override everything with workflow inputs, `?edge=` / `?seed=` query params, or the UI at runtime.
+None of those values are secrets. If they are omitted, the Pages workflow defaults to `https://edge.dragon.aberration.technology`, `nca-prepretraining`, and `nca-r4`, then derives browser-capable bootstrap material from the live edge before publishing. Operators can still override everything with workflow inputs, `?edge=` / `?seed=` query params, or the UI at runtime.
 
 ## Required GitHub Environment Configuration
 
@@ -620,7 +620,7 @@ Use `BURN_DRAGON_P2P_AUTH_PRINCIPALS_JSON` to inject principals like:
 
 The initial directory entries are seeded from:
 
-- `crates/burn_dragon_p2p/deploy/profiles/nca-r3.profile.json`
+- `crates/burn_dragon_p2p/deploy/profiles/nca-r4.profile.json`
 - `crates/burn_dragon_p2p/deploy/profiles/climbmix-r1.profile.json`
 
 The checked-in `ruliad-1m` profile pair is the local ruliad trainability
@@ -634,19 +634,21 @@ and should not be treated as the default ruliad path.
 
 `BURN_DRAGON_P2P_CLIMBMIX_BROWSER_DATASET_BASE_URL` defaults to the managed dataset CDN path `https://datasets.dragon.aberration.technology/dragon-datasets/climbmix-pretraining/climbmix-r1`. Terraform publishes `${base_url}/fetch-manifest.json` into the initial ClimbMix browser profile. Browser peers still fetch only the shards they train on. With a runtime-provided training lease they use the exact assigned microshards; otherwise they use the bounded deterministic per-peer fallback advertised by the profile. The shipped Dragon browser app now reads that persisted browser training lease automatically before local training starts.
 
-The active `nca-r3` profile keeps the NCA corpus and `8` shared Dragon layers, `512` hidden width, `1024` total latent width, native `512` token windows, batch `6`, and `24` native training steps per window. It factorizes the NCA input embedding into cell-position, cell-state, and special-token parameters, reducing the model from about `27.3M` to `1.62M` parameters without changing the task vocabulary. Its signed browser WebGPU tier uses the mathematically equivalent dense-score short-context executor with `256` token windows, `64` token TBPTT chunks, `batch_size = 6`, `8` train batches, `1` eval batch, and a `30s` lease budget. Batch `6` is the measured practical throughput choice for the production browser tier; capability checks still downgrade peers whose reported memory cannot fit it. The smaller full head fits the bounded asynchronous browser publication path, so a browser can contribute learned weights instead of telemetry alone. `nca-r1` and `nca-r2` remain immutable historical contracts.
+The active `nca-r4` profile keeps the NCA corpus and `8` shared Dragon layers, `512` hidden width, `1024` total latent width, native `512` token windows, batch `6`, and `64` native training steps per window. It factorizes the NCA input embedding into cell-position, cell-state, and special-token parameters, reducing the model from about `27.3M` to `1.62M` parameters without changing the task vocabulary. Its measured AdamW learning rate is `3.125e-5`. The signed browser WebGPU tier uses the mathematically equivalent dense-score short-context executor with `256` token windows, `64` token TBPTT chunks, `batch_size = 6`, up to `64` train batches, `1` eval batch, and a `30s` lease budget. A completed first batch calibrates the adapter; the browser then keeps the GPU queue dense, yields UI progress every four batches, and stops when the estimated queue tail plus finalization reserve reaches the lease boundary. A bounded session cache reuses generated NCA documents shared by successive lease selections. Batch `6` is the portable production tier. Software adapters and hardware that cannot finish useful work inside the lease downgrade to a read-only role. The smaller full head fits the bounded asynchronous browser publication path, so a capable browser can contribute learned weights instead of telemetry alone. `nca-r1`, `nca-r2`, and `nca-r3` remain immutable historical contracts.
 
 On an NVIDIA GB10 Chromium/Vulkan probe, the dense executor matched the recurrent executor's 64-step validation loss within `0.00003` while increasing browser training throughput from `253` to `2,111 tok/s`. In a three-sample, fresh-browser sweep of the actual eight-step production window, the complete factorized path averaged `3,330`, `4,535`, and `4,562 tok/s` at batches `4`, `6`, and `8`. Batch `6` retains 25% more batch-memory headroom than batch `8` for only a 0.6% mean-throughput difference and was faster on the cold first window. The larger arms sustained roughly `87-91%` sampled GPU SM utilization during dense compute. These are compatibility and convergence smokes, not a statistical quality claim. Browser capability checks still downgrade peers that cannot safely fit the signed workload before allocating training buffers.
+
+For the R4 scheduler, a controlled three-sample GB10 Chromium/Vulkan sweep compared identical batch-`6` data at `8` and `64` train batches using the historical `1e-3` rate. The short windows averaged `4,473 tok/s` and `65.3%` in-window training duty; dense windows averaged `6,939 tok/s` and `78.0%` duty. A separate fixed 48-example R4 holdout exposed instability at that rate: validation loss was `9.14418`. The selected `3.125e-5` rate reduced it to `5.87565`; adjacent `2.5e-5` and `4e-5` controls reached `5.93833` and `5.84674`. The safer cross-revision center was retained instead of selecting the narrow fixed-holdout minimum. Across three fresh browser processes, the actual one-eval-batch production shape averaged `6,720 tok/s` and `78.2%` training duty. Active compute segments held roughly `88-91%` sampled SM utilization at `34-38W`. A batch-`8` diagnostic reached `7,529 tok/s`, but consumes one third more batch activation memory; it remains an opt-in benchmark rather than the portable signed tier. Raw board power is not an occupancy proxy for this small `1.62M` parameter model, so promotion uses throughput, completed-window duty, lease compliance, validation quality, and accepted contribution evidence together. These are bounded deterministic convergence and runtime measurements, not a statistical corpus-quality claim.
 
 Those profile payloads are derived from the source configs in the same folder. To regenerate a profile locally:
 
 ```bash
 cargo run -p burn_dragon_p2p --features native --bin burn_dragon_p2p_native -- \
   build-profile \
-  --training-config crates/burn_dragon_p2p/deploy/profiles/nca-r3.training.toml \
+  --training-config crates/burn_dragon_p2p/deploy/profiles/nca-r4.training.toml \
   --experiment-kind nca \
-  --revision-id nca-r3 \
-  --output crates/burn_dragon_p2p/deploy/profiles/nca-r3.profile.json
+  --revision-id nca-r4 \
+  --output crates/burn_dragon_p2p/deploy/profiles/nca-r4.profile.json
 ```
 
 For ClimbMix, pass the revision id so the browser shard-manifest URL is included in the profile:
@@ -738,7 +740,7 @@ cargo install --locked burn_dragon_p2p --version 0.21.0 --bin burn_dragon_p2p_na
 
 With no `--config`, the binary points at
 `https://edge.dragon.aberration.technology`, uses DNS TCP/QUIC seed multiaddrs,
-joins `burn-dragon-mainnet` / `nca-prepretraining` / `nca-r3`, restores the
+joins `burn-dragon-mainnet` / `nca-prepretraining` / `nca-r4`, restores the
 canonical head at startup, and resyncs it every 15 seconds while `run-peer` is
 alive. Set `BURN_DRAGON_P2P_NATIVE_STORAGE_ROOT` if you want the auth cache,
 materialized network profile, and checkpoints somewhere other than the default

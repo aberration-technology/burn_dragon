@@ -743,6 +743,7 @@ jobs:
           bootstrap_config_json_b64="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_config_json | base64 -w0)"
           caddyfile_b64="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_caddyfile | base64 -w0)"
           bootstrap_service_unit_b64="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_service_unit | base64 -w0)"
+          bootstrap_secret_sync_script_b64="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_secret_sync_script | base64 -w0)"
           bootstrap_head_mirror_config_b64="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_head_mirror_config | base64 -w0)"
           bootstrap_head_mirror_auth_script_b64="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_head_mirror_fetch_auth_script | base64 -w0)"
           bootstrap_head_mirror_service_unit_b64="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_head_mirror_service_unit | base64 -w0)"
@@ -799,6 +800,7 @@ jobs:
             echo "bootstrap_config_json_b64=$bootstrap_config_json_b64"
             echo "caddyfile_b64=$caddyfile_b64"
             echo "bootstrap_service_unit_b64=$bootstrap_service_unit_b64"
+            echo "bootstrap_secret_sync_script_b64=$bootstrap_secret_sync_script_b64"
             echo "bootstrap_head_mirror_config_b64=$bootstrap_head_mirror_config_b64"
             echo "bootstrap_head_mirror_auth_script_b64=$bootstrap_head_mirror_auth_script_b64"
             echo "bootstrap_head_mirror_service_unit_b64=$bootstrap_head_mirror_service_unit_b64"
@@ -847,6 +849,7 @@ jobs:
           BOOTSTRAP_CONFIG_JSON_B64: ${{ steps.outputs.outputs.bootstrap_config_json_b64 }}
           CADDYFILE_B64: ${{ steps.outputs.outputs.caddyfile_b64 }}
           BOOTSTRAP_SERVICE_UNIT_B64: ${{ steps.outputs.outputs.bootstrap_service_unit_b64 }}
+          BOOTSTRAP_SECRET_SYNC_SCRIPT_B64: ${{ steps.outputs.outputs.bootstrap_secret_sync_script_b64 }}
           BOOTSTRAP_HEAD_MIRROR_CONFIG_B64: ${{ steps.outputs.outputs.bootstrap_head_mirror_config_b64 }}
           BOOTSTRAP_HEAD_MIRROR_AUTH_SCRIPT_B64: ${{ steps.outputs.outputs.bootstrap_head_mirror_auth_script_b64 }}
           BOOTSTRAP_HEAD_MIRROR_SERVICE_UNIT_B64: ${{ steps.outputs.outputs.bootstrap_head_mirror_service_unit_b64 }}
@@ -1320,14 +1323,18 @@ jobs:
             --poll-interval-secs 5 \
             --output-format json
           cleanup_command="trap 'systemctl start burn-dragon-p2p-head-mirror >/dev/null 2>&1 || true' EXIT"
+          printf -v verify_contract_env_command 'grep -F -- %q /etc/burn-dragon-p2p/bootstrap.env' "$contract_path"
           parameters="$(jq -cn \
             --arg command "$provision_command" \
             --arg cleanup "$cleanup_command" \
+            --arg verify_contract_env "$verify_contract_env_command" \
             '{commands:[
               "set -eu",
               "systemctl stop burn-dragon-p2p-head-mirror",
               $cleanup,
               $command,
+              "/usr/local/bin/burn-dragon-p2p-sync-secrets",
+              $verify_contract_env,
               "systemctl restart burn-p2p-bootstrap",
               "systemctl start burn-dragon-p2p-head-mirror",
               "systemctl is-active burn-p2p-bootstrap",

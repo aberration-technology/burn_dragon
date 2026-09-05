@@ -48,6 +48,8 @@ fn runtime_sync_contract() -> Result<()> {
         caddy_object_uri: "s3://bucket/runtime/Caddyfile".to_owned(),
         bootstrap_service_unit_object_uri: "s3://bucket/runtime/burn-p2p-bootstrap.service"
             .to_owned(),
+        bootstrap_secret_sync_object_uri:
+            "s3://bucket/runtime/burn-dragon-p2p-sync-secrets".to_owned(),
         head_mirror_config_object_uri: "s3://bucket/runtime/bootstrap-head-mirror.toml"
             .to_owned(),
         head_mirror_auth_script_object_uri:
@@ -84,6 +86,21 @@ fn runtime_sync_contract() -> Result<()> {
         "systemctl enable burn-dragon-p2p-head-mirror",
         "head mirror enabled",
     )?;
+    let secret_sync_install = commands
+        .iter()
+        .position(|command| {
+            command
+                == "aws s3 cp 's3://bucket/runtime/burn-dragon-p2p-sync-secrets' /usr/local/bin/burn-dragon-p2p-sync-secrets"
+        })
+        .context("runtime sync does not install the rendered secret-sync script")?;
+    let secret_sync_run = commands
+        .iter()
+        .position(|command| command == "/usr/local/bin/burn-dragon-p2p-sync-secrets")
+        .context("runtime sync does not execute the installed secret-sync script")?;
+    ensure!(
+        secret_sync_install < secret_sync_run,
+        "runtime sync executes the secret-sync script before installing its current rendering"
+    );
     require_absent(
         &joined,
         "systemctl restart burn-dragon-p2p-head-mirror",
@@ -287,6 +304,16 @@ fn deployment_workflow_contracts() -> Result<()> {
         require_contains(&text, "EDGE_BASE_URL", "edge base url env")?;
         require_contains(
             &text,
+            "BOOTSTRAP_SECRET_SYNC_SCRIPT_B64",
+            "runtime sync receives the current secret-sync script",
+        )?;
+        require_contains(
+            &text,
+            "output -raw bootstrap_secret_sync_script",
+            "runtime sync captures the rendered secret-sync script from Terraform",
+        )?;
+        require_contains(
+            &text,
             "admin-provision-revision-contract",
             "deployment provisions the active signed browser revision contract",
         )?;
@@ -319,6 +346,11 @@ fn deployment_workflow_contracts() -> Result<()> {
             &text,
             "--require-revision-contract",
             "deployment readiness requires the browser revision contract",
+        )?;
+        require_contains(
+            &text,
+            "verify_contract_env_command",
+            "deployment verifies the provisioned contract survives bootstrap restart",
         )?;
         require_contains(
             &text,
@@ -367,8 +399,14 @@ fn deployment_workflow_contracts() -> Result<()> {
     let restore = read(".github/workflows/restore-burn-dragon-p2p-aws.yml")?;
     let canonical_head_action = read(".github/actions/wait-for-canonical-head/action.yml")?;
     let inspect_commands = read("xtask/assets/bootstrap-inspect-commands.txt")?;
+    let terraform_outputs = read("crates/burn_dragon_p2p/deploy/terraform/aws/outputs.tf")?;
     let secret_sync = read(
         "crates/burn_dragon_p2p/deploy/terraform/aws/templates/bootstrap-secret-sync.sh.tftpl",
+    )?;
+    require_contains(
+        &terraform_outputs,
+        "output \"bootstrap_secret_sync_script\"",
+        "Terraform exports the rendered secret-sync script for in-place runtime updates",
     )?;
     require_contains(
         &canonical_head_action,
@@ -1021,6 +1059,8 @@ fn dummy_runtime_env() -> RuntimeCommandEnv {
         caddy_object_uri: "s3://bucket/runtime/Caddyfile".to_owned(),
         bootstrap_service_unit_object_uri: "s3://bucket/runtime/burn-p2p-bootstrap.service"
             .to_owned(),
+        bootstrap_secret_sync_object_uri:
+            "s3://bucket/runtime/burn-dragon-p2p-sync-secrets".to_owned(),
         head_mirror_config_object_uri: "s3://bucket/runtime/bootstrap-head-mirror.toml"
             .to_owned(),
         head_mirror_auth_script_object_uri:

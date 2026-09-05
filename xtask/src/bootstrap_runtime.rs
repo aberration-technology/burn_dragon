@@ -50,6 +50,10 @@ pub fn sync_bootstrap_runtime_config() -> Result<()> {
         &tmpdir.path().join("burn-p2p-bootstrap.service"),
     )?;
     write_base64_env(
+        "BOOTSTRAP_SECRET_SYNC_SCRIPT_B64",
+        &tmpdir.path().join("burn-dragon-p2p-sync-secrets"),
+    )?;
+    write_base64_env(
         "BOOTSTRAP_HEAD_MIRROR_CONFIG_B64",
         &tmpdir.path().join("bootstrap-head-mirror.toml"),
     )?;
@@ -90,6 +94,10 @@ pub fn sync_bootstrap_runtime_config() -> Result<()> {
         &objects.bootstrap_service,
     )?;
     aws_s3_cp(
+        &tmpdir.path().join("burn-dragon-p2p-sync-secrets"),
+        &objects.bootstrap_secret_sync,
+    )?;
+    aws_s3_cp(
         &tmpdir.path().join("bootstrap-head-mirror.toml"),
         &objects.head_mirror_config,
     )?;
@@ -115,6 +123,7 @@ pub fn sync_bootstrap_runtime_config() -> Result<()> {
         bootstrap_object_uri: objects.bootstrap.clone(),
         caddy_object_uri: objects.caddy.clone(),
         bootstrap_service_unit_object_uri: objects.bootstrap_service.clone(),
+        bootstrap_secret_sync_object_uri: objects.bootstrap_secret_sync.clone(),
         head_mirror_config_object_uri: objects.head_mirror_config.clone(),
         head_mirror_auth_script_object_uri: objects.head_mirror_auth_script.clone(),
         head_mirror_service_object_uri: objects.head_mirror_service.clone(),
@@ -240,6 +249,10 @@ pub fn render_bootstrap_runtime_sync_commands(env: &RuntimeCommandEnv) -> Result
             env.bootstrap_service_unit_object_uri
         ),
         format!(
+            "aws s3 cp '{}' /usr/local/bin/burn-dragon-p2p-sync-secrets",
+            env.bootstrap_secret_sync_object_uri
+        ),
+        format!(
             "aws s3 cp '{}' /etc/burn_dragon_p2p/bootstrap-head-mirror.toml",
             env.head_mirror_config_object_uri
         ),
@@ -255,7 +268,7 @@ pub fn render_bootstrap_runtime_sync_commands(env: &RuntimeCommandEnv) -> Result
     commands.extend(bootstrap_public_ip_rewrite_commands());
     commands.extend([
         "chmod 0644 /etc/burn-dragon-p2p/bootstrap.json /etc/caddy/Caddyfile /etc/systemd/system/burn-p2p-bootstrap.service /etc/burn_dragon_p2p/bootstrap-head-mirror.toml /etc/systemd/system/burn-dragon-p2p-head-mirror.service".to_owned(),
-        "chmod 0755 /usr/local/bin/burn-dragon-p2p-fetch-head-mirror-auth-bundle".to_owned(),
+        "chmod 0755 /usr/local/bin/burn-dragon-p2p-sync-secrets /usr/local/bin/burn-dragon-p2p-fetch-head-mirror-auth-bundle".to_owned(),
         "/usr/local/bin/burn-dragon-p2p-sync-secrets".to_owned(),
         "systemctl stop burn-dragon-p2p-head-mirror || true".to_owned(),
         "systemctl stop burn-p2p-bootstrap || true".to_owned(),
@@ -277,6 +290,7 @@ pub struct RuntimeCommandEnv {
     pub bootstrap_object_uri: String,
     pub caddy_object_uri: String,
     pub bootstrap_service_unit_object_uri: String,
+    pub bootstrap_secret_sync_object_uri: String,
     pub head_mirror_config_object_uri: String,
     pub head_mirror_auth_script_object_uri: String,
     pub head_mirror_service_object_uri: String,
@@ -294,6 +308,7 @@ struct RuntimeObjects {
     bootstrap: String,
     caddy: String,
     bootstrap_service: String,
+    bootstrap_secret_sync: String,
     head_mirror_config: String,
     head_mirror_auth_script: String,
     head_mirror_service: String,
@@ -308,6 +323,7 @@ impl RuntimeObjects {
             bootstrap: uri("bootstrap.json"),
             caddy: uri("Caddyfile"),
             bootstrap_service: uri("burn-p2p-bootstrap.service"),
+            bootstrap_secret_sync: uri("burn-dragon-p2p-sync-secrets"),
             head_mirror_config: uri("bootstrap-head-mirror.toml"),
             head_mirror_auth_script: uri("burn-dragon-p2p-fetch-head-mirror-auth-bundle"),
             head_mirror_service: uri("burn-dragon-p2p-head-mirror.service"),
@@ -343,6 +359,7 @@ impl Drop for RuntimeCleanup {
             &self.objects.bootstrap,
             &self.objects.caddy,
             &self.objects.bootstrap_service,
+            &self.objects.bootstrap_secret_sync,
             &self.objects.head_mirror_config,
             &self.objects.head_mirror_auth_script,
             &self.objects.head_mirror_service,

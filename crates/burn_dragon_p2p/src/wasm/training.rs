@@ -3104,6 +3104,28 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    fn browser_training_smoke_r3_dense_schema_is_cross_target_stable() {
+        let profile: crate::profile::DragonExperimentProfile =
+            serde_json::from_str(include_str!("../../deploy/profiles/nca-r3.profile.json"))
+                .expect("builtin NCA R3 profile");
+        let wire_json = serde_json::to_string(&profile).expect("serialize browser profile");
+        let javascript_value =
+            js_sys::JSON::parse(&wire_json).expect("parse profile in JavaScript");
+        let javascript_json = js_sys::JSON::stringify(&javascript_value)
+            .expect("stringify profile in JavaScript")
+            .as_string()
+            .expect("JavaScript profile JSON string");
+        let profile: crate::profile::DragonExperimentProfile =
+            serde_json::from_str(&javascript_json).expect("decode JavaScript profile round trip");
+        let model = profile.browser.expect("browser profile").model_config;
+
+        assert_eq!(
+            dragon_model_schema_hash(&model).as_str(),
+            "dragon-model-schema-ae55218ef919feac071f796de8c74560917ae03119b8624614d3407e9f1fb042"
+        );
+    }
+
+    #[wasm_bindgen_test]
     fn browser_batches_preserve_native_shard_loss_masks() {
         let device = burn::tensor::Device::<NdArray<f32>>::default();
         let masked = TokenWindowRecord {

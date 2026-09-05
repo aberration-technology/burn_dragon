@@ -28,8 +28,18 @@ use url::form_urlencoded;
 const GIB: u64 = 1024 * 1024 * 1024;
 
 #[cfg(any(feature = "wasm-peer", feature = "native"))]
+/// Hashes the parameter-bearing Dragon schema independently from its execution plan.
+///
+/// Sequence executors and row tiling are authorized by the browser execution contract and do not
+/// change the model's tensors. Canonicalizing them here lets equivalent native and browser kernels
+/// load the same signed checkpoint without weakening parameter-shape validation.
 pub fn dragon_model_schema_hash(model_config: &DragonConfig) -> burn_p2p::ContentId {
-    let bytes = serde_json::to_vec(model_config).expect("Dragon model config should serialize");
+    let mut parameter_schema = model_config.clone();
+    parameter_schema.sequence_kernel = burn_dragon_core::SequenceKernelConfig::reference(
+        parameter_schema.sequence_kernel.memory_system,
+    );
+    let bytes =
+        serde_json::to_vec(&parameter_schema).expect("Dragon model config should serialize");
     let mut hasher = Sha256::new();
     hasher.update(b"dragon-model-schema");
     hasher.update([0]);
@@ -1056,6 +1066,26 @@ pub struct DragonManifestBundle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(feature = "wasm-peer", feature = "native"))]
+    #[test]
+    fn model_schema_hash_separates_parameters_from_sequence_execution() {
+        let reference = DragonConfig::default();
+        let mut dense = reference.clone();
+        dense.sequence_kernel = burn_dragon_core::SequenceKernelConfig::dense_score_short_context()
+            .with_dense_score_row_chunk(128);
+        let mut wider = reference.clone();
+        wider.n_embd = wider.n_embd.saturating_mul(2);
+
+        assert_eq!(
+            dragon_model_schema_hash(&reference),
+            dragon_model_schema_hash(&dense)
+        );
+        assert_ne!(
+            dragon_model_schema_hash(&reference),
+            dragon_model_schema_hash(&wider)
+        );
+    }
 
     #[cfg(any(feature = "wasm-peer", feature = "native"))]
     fn browser_training_config_with_model(

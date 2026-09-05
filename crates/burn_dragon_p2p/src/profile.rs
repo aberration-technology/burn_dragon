@@ -1993,6 +1993,27 @@ prompt = "[R2"
 
     #[cfg(feature = "native")]
     #[test]
+    fn builtin_nca_r3_dense_executor_preserves_signed_model_schema() {
+        let profile: DragonExperimentProfile =
+            serde_json::from_str(BUILTIN_NCA_R3_PROFILE_JSON).expect("builtin NCA R3 profile");
+        let browser_model = profile.browser.expect("browser profile").model_config;
+        let mut reference_model = browser_model.clone();
+        reference_model.sequence_kernel = burn_dragon_core::SequenceKernelConfig::reference(
+            browser_model.sequence_kernel.memory_system,
+        );
+
+        assert_eq!(
+            crate::config::dragon_model_schema_hash(&browser_model),
+            crate::config::dragon_model_schema_hash(&reference_model)
+        );
+        assert_eq!(
+            crate::config::dragon_model_schema_hash(&browser_model).as_str(),
+            "dragon-model-schema-ae55218ef919feac071f796de8c74560917ae03119b8624614d3407e9f1fb042"
+        );
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
     fn native_training_overrides_apply_to_builtin_profile() {
         use crate::config::{DragonNativeTrainingOverrides, DragonPeerNetworkConfig};
         use tempfile::tempdir;

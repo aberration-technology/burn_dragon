@@ -486,16 +486,7 @@ fn wasm_training_benchmark(args: &WasmTrainingBenchmarkArgs) -> Result<()> {
         };
         for sample in 0..args.samples {
             for test in tests {
-                run_hardware_wasm_training_benchmark(
-                    &wasm,
-                    test,
-                    sample,
-                    args.batch_size,
-                    args.train_batches,
-                    args.eval_batches,
-                    args.learning_rate,
-                    args.tbptt_chunk_size,
-                )?;
+                run_hardware_wasm_training_benchmark(&wasm, test, sample, args)?;
             }
         }
         return Ok(());
@@ -554,11 +545,7 @@ fn run_hardware_wasm_training_benchmark(
     wasm: &Path,
     test: &str,
     sample: usize,
-    batch_size: usize,
-    train_batches: usize,
-    eval_batches: usize,
-    learning_rate: Option<f64>,
-    tbptt_chunk_size: usize,
+    args: &WasmTrainingBenchmarkArgs,
 ) -> Result<()> {
     let chrome = resolve_chrome_path().context("could not find Chromium for hardware benchmark")?;
     let runner = ensure_wasm_bindgen_test_runner()?;
@@ -598,11 +585,16 @@ fn run_hardware_wasm_training_benchmark(
         .join("browser-training-benchmark");
     fs::create_dir_all(&artifact_dir)
         .with_context(|| format!("failed to create {}", artifact_dir.display()))?;
-    let learning_rate_label =
-        learning_rate.map_or_else(|| "profile".into(), |rate| rate.to_string());
+    let learning_rate_label = args
+        .learning_rate
+        .map_or_else(|| "profile".into(), |rate| rate.to_string());
     let run_label = format!(
         "{condition}-b{}-n{}-e{}-lr{}-c{}-s{sample}",
-        batch_size, train_batches, eval_batches, learning_rate_label, tbptt_chunk_size
+        args.batch_size,
+        args.train_batches,
+        args.eval_batches,
+        learning_rate_label,
+        args.tbptt_chunk_size
     );
     let screenshot = artifact_dir.join(format!("{run_label}.png"));
     let result = artifact_dir.join(format!("{run_label}.json"));
@@ -619,14 +611,14 @@ fn run_hardware_wasm_training_benchmark(
         .arg("--result")
         .arg(&result)
         .arg("--batch-size")
-        .arg(batch_size.to_string())
+        .arg(args.batch_size.to_string())
         .arg("--train-batches")
-        .arg(train_batches.to_string())
+        .arg(args.train_batches.to_string())
         .arg("--eval-batches")
-        .arg(eval_batches.to_string())
+        .arg(args.eval_batches.to_string())
         .arg("--tbptt-chunk-size")
-        .arg(tbptt_chunk_size.to_string());
-    if let Some(learning_rate) = learning_rate {
+        .arg(args.tbptt_chunk_size.to_string());
+    if let Some(learning_rate) = args.learning_rate {
         command
             .arg("--learning-rate")
             .arg(learning_rate.to_string());

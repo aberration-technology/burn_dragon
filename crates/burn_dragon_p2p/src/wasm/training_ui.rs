@@ -12,10 +12,18 @@ pub(super) fn browser_training_panel(
         .current_window
         .map(|window| window.to_string())
         .unwrap_or_else(|| "-".into());
+    let progress_is_queued =
+        phase == super::training_progress::DragonBrowserTrainingPhase::SubmittingTraining;
     let batch_progress = if state.progress.planned_batches > 0 {
         format!(
-            "{} complete / {} max",
-            state.progress.submitted_batches, state.progress.planned_batches
+            "{} {} / {} max",
+            state.progress.submitted_batches,
+            if progress_is_queued {
+                "queued"
+            } else {
+                "complete"
+            },
+            state.progress.planned_batches,
         )
     } else {
         "-".into()
@@ -51,6 +59,13 @@ pub(super) fn browser_training_panel(
     let throughput = result
         .and_then(|result| result.tokens_per_second)
         .map_or_else(|| "-".into(), |rate| format!("{rate:.1} tok/s"));
+    let training_duty = result
+        .and_then(|result| result.training_duty_percent)
+        .map_or_else(|| "-".into(), |duty| format!("{duty:.0}%"));
+    let learning_rate = result.map_or_else(
+        || "-".into(),
+        |result| format!("{:.5e}", result.learning_rate),
+    );
     let timing = result.map_or_else(
         || "-".into(),
         |result| {
@@ -76,14 +91,17 @@ pub(super) fn browser_training_panel(
             None => "local only".into(),
         },
     );
-    let detail = state.failure.clone().unwrap_or_else(|| {
-        if phase == super::training_progress::DragonBrowserTrainingPhase::SynchronizingLoss {
-            "GPU work submitted; waiting for measured completion".into()
-        } else if state.completed_windows > 0 {
-            "Ready for the next signed training lease".into()
-        } else {
-            "No completed training window yet".into()
+    let detail = state.failure.clone().unwrap_or_else(|| match phase {
+        super::training_progress::DragonBrowserTrainingPhase::MeasuringAdapter => {
+            "Measuring completed GPU work before filling the signed window".into()
         }
+        super::training_progress::DragonBrowserTrainingPhase::SynchronizingLoss => {
+            "GPU work submitted; waiting for measured completion".into()
+        }
+        _ if state.completed_windows > 0 => {
+            "Last result remains pinned while the next signed window runs".into()
+        }
+        _ => "No completed training window yet".into(),
     });
     let completed_windows = state.completed_windows.to_string();
     let phase_slug = phase.slug();
@@ -93,6 +111,11 @@ pub(super) fn browser_training_panel(
         .submitted_batches
         .min(state.progress.planned_batches.max(1))
         .to_string();
+    let token_progress_label = if progress_is_queued {
+        "tokens queued"
+    } else {
+        "tokens complete"
+    };
 
     rsx! {
         section {
@@ -122,7 +145,7 @@ pub(super) fn browser_training_panel(
                     strong { "{batch_progress}" }
                 }
                 div { class: "dragon-training-progress-item",
-                    span { "tokens complete" }
+                    span { "{token_progress_label}" }
                     strong { "{token_progress}" }
                 }
             }
@@ -156,6 +179,14 @@ pub(super) fn browser_training_panel(
                 div { class: "keyvalue-row",
                     span { "throughput" }
                     strong { "{throughput}" }
+                }
+                div { class: "keyvalue-row",
+                    span { "training duty" }
+                    strong { "{training_duty}" }
+                }
+                div { class: "keyvalue-row",
+                    span { "learning rate" }
+                    strong { "{learning_rate}" }
                 }
                 div { class: "keyvalue-row",
                     span { "timing" }

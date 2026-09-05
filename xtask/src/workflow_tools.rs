@@ -317,6 +317,14 @@ pub fn summarize_live_browser_canary(args: &SummarizeLiveBrowserCanaryArgs) -> R
         json_value_display(&report, "expect_training", "n/a")
     );
     println!(
+        "- Expect hardware downgrade: `{}`",
+        json_value_display(&report, "expect_training_downgrade", "n/a")
+    );
+    println!(
+        "- WebGPU adapter: `{}`",
+        json_value_display(&report, "webgpu_adapter", "n/a")
+    );
+    println!(
         "- Minimum accepted receipts: `{}`",
         json_value_display(&report, "min_accepted_receipts", "n/a")
     );
@@ -364,6 +372,14 @@ pub fn summarize_live_browser_canary(args: &SummarizeLiveBrowserCanaryArgs) -> R
     println!(
         "- Training button visible: `{}`",
         bool_field(&report, "training_button_visible")
+    );
+    println!(
+        "- Training action state: `{}`",
+        json_string_or(&report, "training_action_status_label", "n/a")
+    );
+    println!(
+        "- Training layout shift: `{}`",
+        json_value_display(&report, "training_layout_shift_score", "n/a")
     );
     println!(
         "- Training P2P checkpoint ready: `{}`",

@@ -14,6 +14,11 @@ function argument(name) {
   return process.argv[index + 1];
 }
 
+function optionalArgument(name) {
+  const index = process.argv.indexOf(name);
+  return index < 0 || index + 1 >= process.argv.length ? null : process.argv[index + 1];
+}
+
 async function loadPlaywright() {
   try {
     return await import("playwright");
@@ -42,12 +47,21 @@ const screenshot = argument("--screenshot");
 const resultPath = argument("--result");
 const batchSize = Number.parseInt(argument("--batch-size"), 10);
 const trainBatches = Number.parseInt(argument("--train-batches"), 10);
+const evalBatches = Number.parseInt(argument("--eval-batches"), 10);
+const learningRateArgument = optionalArgument("--learning-rate");
+const learningRate = learningRateArgument === null ? null : Number.parseFloat(learningRateArgument);
 const tbpttChunkSize = Number.parseInt(argument("--tbptt-chunk-size"), 10);
 if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 8) {
   throw new Error(`invalid --batch-size ${batchSize}; expected 1..8`);
 }
 if (!Number.isInteger(trainBatches) || trainBatches < 1 || trainBatches > 64) {
   throw new Error(`invalid --train-batches ${trainBatches}; expected 1..64`);
+}
+if (!Number.isInteger(evalBatches) || evalBatches < 1 || evalBatches > 32) {
+  throw new Error(`invalid --eval-batches ${evalBatches}; expected 1..32`);
+}
+if (learningRate !== null && (!Number.isFinite(learningRate) || learningRate <= 0)) {
+  throw new Error(`invalid --learning-rate ${learningRate}; expected a positive finite number`);
 }
 if (
   !Number.isInteger(tbpttChunkSize) ||
@@ -90,6 +104,10 @@ try {
   const benchmarkUrl = new URL(url);
   benchmarkUrl.searchParams.set("batch_size", String(batchSize));
   benchmarkUrl.searchParams.set("train_batches", String(trainBatches));
+  benchmarkUrl.searchParams.set("eval_batches", String(evalBatches));
+  if (learningRate !== null) {
+    benchmarkUrl.searchParams.set("learning_rate", String(learningRate));
+  }
   benchmarkUrl.searchParams.set("tbptt_chunk_size", String(tbpttChunkSize));
   await page.goto(benchmarkUrl.toString(), { waitUntil: "domcontentloaded" });
   const adapter = await page.evaluate(async () => {
@@ -102,7 +120,7 @@ try {
       vendor: info.vendor ?? null,
       architecture: info.architecture ?? null,
       description: info.description ?? null,
-      is_fallback_adapter: info.isFallbackAdapter ?? null,
+      is_fallback_adapter: selected.isFallbackAdapter ?? info.isFallbackAdapter ?? null,
     };
   });
   process.stdout.write(`BROWSER_ADAPTER ${JSON.stringify(adapter)}\n`);
@@ -145,6 +163,9 @@ try {
         adapter,
         batch_size: batchSize,
         train_batches: trainBatches,
+        eval_batches: evalBatches,
+        learning_rate_override: learningRate,
+        learning_rate: benchmark.learning_rate,
         tbptt_chunk_size: tbpttChunkSize,
         condition: metadata[1],
         started_at_ms: Number(metadata[2]),

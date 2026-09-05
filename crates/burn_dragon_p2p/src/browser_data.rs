@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use burn_dragon_universality::{OnlineNcaCorpus, OnlineRuliadCorpus, SampleSplit};
 use burn_p2p::WorkloadTrainingLease;
 use burn_p2p_core::codec::multihash_sha256;
+use std::collections::BTreeMap;
 
 use crate::config::{DragonBrowserDatasetSplit, TokenWindowRecord};
 
@@ -35,22 +36,88 @@ pub(crate) struct GeneratedRecordSelection<'a> {
     pub training_lease: Option<&'a WorkloadTrainingLease>,
 }
 
-pub(crate) fn generated_nca_records(
+const BROWSER_GENERATED_NCA_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BrowserGeneratedNcaCacheStats {
+    pub hits: usize,
+    pub misses: usize,
+    pub bytes: usize,
+}
+
+#[derive(Default)]
+pub(crate) struct BrowserGeneratedNcaCache {
+    source_key: Option<String>,
+    runtime: Option<OnlineNcaCorpus>,
+    documents: BTreeMap<(u8, usize), Vec<u32>>,
+    stats: BrowserGeneratedNcaCacheStats,
+}
+
+impl BrowserGeneratedNcaCache {
+    pub(crate) fn stats(&self) -> BrowserGeneratedNcaCacheStats {
+        self.stats
+    }
+
+    fn bind(
+        &mut self,
+        corpus: &burn_dragon_universality::NcaCorpusConfig,
+        block_size: usize,
+    ) -> Result<()> {
+        let source_key = format!("{block_size}\0{}", serde_json::to_string(corpus)?);
+        if self.source_key.as_deref() == Some(source_key.as_str()) {
+            return Ok(());
+        }
+        self.source_key = Some(source_key);
+        self.runtime = Some(OnlineNcaCorpus::new_with_min_logical_document_tokens(
+            corpus.clone(),
+            Some(block_size.saturating_add(1)),
+        )?);
+        self.documents.clear();
+        self.stats = BrowserGeneratedNcaCacheStats::default();
+        Ok(())
+    }
+
+    fn document_tokens(
+        &mut self,
+        split: DragonBrowserDatasetSplit,
+        sample_index: usize,
+    ) -> Result<Vec<u32>> {
+        let key = (dataset_split_key(split), sample_index);
+        if let Some(tokens) = self.documents.get(&key) {
+            self.stats.hits = self.stats.hits.saturating_add(1);
+            return Ok(tokens.clone());
+        }
+        let tokens = self
+            .runtime
+            .as_ref()
+            .expect("generated NCA cache must be bound before use")
+            .generate_document_tokens(dataset_split(split), sample_index)?;
+        self.stats.misses = self.stats.misses.saturating_add(1);
+        let token_bytes = tokens.len().saturating_mul(std::mem::size_of::<u32>());
+        if self.stats.bytes.saturating_add(token_bytes) <= BROWSER_GENERATED_NCA_CACHE_MAX_BYTES {
+            self.stats.bytes = self.stats.bytes.saturating_add(token_bytes);
+            self.documents.insert(key, tokens.clone());
+        }
+        Ok(tokens)
+    }
+}
+
+pub(crate) fn generated_nca_records_cached(
+    cache: &mut BrowserGeneratedNcaCache,
     corpus: &burn_dragon_universality::NcaCorpusConfig,
     split: DragonBrowserDatasetSplit,
     block_size: usize,
     selection: GeneratedRecordSelection<'_>,
 ) -> Result<Vec<TokenWindowRecord>> {
-    let runtime = OnlineNcaCorpus::new_with_min_logical_document_tokens(
-        corpus.clone(),
-        Some(block_size.saturating_add(1)),
-    )?;
-    generated_records(
-        runtime.sample_count(dataset_split(split)),
-        block_size,
-        selection,
-        |sample_index| runtime.generate_document_tokens(dataset_split(split), sample_index),
-    )
+    cache.bind(corpus, block_size)?;
+    let sample_count = cache
+        .runtime
+        .as_ref()
+        .expect("generated NCA cache must be bound before use")
+        .sample_count(dataset_split(split));
+    generated_records(sample_count, block_size, selection, |sample_index| {
+        cache.document_tokens(split, sample_index)
+    })
 }
 
 pub(crate) fn generated_ruliad_records(
@@ -212,6 +279,13 @@ fn dataset_split(split: DragonBrowserDatasetSplit) -> SampleSplit {
     match split {
         DragonBrowserDatasetSplit::Train => SampleSplit::Train,
         DragonBrowserDatasetSplit::Validation => SampleSplit::Validation,
+    }
+}
+
+fn dataset_split_key(split: DragonBrowserDatasetSplit) -> u8 {
+    match split {
+        DragonBrowserDatasetSplit::Train => 0,
+        DragonBrowserDatasetSplit::Validation => 1,
     }
 }
 
@@ -563,7 +637,8 @@ mod tests {
             tokenization: NcaTokenizationConfig::default(),
             families: burn_dragon_universality::config::default_families(),
         };
-        let records = generated_nca_records(
+        let records = generated_nca_records_cached(
+            &mut BrowserGeneratedNcaCache::default(),
             &config,
             DragonBrowserDatasetSplit::Train,
             32,
@@ -581,5 +656,50 @@ mod tests {
                 .iter()
                 .all(|record| record.inputs.len() == 32 && record.targets.len() == 32)
         );
+    }
+
+    #[test]
+    fn generated_nca_cache_reuses_documents_without_changing_records() {
+        let config = NcaCorpusConfig {
+            output_dir: "ignored".into(),
+            seed: 92,
+            name: "browser-nca-cache".into(),
+            train_samples: 2,
+            validation_samples: 1,
+            chunk_token_capacity: 4096,
+            serialization: NcaSerializationConfig::default(),
+            tokenization: NcaTokenizationConfig::default(),
+            families: burn_dragon_universality::config::default_families(),
+        };
+        let selection = || GeneratedRecordSelection {
+            max_documents: Some(1),
+            record_limit: Some(1),
+            selection_key: None,
+            training_lease: None,
+        };
+        let mut cache = BrowserGeneratedNcaCache::default();
+        let first = generated_nca_records_cached(
+            &mut cache,
+            &config,
+            DragonBrowserDatasetSplit::Train,
+            32,
+            selection(),
+        )
+        .expect("first cached NCA records");
+        assert_eq!(cache.stats().misses, 1);
+        assert_eq!(cache.stats().hits, 0);
+        assert!(cache.stats().bytes > 0);
+
+        let second = generated_nca_records_cached(
+            &mut cache,
+            &config,
+            DragonBrowserDatasetSplit::Train,
+            32,
+            selection(),
+        )
+        .expect("reused cached NCA records");
+        assert_eq!(second, first);
+        assert_eq!(cache.stats().misses, 1);
+        assert_eq!(cache.stats().hits, 1);
     }
 }

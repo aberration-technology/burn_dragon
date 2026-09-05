@@ -9,6 +9,7 @@ pub(crate) enum DragonBrowserTrainingPhase {
     InitializingModel,
     LoadingCheckpoint,
     SubmittingTraining,
+    MeasuringAdapter,
     SynchronizingLoss,
     Evaluating,
     PublishingUpdate,
@@ -30,6 +31,7 @@ impl DragonBrowserTrainingPhase {
             Self::InitializingModel => "initializing model",
             Self::LoadingCheckpoint => "loading checkpoint",
             Self::SubmittingTraining => "training",
+            Self::MeasuringAdapter => "measuring GPU",
             Self::SynchronizingLoss => "synchronizing GPU",
             Self::Evaluating => "evaluating",
             Self::PublishingUpdate => "publishing update",
@@ -51,6 +53,7 @@ impl DragonBrowserTrainingPhase {
             Self::InitializingModel => "initializing-model",
             Self::LoadingCheckpoint => "loading-checkpoint",
             Self::SubmittingTraining => "submitting-training",
+            Self::MeasuringAdapter => "measuring-adapter",
             Self::SynchronizingLoss => "synchronizing-loss",
             Self::Evaluating => "evaluating",
             Self::PublishingUpdate => "publishing-update",
@@ -101,6 +104,19 @@ impl DragonBrowserTrainingProgress {
     ) -> Self {
         Self {
             phase: DragonBrowserTrainingPhase::SynchronizingLoss,
+            submitted_batches,
+            planned_batches,
+            submitted_tokens,
+        }
+    }
+
+    pub(crate) const fn measuring_adapter(
+        submitted_batches: usize,
+        planned_batches: usize,
+        submitted_tokens: usize,
+    ) -> Self {
+        Self {
+            phase: DragonBrowserTrainingPhase::MeasuringAdapter,
             submitted_batches,
             planned_batches,
             submitted_tokens,
@@ -207,5 +223,14 @@ mod tests {
         assert_eq!(progress.phase.slug(), "synchronizing-loss");
         assert_eq!(progress.submitted_batches, 4);
         assert_eq!(progress.planned_batches, 8);
+    }
+
+    #[test]
+    fn adapter_measurement_keeps_progress_visible() {
+        let progress = DragonBrowserTrainingProgress::measuring_adapter(1, 64, 1536);
+
+        assert_eq!(progress.phase.label(), "measuring GPU");
+        assert_eq!(progress.submitted_batches, 1);
+        assert_eq!(progress.submitted_tokens, 1536);
     }
 }

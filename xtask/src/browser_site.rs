@@ -428,7 +428,7 @@ body {
 }
 
 .dragon-training-panel {
-  height: 460px;
+  height: 500px;
   display: grid;
   grid-template-rows: auto auto 6px 1fr auto;
   gap: 14px;
@@ -832,6 +832,10 @@ main.dragon-browser-shell {
 }
 
 .dragon-activity-panel {
+  height: 300px;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  align-content: start;
   border-radius: 8px;
   min-width: 0;
   max-width: 100%;
@@ -839,6 +843,7 @@ main.dragon-browser-shell {
 }
 
 .dragon-activity-feed {
+  height: 100%;
   display: grid;
   gap: 8px;
   list-style: none;
@@ -1185,7 +1190,7 @@ main.dragon-browser-shell {
   }
 
   .dragon-training-panel {
-    height: 780px;
+    height: 840px;
   }
 
   .dragon-training-header {
@@ -1810,10 +1815,11 @@ mod tests {
 
     #[test]
     fn browser_training_surface_reserves_stable_layout_space() {
-        assert!(EXTRA_STYLESHEET.contains(".dragon-training-panel {\n  height: 460px;"));
+        assert!(EXTRA_STYLESHEET.contains(".dragon-training-panel {\n  height: 500px;"));
+        assert!(EXTRA_STYLESHEET.contains(".dragon-activity-panel {\n  height: 300px;"));
         assert!(EXTRA_STYLESHEET.contains(".dragon-live-actions {\n  min-height: 92px;"));
         assert!(EXTRA_STYLESHEET.contains(".dragon-training-last-window"));
-        assert!(EXTRA_STYLESHEET.contains("height: 780px;"));
+        assert!(EXTRA_STYLESHEET.contains("height: 840px;"));
         assert!(EXTRA_STYLESHEET.contains("grid-auto-rows: minmax(40px, auto);"));
         assert!(EXTRA_STYLESHEET.contains("font-variant-numeric: tabular-nums;"));
     }

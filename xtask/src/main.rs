@@ -61,6 +61,12 @@ struct WasmTrainingBenchmarkArgs {
     /// Number of optimizer steps in each measured browser window.
     #[arg(long, default_value_t = 8)]
     train_batches: usize,
+    /// Number of held-out batches used to measure validation quality.
+    #[arg(long, default_value_t = 1)]
+    eval_batches: usize,
+    /// AdamW learning-rate override. Omit to exercise the profile value.
+    #[arg(long)]
+    learning_rate: Option<f64>,
     /// Through-time chunk size within each 256-token benchmark record.
     #[arg(long, default_value_t = 64)]
     tbptt_chunk_size: usize,
@@ -422,6 +428,16 @@ fn wasm_training_benchmark(args: &WasmTrainingBenchmarkArgs) -> Result<()> {
         "--train-batches must be between 1 and 64"
     );
     ensure!(
+        (1..=32).contains(&args.eval_batches),
+        "--eval-batches must be between 1 and 32"
+    );
+    if let Some(learning_rate) = args.learning_rate {
+        ensure!(
+            learning_rate.is_finite() && learning_rate > 0.0,
+            "--learning-rate must be finite and greater than zero"
+        );
+    }
+    ensure!(
         (1..=256).contains(&args.tbptt_chunk_size)
             && 256_usize.is_multiple_of(args.tbptt_chunk_size),
         "--tbptt-chunk-size must be a divisor of 256"
@@ -476,6 +492,8 @@ fn wasm_training_benchmark(args: &WasmTrainingBenchmarkArgs) -> Result<()> {
                     sample,
                     args.batch_size,
                     args.train_batches,
+                    args.eval_batches,
+                    args.learning_rate,
                     args.tbptt_chunk_size,
                 )?;
             }
@@ -538,6 +556,8 @@ fn run_hardware_wasm_training_benchmark(
     sample: usize,
     batch_size: usize,
     train_batches: usize,
+    eval_batches: usize,
+    learning_rate: Option<f64>,
     tbptt_chunk_size: usize,
 ) -> Result<()> {
     let chrome = resolve_chrome_path().context("could not find Chromium for hardware benchmark")?;
@@ -578,13 +598,16 @@ fn run_hardware_wasm_training_benchmark(
         .join("browser-training-benchmark");
     fs::create_dir_all(&artifact_dir)
         .with_context(|| format!("failed to create {}", artifact_dir.display()))?;
+    let learning_rate_label =
+        learning_rate.map_or_else(|| "profile".into(), |rate| rate.to_string());
     let run_label = format!(
-        "{condition}-b{}-n{}-c{}-s{sample}",
-        batch_size, train_batches, tbptt_chunk_size
+        "{condition}-b{}-n{}-e{}-lr{}-c{}-s{sample}",
+        batch_size, train_batches, eval_batches, learning_rate_label, tbptt_chunk_size
     );
     let screenshot = artifact_dir.join(format!("{run_label}.png"));
     let result = artifact_dir.join(format!("{run_label}.json"));
-    let status = Command::new("node")
+    let mut command = Command::new("node");
+    command
         .current_dir(workspace_root())
         .arg("xtask/assets/wasm-browser-benchmark.mjs")
         .arg("--url")
@@ -599,9 +622,16 @@ fn run_hardware_wasm_training_benchmark(
         .arg(batch_size.to_string())
         .arg("--train-batches")
         .arg(train_batches.to_string())
+        .arg("--eval-batches")
+        .arg(eval_batches.to_string())
         .arg("--tbptt-chunk-size")
-        .arg(tbptt_chunk_size.to_string())
-        .status();
+        .arg(tbptt_chunk_size.to_string());
+    if let Some(learning_rate) = learning_rate {
+        command
+            .arg("--learning-rate")
+            .arg(learning_rate.to_string());
+    }
+    let status = command.status();
     let _ = server.kill();
     let _ = server.wait();
     let status = status.context("failed to launch hardware WebGPU benchmark browser")?;

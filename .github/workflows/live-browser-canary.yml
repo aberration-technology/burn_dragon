@@ -81,6 +81,7 @@ jobs:
             browser: chromium
             transport_mode: auto
             expect_training: "0"
+            expect_training_downgrade: "0"
             expect_checkpoint_sync: "0"
             min_accepted_receipts: "0"
             required: "1"
@@ -88,6 +89,7 @@ jobs:
             browser: chromium
             transport_mode: webrtc-direct
             expect_training: "0"
+            expect_training_downgrade: "0"
             expect_checkpoint_sync: "0"
             min_accepted_receipts: "0"
             required: "1"
@@ -95,20 +97,23 @@ jobs:
             browser: chromium
             transport_mode: webrtc-direct
             expect_training: "0"
+            expect_training_downgrade: "0"
             expect_checkpoint_sync: "1"
             min_accepted_receipts: "0"
             required: "1"
-          - lane: chromium-webrtc-direct-training
+          - lane: chromium-webrtc-direct-production-capability
             browser: chromium
             transport_mode: webrtc-direct
-            expect_training: "1"
-            expect_checkpoint_sync: "0"
-            min_accepted_receipts: "2"
+            expect_training: "0"
+            expect_training_downgrade: "1"
+            expect_checkpoint_sync: "1"
+            min_accepted_receipts: "0"
             required: "1"
           - lane: firefox-webrtc-direct-connect
             browser: firefox
             transport_mode: webrtc-direct
             expect_training: "0"
+            expect_training_downgrade: "0"
             expect_checkpoint_sync: "0"
             min_accepted_receipts: "0"
             required: "0"
@@ -142,6 +147,7 @@ jobs:
           BURN_DRAGON_BROWSER_CANARY_BROWSER: ${{ matrix.browser }}
           BURN_DRAGON_BROWSER_CANARY_TRANSPORT_MODE: ${{ matrix.transport_mode }}
           BURN_DRAGON_BROWSER_CANARY_EXPECT_TRAINING: ${{ matrix.expect_training }}
+          BURN_DRAGON_BROWSER_CANARY_EXPECT_TRAINING_DOWNGRADE: ${{ matrix.expect_training_downgrade }}
           BURN_DRAGON_BROWSER_CANARY_EXPECT_CHECKPOINT_SYNC: ${{ matrix.expect_checkpoint_sync }}
           BURN_DRAGON_BROWSER_CANARY_USE_PRODUCTION_TRAINING_PROFILE: ${{ inputs.use_production_training_profile }}
           BURN_DRAGON_BROWSER_CANARY_MIN_ACCEPTED_RECEIPTS: ${{ matrix.min_accepted_receipts }}

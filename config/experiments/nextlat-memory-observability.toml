@@ -1,0 +1,42 @@
+version = 1
+output = "target/experiments/nextlat-memory-observability"
+repositories = [".", "../burn_pc", "../burn_ecs", "../burn_eggroll", "../burn_p2p"]
+
+[limits]
+system_fraction = 0.90
+headroom_mib = 4096
+poll_seconds = 0.25
+gpu_sample_seconds = 2.0
+shared_gpu_memory = true
+
+[[cases]]
+id = "before-full-problem-suffix"
+gpu = true
+expected_peak_mib = 32768
+timeout_seconds = 1800
+argv = ["target/release/examples/evaluate_ruliad_checkpoint","--backend","cuda","--checkpoint","runs/terrific-friend","--epoch","32","--evaluation-corpus","config/language/experiments/next_latent/observability-confirmatory-structural.corpus.toml","--free-run-items","128","--policy-items","128","--difficulty-levels","2","--panel-seed","9173405","--batch-size","2","--policy-prompt-context","full_problem_suffix","--no-closed-loop-rollout","--output","{output}/evaluation.json"]
+inputs = ["config/language/experiments/next_latent/corpus.toml","config/language/experiments/next_latent/in-distribution.corpus.toml","config/language/experiments/next_latent/structural-eval.corpus.toml","config/language/experiments/next_latent/memory-retention.corpus.toml","config/language/experiments/next_latent/memory-stationary.corpus.toml","config/language/experiments/next_latent/observability-confirmatory-structural.corpus.toml","runs/terrific-friend/training_config.json","runs/terrific-friend/config.json","runs/terrific-friend/checkpoint/model-config-32.json","runs/terrific-friend/checkpoint/model-32.bin"]
+
+[[cases]]
+id = "after-full-problem-suffix"
+gpu = true
+expected_peak_mib = 32768
+timeout_seconds = 1800
+argv = ["target/release/examples/evaluate_ruliad_checkpoint","--backend","cuda","--checkpoint","target/experiments/nextlat-memory-mastery-work/terrific-friend","--epoch","48","--evaluation-corpus","config/language/experiments/next_latent/observability-confirmatory-structural.corpus.toml","--free-run-items","128","--policy-items","128","--difficulty-levels","2","--panel-seed","9173405","--batch-size","2","--policy-prompt-context","full_problem_suffix","--no-closed-loop-rollout","--output","{output}/evaluation.json"]
+inputs = ["config/language/experiments/next_latent/corpus.toml","config/language/experiments/next_latent/in-distribution.corpus.toml","config/language/experiments/next_latent/structural-eval.corpus.toml","config/language/experiments/next_latent/memory-retention.corpus.toml","config/language/experiments/next_latent/memory-stationary.corpus.toml","config/language/experiments/next_latent/observability-confirmatory-structural.corpus.toml","target/experiments/nextlat-memory-mastery-work/terrific-friend/training_config.json","target/experiments/nextlat-memory-mastery-work/terrific-friend/config.json","target/experiments/nextlat-memory-mastery-work/terrific-friend/checkpoint/model-config-48.json","target/experiments/nextlat-memory-mastery-work/terrific-friend/checkpoint/model-48.bin"]
+
+[[cases]]
+id = "before-exact-action-state"
+gpu = true
+expected_peak_mib = 32768
+timeout_seconds = 1800
+argv = ["target/release/examples/evaluate_ruliad_checkpoint","--backend","cuda","--checkpoint","runs/terrific-friend","--epoch","32","--evaluation-corpus","config/language/experiments/next_latent/observability-confirmatory-structural.corpus.toml","--free-run-items","128","--policy-items","128","--difficulty-levels","2","--panel-seed","9173405","--batch-size","2","--policy-prompt-context","exact_action_state","--no-closed-loop-rollout","--output","{output}/evaluation.json"]
+inputs = ["config/language/experiments/next_latent/corpus.toml","config/language/experiments/next_latent/in-distribution.corpus.toml","config/language/experiments/next_latent/structural-eval.corpus.toml","config/language/experiments/next_latent/memory-retention.corpus.toml","config/language/experiments/next_latent/memory-stationary.corpus.toml","config/language/experiments/next_latent/observability-confirmatory-structural.corpus.toml","runs/terrific-friend/training_config.json","runs/terrific-friend/config.json","runs/terrific-friend/checkpoint/model-config-32.json","runs/terrific-friend/checkpoint/model-32.bin"]
+
+[[cases]]
+id = "after-exact-action-state"
+gpu = true
+expected_peak_mib = 32768
+timeout_seconds = 1800
+argv = ["target/release/examples/evaluate_ruliad_checkpoint","--backend","cuda","--checkpoint","target/experiments/nextlat-memory-mastery-work/terrific-friend","--epoch","48","--evaluation-corpus","config/language/experiments/next_latent/observability-confirmatory-structural.corpus.toml","--free-run-items","128","--policy-items","128","--difficulty-levels","2","--panel-seed","9173405","--batch-size","2","--policy-prompt-context","exact_action_state","--no-closed-loop-rollout","--output","{output}/evaluation.json"]
+inputs = ["config/language/experiments/next_latent/corpus.toml","config/language/experiments/next_latent/in-distribution.corpus.toml","config/language/experiments/next_latent/structural-eval.corpus.toml","config/language/experiments/next_latent/memory-retention.corpus.toml","config/language/experiments/next_latent/memory-stationary.corpus.toml","config/language/experiments/next_latent/observability-confirmatory-structural.corpus.toml","target/experiments/nextlat-memory-mastery-work/terrific-friend/training_config.json","target/experiments/nextlat-memory-mastery-work/terrific-friend/config.json","target/experiments/nextlat-memory-mastery-work/terrific-friend/checkpoint/model-config-48.json","target/experiments/nextlat-memory-mastery-work/terrific-friend/checkpoint/model-48.bin"]

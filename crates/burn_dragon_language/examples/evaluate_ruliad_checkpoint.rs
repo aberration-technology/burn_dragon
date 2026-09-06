@@ -14,8 +14,8 @@ use burn_dragon_language::train::{
 };
 #[cfg(feature = "train")]
 use burn_dragon_language::{
-    config::RuliadProofPolicyScoring, load_language_core_from_checkpoint,
-    load_training_config_for_checkpoint,
+    config::{RuliadProofPolicyPromptContext, RuliadProofPolicyScoring},
+    load_language_core_from_checkpoint, load_training_config_for_checkpoint,
 };
 #[cfg(feature = "train")]
 use burn_ndarray::NdArray;
@@ -35,6 +35,7 @@ struct Args {
     batch_size: Option<usize>,
     include_closed_loop_rollout: bool,
     policy_scoring: Option<RuliadProofPolicyScoring>,
+    policy_prompt_context: Option<RuliadProofPolicyPromptContext>,
     policy_max_steps: Option<usize>,
     panel_seed: Option<u64>,
     evaluation_corpus: Option<PathBuf>,
@@ -60,6 +61,7 @@ fn parse_args() -> Result<Args> {
     let mut batch_size = None;
     let mut include_closed_loop_rollout = true;
     let mut policy_scoring = None;
+    let mut policy_prompt_context = None;
     let mut policy_max_steps = None;
     let mut panel_seed = None;
     let mut evaluation_corpus = None;
@@ -119,13 +121,28 @@ fn parse_args() -> Result<Args> {
                     }
                 });
             }
+            "--policy-prompt-context" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--policy-prompt-context requires a value"))?;
+                policy_prompt_context = Some(match value.as_str() {
+                    "full_problem_suffix" => RuliadProofPolicyPromptContext::FullProblemSuffix,
+                    "local_action_state" => RuliadProofPolicyPromptContext::LocalActionState,
+                    "exact_action_state" => RuliadProofPolicyPromptContext::ExactActionState,
+                    _ => {
+                        return Err(anyhow!(
+                            "--policy-prompt-context must be full_problem_suffix, local_action_state, or exact_action_state"
+                        ));
+                    }
+                });
+            }
             "--policy-max-steps" => {
                 policy_max_steps = Some(parse_usize(&mut args, "--policy-max-steps")?)
             }
             "--no-closed-loop-rollout" => include_closed_loop_rollout = false,
             "--help" | "-h" => {
                 println!(
-                    "usage: evaluate_ruliad_checkpoint --backend <cpu|cuda> --checkpoint <run-or-checkpoint-dir> [--epoch N] [--output report.json] [--free-run-items N] [--policy-items N] [--panel-seed N] [--difficulty-levels N] [--batch-size N] [--evaluation-corpus path.toml] [--policy-scoring <completion_likelihood|semantic_energy|residual_energy>] [--policy-max-steps <0|N>] [--no-closed-loop-rollout]"
+                    "usage: evaluate_ruliad_checkpoint --backend <cpu|cuda> --checkpoint <run-or-checkpoint-dir> [--epoch N] [--output report.json] [--free-run-items N] [--policy-items N] [--panel-seed N] [--difficulty-levels N] [--batch-size N] [--evaluation-corpus path.toml] [--policy-scoring <completion_likelihood|semantic_energy|residual_energy>] [--policy-prompt-context <full_problem_suffix|local_action_state|exact_action_state>] [--policy-max-steps <0|N>] [--no-closed-loop-rollout]"
                 );
                 std::process::exit(0);
             }
@@ -143,6 +160,7 @@ fn parse_args() -> Result<Args> {
         batch_size,
         include_closed_loop_rollout,
         policy_scoring,
+        policy_prompt_context,
         policy_max_steps,
         panel_seed,
         evaluation_corpus,
@@ -167,6 +185,7 @@ struct CheckpointEvaluationDocument {
     checkpoint_epoch: usize,
     git_commit: Option<String>,
     policy_scoring: String,
+    policy_prompt_context: String,
     policy_max_steps: usize,
     options: RuliadEvaluationSuiteOptions,
     corpus_semantic_fingerprint: Option<String>,
@@ -269,6 +288,9 @@ where
     if let Some(max_steps) = args.policy_max_steps {
         config.training.ruliad_policy_probe.max_steps = max_steps;
     }
+    if let Some(context) = args.policy_prompt_context {
+        config.training.ruliad_policy_probe.prompt_context = context;
+    }
     let policy_scoring = config.training.ruliad_policy_probe.scoring;
     let policy_max_steps = config.training.ruliad_policy_probe.max_steps;
     let corpus_override =
@@ -307,12 +329,18 @@ where
         &device,
     )?;
     Ok(CheckpointEvaluationDocument {
-        version: 4,
+        version: 5,
         backend: args.backend.clone(),
         checkpoint,
         checkpoint_epoch,
         git_commit: option_env!("BURN_DRAGON_GIT_COMMIT").map(str::to_string),
         policy_scoring: policy_scoring.as_str().to_string(),
+        policy_prompt_context: config
+            .training
+            .ruliad_policy_probe
+            .prompt_context
+            .as_str()
+            .to_string(),
         policy_max_steps,
         options,
         corpus_semantic_fingerprint: dataset.ruliad_semantic_fingerprint()?,

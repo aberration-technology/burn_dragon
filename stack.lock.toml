@@ -4,7 +4,7 @@ schema_version = 1
 name = "burn_ecs"
 path = "../burn_ecs"
 url = "https://github.com/aberration-technology/burn_ecs.git"
-revision = "115cdfe8cd4212c529ab11be1f38887abf558ba0"
+revision = "b4ab09125838ccb81925102e2a2ce20d7f95d659"
 
 [[repositories]]
 name = "burn_p2p"
@@ -16,10 +16,10 @@ revision = "6d8f5400b171fafe0f20550f51eb79db3d84c4bf"
 name = "burn_eggroll"
 path = "../burn_eggroll"
 url = "https://github.com/aberration-technology/burn_eggroll.git"
-revision = "bc11f547c1096da0c662ddf9e2fa1fb7f8c3f6bc"
+revision = "56fffb50af0c0a7bd1df81c38709a150c9755c39"
 
 [[repositories]]
 name = "burn_pc"
 path = "../burn_pc"
 url = "https://github.com/aberration-technology/burn_pc.git"
-revision = "2aaab500cce6fa04ecdda4ba5c7667b9ce07d035"
+revision = "282e8c3f601f63abf6e202b42039e8b3f6434c4f"

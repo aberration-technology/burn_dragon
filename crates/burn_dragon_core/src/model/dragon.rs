@@ -5,9 +5,9 @@ mod diagnostics;
 #[cfg(any(feature = "probe", test))]
 mod interpretability;
 mod language_head;
+mod language_pipeline;
 #[cfg(test)]
 mod next_latent_tests;
-mod language_pipeline;
 mod predictive_coding;
 mod sequence_dispatch;
 pub use continual_backprop::{

@@ -1454,20 +1454,20 @@ mod tests {
             width: Some(UsizeRangeConfig { min: 2, max: 2 }),
             steps: Some(UsizeRangeConfig { min: 2, max: 2 }),
         }];
-        let original = OnlineRuliadCorpus::new(config.clone()).unwrap();
+        let original = OnlineRuliadCorpus::new(config.clone()).expect("structural corpus");
         config.formal_generalization =
             RuliadFormalGeneralizationContract::StructuralTrainSeedDisjointV1;
-        let control = OnlineRuliadCorpus::new(config).unwrap();
+        let control = OnlineRuliadCorpus::new(config).expect("seed-disjoint corpus");
         for sample in 0..2 {
             let train = original
                 .generate_document_for_epoch(SampleSplit::Train, 11, sample)
-                .unwrap();
+                .expect("structural training document");
             let control_train = control
                 .generate_document_for_epoch(SampleSplit::Train, 11, sample)
-                .unwrap();
+                .expect("control training document");
             let validation = control
                 .generate_document_for_epoch(SampleSplit::Validation, 0, sample)
-                .unwrap();
+                .expect("control validation document");
             assert_eq!(train.tokens, control_train.tokens);
             assert_eq!(train.oracle_hash, control_train.oracle_hash);
             assert_ne!(train.oracle_hash, validation.oracle_hash);
@@ -1833,7 +1833,9 @@ mod tests {
         assert!(report.total_trace_answer_target_tokens > report.total_answer_target_tokens);
         assert!(report.max_to_min_mean_stream_chunks_ratio >= 1.0);
         assert_eq!(report.total_query_conditioning_samples, report.sample_count);
-        assert_eq!(report.query_visible_within_block_fraction, 1.0);
+        // Eight of twelve observations share a block with the first answer prediction.
+        // A short span alone does not guarantee visibility across an aligned block boundary.
+        assert_eq!(report.query_visible_within_block_fraction, 8.0 / 12.0);
         let stream_share_sum = report
             .buckets
             .iter()
@@ -1858,7 +1860,29 @@ mod tests {
             .find(|bucket| bucket.answer_contract == "proof_step")
             .expect("transition bucket");
         assert_eq!(transition.query_conditioning_samples, 4);
-        assert_eq!(transition.query_visible_within_block_fraction, 1.0);
+        let visible_transitions = (0..4)
+            .filter(|sample_index| {
+                let document = corpus
+                    .generate_document_for_source_bucket_with_padding(
+                        SampleSplit::Train,
+                        0,
+                        *sample_index,
+                        &transition.bucket_label,
+                        false,
+                    )
+                    .expect("audited transition document");
+                let geometry =
+                    query_to_answer_token_geometry(&corpus.tokenizer, &document.serialized_preview)
+                        .expect("query and answer markers");
+                let first_answer_input = geometry.answer_token_offset - 1;
+                let block_start = first_answer_input - first_answer_input % 128;
+                (block_start..block_start + 128).contains(&geometry.query_token_offset)
+            })
+            .count();
+        assert_eq!(
+            transition.query_visible_within_block_fraction,
+            visible_transitions as f64 / 4.0
+        );
         assert!(transition.max_query_to_answer_tokens <= 128);
     }
 

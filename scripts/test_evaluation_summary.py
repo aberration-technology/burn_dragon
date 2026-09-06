@@ -21,6 +21,13 @@ class EvaluationSummaryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "model identities"):
             validate_identities([original, changed])
 
+    def test_prompt_contracts_are_distinct_but_still_require_matched_identities(self):
+        original = dict(self.row(), policy_prompt_context="local_action_state")
+        exact = dict(original, policy_prompt_context="exact_action_state", panel_fingerprint="exact")
+        validate_identities([original, exact])
+        with self.assertRaisesRegex(ValueError, "item identities"):
+            validate_identities([exact, dict(exact, panel_fingerprint="mismatched")])
+
     def test_rejects_mismatched_items_for_the_same_panel_request(self):
         original = self.row()
         changed = copy.deepcopy(original)

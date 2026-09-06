@@ -3,6 +3,12 @@ name: CI
 on:
   pull_request:
     paths:
+      - "stack.lock.toml"
+      - ".github/actions/bootstrap-stack/**"
+      - "scripts/bootstrap_stack.py"
+      - "scripts/experiments/**"
+      - "scripts/test_*.py"
+      - "scripts/ruliad_checkpoint_eval_analyze.py"
       - ".github/workflows/ci.yml"
       - ".github/workflows/deploy-burn-dragon-p2p-aws.yml"
       - ".github/workflows/restore-burn-dragon-p2p-aws.yml"
@@ -24,6 +30,12 @@ on:
     branches:
       - main
     paths:
+      - "stack.lock.toml"
+      - ".github/actions/bootstrap-stack/**"
+      - "scripts/bootstrap_stack.py"
+      - "scripts/experiments/**"
+      - "scripts/test_*.py"
+      - "scripts/ruliad_checkpoint_eval_analyze.py"
       - ".github/workflows/ci.yml"
       - ".github/workflows/deploy-burn-dragon-p2p-aws.yml"
       - ".github/workflows/restore-burn-dragon-p2p-aws.yml"
@@ -60,6 +72,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: bootstrap locked sibling stack
         uses: ./.github/actions/bootstrap-stack
+      - name: verify stack and bounded experiment contracts
+        run: |
+          python3 scripts/bootstrap_stack.py --verify
+          python3 -m unittest scripts.test_experiments scripts.test_training_summary scripts.test_evaluation_summary scripts.test_ruliad_checkpoint_eval_analyze
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

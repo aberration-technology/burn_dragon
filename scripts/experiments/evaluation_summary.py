@@ -19,7 +19,8 @@ def validate_identities(rows):
             raise ValueError("one checkpoint produced different model identities across panels")
         options = row["panel_options"]
         panel = (row["corpus_fingerprint"], options["panel_seed"], options["free_run_items"],
-                 options["policy_items"], options["difficulty_levels"])
+                 options["policy_items"], options["difficulty_levels"],
+                 row.get("policy_prompt_context"), row.get("policy_scoring"))
         fingerprint = row["panel_fingerprint"]
         if panels.setdefault(panel, fingerprint) != fingerprint:
             raise ValueError("matched corpus/panel requests produced different item identities")
@@ -47,6 +48,8 @@ def summarize(root):
                          corpus_fingerprint=document["corpus_semantic_fingerprint"],
                          corpus_override=override, model_fingerprint=evaluation["model_tensor_fingerprint_sha256"],
                          panel_fingerprint=evaluation["panel_fingerprint_sha256"], panel_options=document["options"],
+                         policy_prompt_context=document.get("policy_prompt_context"),
+                         policy_scoring=document.get("policy_scoring"),
                          report_identity=file_identity(path),
                          free_items=free["item_count"], free_verifier_accuracy=report["verifier_accuracy"],
                          answer_nll=teacher["mean_nll"], answer_token_accuracy=teacher["token_accuracy"],

@@ -240,44 +240,11 @@ pub fn ruliad_proof_action_query(
     problem: &RuliadProofProblem,
     actions: &crate::ruliad::policy::RuliadProofActionSet,
 ) -> Result<String> {
-    let candidates = actions
-        .candidates
-        .iter()
-        .enumerate()
-        .map(|(index, candidate)| {
-            let source = match &candidate.step.source {
-                RuliadProofSource::Axiom { id } => format!("a:{id}"),
-                RuliadProofSource::Lemma { goal } => format!("l:{goal}"),
-            };
-            let direction = match candidate.step.direction {
-                RuliadRewriteDirection::Forward => "f",
-                RuliadRewriteDirection::Reverse => "r",
-            };
-            let path = if candidate.step.path.is_empty() {
-                "-".to_string()
-            } else {
-                candidate
-                    .step
-                    .path
-                    .iter()
-                    .map(usize::to_string)
-                    .collect::<Vec<_>>()
-                    .join(".")
-            };
-            let (lhs, rhs) = formal_proof_source_equality(problem, &candidate.step.source)?;
-            let (before, after) = match candidate.step.direction {
-                RuliadRewriteDirection::Forward => (lhs, rhs),
-                RuliadRewriteDirection::Reverse => (rhs, lhs),
-            };
-            let (before, after) = transition_pattern_focus(before, after);
-            Ok(format!(
-                "c{index}={source}|{direction}|{path}|{}>{}",
-                bounded_transition_pattern(before),
-                bounded_transition_pattern(after)
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?
-        .join(",");
+    let candidates = super::action_prompt::candidate_menu(
+        problem,
+        actions,
+        super::action_prompt::ActionPromptDetail::Focused,
+    )?;
     let (difference_path, current_focus, target_focus) =
         first_state_difference(&actions.current, &actions.target);
     let difference_path = if difference_path.is_empty() {
@@ -313,10 +280,11 @@ pub fn ruliad_proof_action_prompt(
     ))
 }
 
-/// Minimal verifier-sufficient interface for proof-action policy learning.
+/// Historical compact, focused observation for proof-action policy learning.
 ///
 /// The action menu already contains the local rewrite patterns, current and
-/// target focus, goal id, and difference path needed to choose a transition.
+/// target focus, goal id, and difference path. Focus and bounded rendering can
+/// discard state or rule details, so this is not a fully observable interface.
 /// Omitting the serialized global problem and random content hash prevents a
 /// fixed context window from silently retaining an arbitrary suffix of those
 /// fields and removes a high-entropy memorization channel from the policy.

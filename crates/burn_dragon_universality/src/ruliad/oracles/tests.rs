@@ -34,7 +34,7 @@ fn structural_train_seed_disjoint_uses_identical_grammar_for_both_splits() {
         );
     }
     assert_eq!(
-        serde_json::to_string(&contract).unwrap(),
+        serde_json::to_string(&contract).expect("serialized generalization contract"),
         "\"structural_train_seed_disjoint_v1\""
     );
 }

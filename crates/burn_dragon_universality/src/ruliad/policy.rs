@@ -1298,17 +1298,21 @@ mod tests {
         let progress = actions.candidate_progress_units();
         assert_eq!(progress.len(), actions.candidates.len());
         assert!(progress.iter().any(|weight| *weight > 0));
-        let maximum = progress.iter().copied().max().unwrap();
+        let maximum = progress
+            .iter()
+            .copied()
+            .max()
+            .expect("nonempty progress fixture");
         assert_eq!(progress[actions.selected_index], maximum);
 
         for rotation in 0..actions.candidates.len() {
             let rotated = actions.rotate_left(rotation).expect("rotated actions");
             let rotated_progress = rotated.candidate_progress_units();
-            for presented_index in 0..rotated.candidates.len() {
+            for (presented_index, rotated_weight) in rotated_progress.iter().enumerate() {
                 let original_index = actions
                     .original_index_after_rotation(presented_index, rotation)
                     .expect("original index");
-                assert_eq!(rotated_progress[presented_index], progress[original_index]);
+                assert_eq!(*rotated_weight, progress[original_index]);
             }
         }
     }

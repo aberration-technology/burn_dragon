@@ -50,6 +50,11 @@ pub struct RuliadConstrainedPolicyEvaluation {
     pub context_swap_top1_change_rate: f64,
     pub context_swap_equivalent_probability_drop: f64,
     pub counterfactual_target_top1_change_rate: f64,
+    pub counterfactual_target_items: usize,
+    pub counterfactual_target_equivalent_top1_rate: f64,
+    /// Both the original reference action and the retargeted one-step action are correct.
+    pub counterfactual_target_pair_accuracy: f64,
+    pub counterfactual_target_equivalent_nll: f64,
     pub counterfactual_target_equivalent_probability_gain: f64,
     pub elapsed_ms: f64,
 }
@@ -141,6 +146,17 @@ fn constrained_evaluation(
             summary.counterfactual_target_top1_changes,
             summary.counterfactual_target_items,
         ),
+        counterfactual_target_items: summary.counterfactual_target_items,
+        counterfactual_target_equivalent_top1_rate: ratio(
+            summary.counterfactual_target_equivalent_top1,
+            summary.counterfactual_target_items,
+        ),
+        counterfactual_target_pair_accuracy: ratio(
+            summary.counterfactual_target_pair_correct,
+            summary.counterfactual_target_items,
+        ),
+        counterfactual_target_equivalent_nll: summary.counterfactual_target_equivalent_nll_sum
+            / summary.counterfactual_target_items.max(1) as f64,
         counterfactual_target_equivalent_probability_gain: summary
             .counterfactual_target_equivalent_probability_gain_sum
             / summary.counterfactual_target_items.max(1) as f64,
@@ -450,7 +466,7 @@ where
         "checkpoint evaluation mutated model parameters"
     );
     Ok(RuliadEvaluationSuiteReport {
-        version: 8,
+        version: 9,
         model_tensor_fingerprint_sha256,
         panel_fingerprint_sha256,
         free_run,
@@ -472,6 +488,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counterfactual_accuracy_is_not_the_answer_change_rate() {
+        let report = constrained_evaluation(RuliadCorrectnessConstrainedPolicySummary {
+            items: 16,
+            counterfactual_target_items: 8,
+            counterfactual_target_equivalent_top1: 2,
+            counterfactual_target_pair_correct: 1,
+            counterfactual_target_top1_changes: 6,
+            counterfactual_target_equivalent_nll_sum: 12.0,
+            ..Default::default()
+        });
+        assert_eq!(report.counterfactual_target_items, 8);
+        assert_eq!(report.counterfactual_target_equivalent_top1_rate, 0.25);
+        assert_eq!(report.counterfactual_target_pair_accuracy, 0.125);
+        assert_eq!(report.counterfactual_target_top1_change_rate, 0.75);
+        assert_eq!(report.counterfactual_target_equivalent_nll, 1.5);
+    }
 
     #[test]
     fn rollout_metrics_use_the_same_denominators_as_training_telemetry() {
@@ -510,5 +544,11 @@ mod tests {
         assert!(rollout.valid_action_rate.is_finite());
         assert!(constrained.equivalent_top1_rate.is_finite());
         assert!(constrained.valid_invalid_margin.is_finite());
+        assert!(constrained.counterfactual_target_equivalent_nll.is_finite());
+        assert!(
+            constrained
+                .counterfactual_target_equivalent_top1_rate
+                .is_finite()
+        );
     }
 }

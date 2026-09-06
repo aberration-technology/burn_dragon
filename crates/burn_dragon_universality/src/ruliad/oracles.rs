@@ -237,6 +237,7 @@ pub struct RuliadOracleReport {
     pub oracle_hash: String,
 }
 
+mod action_prompt;
 mod classification;
 mod document;
 mod families;
@@ -252,6 +253,7 @@ use statistics::*;
 #[cfg(test)]
 use generation::*;
 
+pub use action_prompt::ruliad_proof_action_exact_prompt;
 pub(crate) use classification::scale_family_for_difficulty;
 pub use classification::{ruliad_sample_math_domains, ruliad_sample_reasoning_modes};
 pub use document::{

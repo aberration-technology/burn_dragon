@@ -2498,6 +2498,9 @@ pub enum RuliadProofPolicyPromptContext {
     /// candidate rewrite patterns, goal, and difference path. No random hash
     /// or serialized global problem is exposed to the policy.
     LocalActionState,
+    /// Complete current/target terms and candidate rules, without a difference-path hint.
+    /// Fixed-block training rejects oversized prompts instead of silently cropping them.
+    ExactActionState,
 }
 
 impl RuliadProofPolicyPromptContext {
@@ -2505,6 +2508,7 @@ impl RuliadProofPolicyPromptContext {
         match self {
             Self::FullProblemSuffix => "full_problem_suffix",
             Self::LocalActionState => "local_action_state",
+            Self::ExactActionState => "exact_action_state",
         }
     }
 }

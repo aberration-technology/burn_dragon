@@ -344,6 +344,33 @@ def validate_policy_controls(document: dict[str, Any], path: Path) -> None:
         value = finite_number(observed)
         if value is None or not math.isclose(value, model_accuracy, abs_tol=1e-7):
             raise ValueError(f"policy control/model verifier disagreement: {path}")
+    if evaluation.get("version", 0) >= 9:
+        validate_counterfactual_metrics(evaluation["constrained_policy"], path)
+
+
+def validate_counterfactual_metrics(policy: dict[str, Any], path: Path) -> None:
+    count = policy.get("counterfactual_target_items")
+    total = policy.get("items")
+    if type(count) is not int or type(total) is not int or not 0 <= count <= total:
+        raise ValueError(f"invalid counterfactual item coverage: {path}")
+    counts = {}
+    for key in ("equivalent_top1_rate", "pair_accuracy", "top1_change_rate"):
+        rate = finite_number(policy.get(f"counterfactual_target_{key}"))
+        if rate is None or not 0 <= rate <= 1 or (count == 0 and rate != 0):
+            raise ValueError(f"invalid counterfactual rate {key}: {path}")
+        realized = rate * count
+        if not math.isclose(realized, round(realized), abs_tol=1e-7):
+            raise ValueError(f"nonintegral counterfactual count {key}: {path}")
+        counts[key] = round(realized)
+    original = finite_number(policy.get("equivalent_top1_rate"))
+    if original is None or not 0 <= original <= 1:
+        raise ValueError(f"invalid original accuracy in counterfactual comparison: {path}")
+    if counts["pair_accuracy"] > min(counts["equivalent_top1_rate"],
+                                    counts["top1_change_rate"], round(original * total)):
+        raise ValueError(f"counterfactual pair accuracy exceeds correct changed pairs: {path}")
+    nll = finite_number(policy.get("counterfactual_target_equivalent_nll"))
+    if nll is None or nll < 0 or (count == 0 and nll != 0):
+        raise ValueError(f"invalid counterfactual NLL: {path}")
 
 
 def mean_ci(values: list[float]) -> tuple[float, float | None, float | None]:

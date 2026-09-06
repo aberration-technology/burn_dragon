@@ -168,9 +168,9 @@ mod tests {
             config.formal_generalization = contract;
             identities.insert(
                 RuliadSemanticContract::from_config(&config, None)
-                    .unwrap()
+                    .expect("corpus semantic contract")
                     .canonical_hash()
-                    .unwrap(),
+                    .expect("semantic contract identity"),
             );
         }
         assert_eq!(identities.len(), 3);

@@ -599,6 +599,7 @@ pub(super) struct RuliadCorrectnessConstrainedPolicySummary {
     pub(super) context_swap_js_divergence_sum: f64,
     pub(super) counterfactual_target_items: usize,
     pub(super) counterfactual_target_equivalent_top1: usize,
+    pub(super) counterfactual_target_pair_correct: usize,
     pub(super) counterfactual_target_equivalent_nll_sum: f64,
     pub(super) counterfactual_target_top1_changes: usize,
     pub(super) counterfactual_target_equivalent_probability_gain_sum: f64,
@@ -813,10 +814,14 @@ pub(super) fn record_ruliad_correctness_context_swap(
 
 pub(super) fn record_ruliad_correctness_counterfactual_target(
     summary: &mut RuliadCorrectnessConstrainedPolicySummary,
+    original_job: &RuliadCorrectnessConstrainedPolicyJob,
     counterfactual_job: &RuliadCorrectnessConstrainedPolicyJob,
     original_scores: &[f32],
     counterfactual_scores: &[f32],
 ) {
+    let Some(original) = ruliad_correctness_constrained_score(original_job, original_scores) else {
+        return;
+    };
     let Some(before) = ruliad_correctness_constrained_score(counterfactual_job, original_scores)
     else {
         return;
@@ -845,6 +850,8 @@ pub(super) fn record_ruliad_correctness_counterfactual_target(
         .counterfactual_target_equivalent_top1
         .saturating_add(usize::from(after.equivalent_top1));
     summary.counterfactual_target_equivalent_nll_sum += after.equivalent_nll;
+    summary.counterfactual_target_pair_correct +=
+        usize::from(original.equivalent_top1 && after.equivalent_top1);
     summary.counterfactual_target_top1_changes = summary
         .counterfactual_target_top1_changes
         .saturating_add(usize::from(original_top1 != counterfactual_top1));
@@ -1018,6 +1025,14 @@ pub(super) fn counterfactual_target_action_jobs(
                 &base_context.actions,
                 candidate_index,
             )?;
+        anyhow::ensure!(
+            counterfactual_actions.current == base_context.actions.current
+                && counterfactual_actions
+                    .equivalent_indices
+                    .iter()
+                    .all(|index| !base_context.actions.is_equivalent_index(*index)),
+            "counterfactual action labels must be disjoint while preserving current state"
+        );
         let mut presentations = Vec::with_capacity(job.presentations.len());
         let mut prompt_contexts = Vec::with_capacity(job.presentations.len());
         for presentation in &job.presentations {
@@ -1493,6 +1508,7 @@ where
             |summary| {
                 record_ruliad_correctness_counterfactual_target(
                     summary,
+                    &jobs[*original_index],
                     counterfactual_job,
                     &original_decision.orbit.averaged_log_probs,
                     &counterfactual_decision.orbit.averaged_log_probs,
@@ -1675,6 +1691,13 @@ where
             "Ruliad Correctness Constrained Counterfactual-Target Equivalent NLL",
             summary.counterfactual_target_equivalent_nll_sum
                 / summary.counterfactual_target_items.max(1) as f64,
+        ),
+        (
+            "Ruliad Correctness Constrained Counterfactual-Target Pair Accuracy",
+            ratio_usize(
+                summary.counterfactual_target_pair_correct,
+                summary.counterfactual_target_items,
+            ),
         ),
         (
             "Ruliad Correctness Constrained Counterfactual-Target Top-1 Change Rate",

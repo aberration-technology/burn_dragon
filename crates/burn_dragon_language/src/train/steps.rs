@@ -2696,6 +2696,6 @@ mod verifier_terminal;
 use degeneracy::*;
 
 #[cfg(test)]
-mod objective_step_tests;
-#[cfg(test)]
 mod next_latent_tests;
+#[cfg(test)]
+mod objective_step_tests;

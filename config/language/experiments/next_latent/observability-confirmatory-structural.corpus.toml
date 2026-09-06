@@ -1,0 +1,6 @@
+extends = ["structural-eval.corpus.toml"]
+
+# Fresh panel for observation-contract and counterfactual diagnostics, not training.
+seed = 8817305
+name = "nextlat-observability-confirmatory-structural"
+validation_samples = 1024

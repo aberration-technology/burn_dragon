@@ -74,6 +74,21 @@ This checks caches against execution, not an independently implemented verifier.
 Per-item paired results and difficulty/source summaries remain in the JSON.
 The in-training probe explicitly disables these additional controls.
 
+Suite v9 additionally exports counterfactual-target correctness and joint pair
+accuracy: both the original certificate-equivalent action and the one-step action
+for a changed target must be correct. A top-1 change alone is not success. The
+counterfactual retains the current state and candidate menu with disjoint target
+labels; it is a local transition task, not a newly certified whole proof.
+
+`config/experiments/nextlat-memory-observability.toml` compares frozen before/after
+curriculum checkpoints using the historical full-problem prompt and
+`--policy-prompt-context exact_action_state`. Exact observations contain complete
+current/target terms and candidate rewrite rules, without first-difference hints
+or text abbreviation. Fixed-block training rejects cropping in this mode;
+checkpoint scoring consumes complete recurrent prefixes. This intervention is
+out of distribution for existing checkpoints, not an ablation of retrained
+objectives. The matrix does not promote the new representation as a default.
+
 `config/experiments/ruliad-policy-controls.toml` compares six existing frozen
 checkpoints on the same 256-item panel. The 512- and 1024-update groups are
 different training experiments, not a causal checkpoint learning curve. Compare

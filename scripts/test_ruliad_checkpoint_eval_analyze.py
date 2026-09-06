@@ -3,10 +3,35 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from scripts.ruliad_checkpoint_eval_analyze import analyze, fixture_report, report_row
+from scripts.ruliad_checkpoint_eval_analyze import analyze, fixture_report, report_row, validate_counterfactual_metrics
 
 
 class EvaluationContracts(unittest.TestCase):
+    def test_counterfactual_pairs_require_valid_counts_and_two_correct_changed_answers(self):
+        policy = dict(items=16, equivalent_top1_rate=0.5, counterfactual_target_items=8,
+                      counterfactual_target_equivalent_top1_rate=0.25,
+                      counterfactual_target_pair_accuracy=0.125,
+                      counterfactual_target_top1_change_rate=0.75,
+                      counterfactual_target_equivalent_nll=1.5)
+        path = Path("fixture")
+        validate_counterfactual_metrics(policy, path)
+        for key, value in (("items", 7), ("pair_accuracy", 0.5), ("pair_accuracy", 0.2),
+                           ("top1_change_rate", 0.0), ("equivalent_nll", float("nan"))):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                validate_counterfactual_metrics(dict(policy, **{f"counterfactual_target_{key}": value}), path)
+        with self.assertRaises(ValueError):
+            validate_counterfactual_metrics(dict(policy, equivalent_top1_rate=0.0), path)
+
+    def test_empty_counterfactual_panel_is_not_success(self):
+        policy = dict(items=0, equivalent_top1_rate=0.0, counterfactual_target_items=0,
+                      counterfactual_target_equivalent_top1_rate=0.0,
+                      counterfactual_target_pair_accuracy=0.0,
+                      counterfactual_target_top1_change_rate=0.0,
+                      counterfactual_target_equivalent_nll=0.0)
+        validate_counterfactual_metrics(policy, Path("empty"))
+        with self.assertRaises(ValueError):
+            validate_counterfactual_metrics(dict(policy, counterfactual_target_pair_accuracy=1.0), Path("empty"))
+
     def test_v8_controls_reject_partial_or_inconsistent_evidence(self):
         report = fixture_report(0.0, 0.5)
         report["evaluation"]["version"] = 8

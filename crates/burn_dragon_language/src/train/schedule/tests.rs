@@ -348,9 +348,19 @@ fn constrained_correctness_counterfactual_target_requires_preference_change() {
         selected_index: 2,
         equivalent_indices: vec![2],
     };
+    let original_job = RuliadCorrectnessConstrainedPolicyJob {
+        difficulty_level: counterfactual_job.difficulty_level,
+        source_label: counterfactual_job.source_label.clone(),
+        presentations: counterfactual_job.presentations.clone(),
+        prompt_contexts: Vec::new(),
+        base_context: None,
+        selected_index: 1,
+        equivalent_indices: vec![1],
+    };
     let mut summary = RuliadCorrectnessConstrainedPolicySummary::default();
     record_ruliad_correctness_counterfactual_target(
         &mut summary,
+        &original_job,
         &counterfactual_job,
         &[0.1f32.ln(), 0.8f32.ln(), 0.1f32.ln()],
         &[0.1f32.ln(), 0.2f32.ln(), 0.7f32.ln()],
@@ -358,9 +368,32 @@ fn constrained_correctness_counterfactual_target_requires_preference_change() {
 
     assert_eq!(summary.counterfactual_target_items, 1);
     assert_eq!(summary.counterfactual_target_equivalent_top1, 1);
+    assert_eq!(summary.counterfactual_target_pair_correct, 1);
     assert_eq!(summary.counterfactual_target_top1_changes, 1);
     assert!(summary.counterfactual_target_equivalent_probability_gain_sum > 0.5);
     assert!(summary.counterfactual_target_js_divergence_sum > 0.0);
+
+    // Merely changing to another incorrect action must not count as solving the pair.
+    record_ruliad_correctness_counterfactual_target(
+        &mut summary,
+        &original_job,
+        &counterfactual_job,
+        &[0.1f32.ln(), 0.8f32.ln(), 0.1f32.ln()],
+        &[0.8f32.ln(), 0.1f32.ln(), 0.1f32.ln()],
+    );
+    assert_eq!(summary.counterfactual_target_top1_changes, 2);
+    assert_eq!(summary.counterfactual_target_equivalent_top1, 1);
+    assert_eq!(summary.counterfactual_target_pair_correct, 1);
+
+    record_ruliad_correctness_counterfactual_target(
+        &mut summary,
+        &original_job,
+        &counterfactual_job,
+        &[0.8f32.ln(), 0.1f32.ln(), 0.1f32.ln()],
+        &[0.1f32.ln(), 0.1f32.ln(), 0.8f32.ln()],
+    );
+    assert_eq!(summary.counterfactual_target_equivalent_top1, 2);
+    assert_eq!(summary.counterfactual_target_pair_correct, 1);
 }
 
 #[test]

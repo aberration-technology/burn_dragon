@@ -273,6 +273,9 @@ pub(crate) fn ruliad_proof_policy_prompt(
         crate::config::RuliadProofPolicyPromptContext::LocalActionState => {
             burn_dragon_universality::ruliad::ruliad_proof_action_local_prompt(problem, actions)
         }
+        crate::config::RuliadProofPolicyPromptContext::ExactActionState => {
+            burn_dragon_universality::ruliad::ruliad_proof_action_exact_prompt(problem, actions)
+        }
     }
 }
 
@@ -339,6 +342,10 @@ pub(crate) fn encode_ruliad_proof_action_request_with_rotations(
             .collect::<Vec<_>>();
         let original_prompt_token_count = prompt_tokens.len();
         if prompt_tokens.len() > maximum_prompt {
+            anyhow::ensure!(
+                prompt_context != crate::config::RuliadProofPolicyPromptContext::ExactActionState,
+                "exact_action_state requires {original_prompt_token_count} prompt tokens plus {maximum_completion} completion tokens, exceeding block_size={block_size}; exact observations cannot be cropped"
+            );
             prompt_tokens = prompt_tokens[prompt_tokens.len() - maximum_prompt..].to_vec();
         }
         if prompt_tokens.is_empty() {
@@ -2881,7 +2888,7 @@ mod tests {
     }
 
     #[test]
-    fn local_action_prompt_preserves_the_complete_state_when_full_context_must_crop() {
+    fn local_action_prompt_preserves_the_focused_observation_when_full_context_must_crop() {
         let bundle = burn_dragon_universality::ruliad::formal::generate_formal_bundle(
             61,
             burn_dragon_universality::ruliad::RuliadFormalGeneratorConfig {
@@ -2965,6 +2972,70 @@ mod tests {
             local.original_prompt_token_count < full.original_prompt_token_count,
             "local action state should remove the global proof serialization"
         );
+    }
+
+    #[test]
+    fn exact_action_state_rejects_cropping_and_round_trips_config() -> Result<()> {
+        use crate::config::{RuliadProofPolicyCandidateSymmetry, RuliadProofPolicyPromptContext};
+        use burn_dragon_universality::ruliad::{RuliadProofActionAnswerContract, formal::*};
+        let context = RuliadProofPolicyPromptContext::ExactActionState;
+        assert_eq!(serde_json::to_string(&context)?, "\"exact_action_state\"");
+        assert_eq!(
+            serde_json::from_str::<RuliadProofPolicyPromptContext>("\"exact_action_state\"")?,
+            context
+        );
+        let bundle = generate_formal_bundle(61, RuliadFormalGeneratorConfig::default())?;
+        let actions = burn_dragon_universality::ruliad::oracle_proof_action_set(
+            &bundle.problem,
+            &bundle.certificate,
+            0,
+            4,
+        )?;
+        let tokenization = burn_dragon_universality::RuliadTokenizationConfig::StructuredSymbolic {
+            vocab_size: 272,
+            eos_id: Some(271),
+        };
+        let encode = |block_size| {
+            encode_ruliad_proof_action_request_with_context(
+                &bundle.problem,
+                &actions,
+                RuliadProofActionAnswerContract::SemanticStep,
+                context,
+                RuliadProofPolicyCandidateSymmetry::CyclicOrbitAverage,
+                0,
+                &tokenization,
+                Some(271),
+                block_size,
+                128,
+            )
+        };
+        let unbounded = encode(16384)?;
+        let required = unbounded
+            .presentations
+            .iter()
+            .map(|presentation| {
+                assert_eq!(
+                    presentation.prompt_tokens.len(),
+                    presentation.original_prompt_token_count
+                );
+                presentation.prompt_tokens.len()
+                    + presentation
+                        .candidate_tokens
+                        .iter()
+                        .map(Vec::len)
+                        .max()
+                        .expect("encoded candidate actions")
+            })
+            .max()
+            .expect("encoded presentation orbit");
+        assert_eq!(encode(required)?, unbounded);
+        assert!(
+            encode(required - 1)
+                .expect_err("exact prompt must reject cropping")
+                .to_string()
+                .contains("exact observations cannot be cropped")
+        );
+        Ok(())
     }
 
     #[test]

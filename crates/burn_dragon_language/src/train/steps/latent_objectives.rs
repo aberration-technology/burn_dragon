@@ -237,6 +237,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         hidden: Tensor<B, 3>,
         target_hidden: Tensor<B, 3>,
         clean_inputs: Tensor<B, 2, Int>,
+        loss_mask: Option<Tensor<B, 2, Int>>,
     ) -> (Option<Tensor<B, 1>>, usize) {
         let config = &self.latent_reasoning.next_latent;
         if !config.enabled || !self.model.next_latent_transition_enabled() {
@@ -251,10 +252,32 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         if batch == 0 || time < 2 || dim == 0 {
             return (None, 0);
         }
+        let layout = self.next_latent_token_layout.as_ref().expect(
+            "NextLat requires the dataset tokenizer; call with_next_latent_tokenizer before training",
+        );
+        assert!(
+            matches!(
+                self.latent_reasoning.target_encoder,
+                crate::config::LatentReasoningTargetEncoder::DetachedStudent
+            ),
+            "NextLat currently requires same-pass detached_student targets"
+        );
+        assert!(
+            token_kl_weight <= f32::EPSILON || !self.model.uses_factorized_language_head(),
+            "NextLat token KL requires a flat language head"
+        );
         let max_horizon = config.horizon.min(time.saturating_sub(1));
         let mut rollout_state = hidden;
-        let mut total: Option<Tensor<B, 1>> = None;
-        let mut loss_components = 0usize;
+        let action_embeddings = self.model.embed_tokens(clean_inputs.clone());
+        let action_embeddings = if config.detach_action_embedding {
+            action_embeddings.detach()
+        } else {
+            action_embeddings
+        };
+        let mut transition_mask = layout.source_mask(clean_inputs.clone());
+        let destination_mask = layout.destination_mask(clean_inputs);
+        let mut regression = crate::train::next_latent::HorizonMean::new();
+        let mut token_kl = crate::train::next_latent::HorizonMean::new();
         let mut transition_components = 0usize;
         for horizon_index in 0..max_horizon {
             let rollout_time = time.saturating_sub(horizon_index + 1);
@@ -262,13 +285,15 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                 break;
             }
             let current = rollout_state.slice([0..batch, 0..rollout_time, 0..dim]);
-            let action_tokens = clean_inputs
-                .clone()
-                .slice([0..batch, horizon_index + 1..time]);
-            let mut action_embedding = self.model.embed_tokens(action_tokens);
-            if config.detach_action_embedding {
-                action_embedding = action_embedding.detach();
-            }
+            let action_embedding =
+                action_embeddings
+                    .clone()
+                    .slice([0..batch, horizon_index + 1..time, 0..dim]);
+            // Intersect every traversed token, not just the horizon endpoint.
+            transition_mask = transition_mask.slice([0..batch, 0..rollout_time])
+                * destination_mask
+                    .clone()
+                    .slice([0..batch, horizon_index + 1..time]);
             let Some(prediction) = self
                 .model
                 .next_latent_prediction_from_hidden_action(current, action_embedding)
@@ -280,39 +305,46 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                 .slice([0..batch, horizon_index + 1..time, 0..dim])
                 .detach();
             if regression_weight > f32::EPSILON {
-                let regression = crate::train::next_latent::smooth_l1_mean(
+                let values = crate::train::next_latent::smooth_l1_per_token(
                     prediction.clone(),
                     target.clone(),
                     config.smooth_l1_beta,
-                )
-                .mul_scalar(regression_weight);
-                total = Some(match total {
-                    Some(accumulated) => accumulated + regression,
-                    None => regression,
-                });
-                loss_components = loss_components.saturating_add(1);
+                );
+                regression.push(values, transition_mask.clone());
             }
-            if token_kl_weight > f32::EPSILON && !self.model.uses_factorized_language_head() {
-                let student_logits = self.model.logits_from_hidden(prediction.clone());
-                let teacher_logits = self.model.logits_from_hidden(target).detach();
-                let token_kl = crate::train::next_latent::token_kl_mean_from_logits(
-                    student_logits,
-                    teacher_logits,
-                )
-                .mul_scalar(token_kl_weight);
-                total = Some(match total {
-                    Some(accumulated) => accumulated + token_kl,
-                    None => token_kl,
-                });
-                loss_components = loss_components.saturating_add(1);
+            if token_kl_weight > f32::EPSILON {
+                let student_logits = self
+                    .model
+                    .logits_from_hidden_with_frozen_head(prediction.clone());
+                let teacher_logits = self
+                    .model
+                    .logits_from_hidden_with_frozen_head(target)
+                    .detach();
+                let values =
+                    crate::train::next_latent::token_kl_per_token(student_logits, teacher_logits);
+                let mask = match &loss_mask {
+                    Some(mask) => {
+                        transition_mask.clone()
+                            * mask.clone().slice([0..batch, horizon_index + 1..time])
+                    }
+                    None => transition_mask.clone(),
+                };
+                token_kl.push(values, mask);
             }
             rollout_state = prediction;
             transition_components = transition_components.saturating_add(1);
         }
-        (
-            total.map(|loss| loss.div_scalar(loss_components.max(1) as f32)),
-            transition_components,
-        )
+        let regression = regression
+            .finish()
+            .map(|loss| loss.mul_scalar(regression_weight));
+        let token_kl = token_kl
+            .finish()
+            .map(|loss| loss.mul_scalar(token_kl_weight));
+        let total = match (regression, token_kl) {
+            (Some(regression), Some(token_kl)) => Some(regression + token_kl),
+            (regression, token_kl) => regression.or(token_kl),
+        };
+        (total, transition_components)
     }
 
     pub(super) fn latent_energy_model_auxiliary_loss(
@@ -902,20 +934,17 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         let mut total: Option<Tensor<B, 1>> = None;
         let mut components = 0usize;
         let mut next_latent_components = 0usize;
+        let mut next_latent_total = None;
         if let Some(next_latent_aux_scale) = next_latent_aux_scale {
             let (next_latent_loss, active_components) = self.next_latent_auxiliary_loss(
                 hidden.clone(),
                 target_hidden.clone(),
                 clean_inputs.clone(),
+                loss_mask.clone(),
             );
             next_latent_components = active_components;
             if let Some(next_latent_loss) = next_latent_loss {
-                let next_latent_loss = next_latent_loss.mul_scalar(next_latent_aux_scale);
-                total = Some(match total {
-                    Some(accumulated) => accumulated + next_latent_loss,
-                    None => next_latent_loss,
-                });
-                components = components.saturating_add(1);
+                next_latent_total = Some(next_latent_loss.mul_scalar(next_latent_aux_scale));
             }
         }
         let mut jepa_components = 0usize;
@@ -991,7 +1020,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             components = components.saturating_add(1);
             sigreg_components = sigreg_components.saturating_add(1);
         }
-        if components > 0 {
+        if components > 0 || next_latent_components > 0 {
             crate::train::profile::record_latent_reasoning(
                 next_latent_components,
                 0,
@@ -1002,6 +1031,10 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                 self.model.latent_reasoning_config().max_steps,
             );
         }
-        total.map(|loss| loss.div_scalar(components.max(1) as f32))
+        let other = total.map(|loss| loss.div_scalar(components.max(1) as f32));
+        match (next_latent_total, other) {
+            (Some(next_latent), Some(other)) => Some(next_latent + other),
+            (next_latent, other) => next_latent.or(other),
+        }
     }
 }

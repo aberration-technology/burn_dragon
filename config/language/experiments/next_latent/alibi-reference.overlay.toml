@@ -1,0 +1,4 @@
+# Four-head reference ALiBi schedule. No implicit changes to old checkpoints.
+[model]
+rotary_embedding = "alibi"
+alibi_slopes = [0.25, 0.0625, 0.015625, 0.00390625]

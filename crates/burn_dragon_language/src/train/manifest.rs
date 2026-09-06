@@ -40,6 +40,16 @@ pub struct ExperimentLaunch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub immutable_training_contract_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_latent_objective_contract_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ruliad_supervision_audit_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ruliad_supervision_audit: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_model_tensor_fingerprint_schema: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_model_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planned_max_iters: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub horizon_extension: Option<ExperimentHorizonExtension>,
@@ -96,8 +106,14 @@ struct OwnedExperimentLaunchConfigSnapshot {
 }
 
 #[derive(Deserialize)]
-struct LegacySourceSelectionProgress {
-    absolute_step_offset: usize,
+#[serde(untagged)]
+enum SourceSelectionCheckpointProgress {
+    Clocked {
+        clock: crate::dataset::RuliadSourceSelectionClock,
+    },
+    Legacy {
+        absolute_step_offset: usize,
+    },
 }
 
 pub fn write_experiment_manifest(
@@ -106,6 +122,44 @@ pub fn write_experiment_manifest(
     run_dir: &Path,
     run_name: &str,
     backend: &str,
+) -> Result<()> {
+    write_experiment_manifest_with_supervision_audit(
+        config,
+        model_config,
+        run_dir,
+        run_name,
+        backend,
+        None,
+    )
+}
+
+pub fn write_experiment_manifest_with_supervision_audit(
+    config: &TrainingConfig,
+    model_config: &DragonConfig,
+    run_dir: &Path,
+    run_name: &str,
+    backend: &str,
+    ruliad_supervision_audit_sha256: Option<&str>,
+) -> Result<()> {
+    write_experiment_manifest_with_identities(
+        config,
+        model_config,
+        run_dir,
+        run_name,
+        backend,
+        ruliad_supervision_audit_sha256,
+        None,
+    )
+}
+
+pub fn write_experiment_manifest_with_identities(
+    config: &TrainingConfig,
+    model_config: &DragonConfig,
+    run_dir: &Path,
+    run_name: &str,
+    backend: &str,
+    ruliad_supervision_audit_sha256: Option<&str>,
+    initial_model_sha256: Option<&str>,
 ) -> Result<()> {
     fs::create_dir_all(run_dir)
         .with_context(|| format!("create experiment run directory {}", run_dir.display()))?;
@@ -116,6 +170,15 @@ pub fn write_experiment_manifest(
         effective_config_sha256: effective_config_sha256(config)?,
         training_contract_sha256: training_contract_sha256(config)?,
         immutable_training_contract_sha256: Some(immutable_training_contract_sha256(config)?),
+        next_latent_objective_contract_version: (config.training.latent_reasoning.enabled
+            && config.training.latent_reasoning.next_latent.enabled)
+            .then_some(crate::config::train::NEXT_LATENT_OBJECTIVE_CONTRACT_VERSION),
+        ruliad_supervision_audit_sha256: ruliad_supervision_audit_sha256.map(str::to_string),
+        ruliad_supervision_audit: ruliad_supervision_audit_sha256
+            .map(|_| PathBuf::from(super::utils::RULIAD_SUPERVISION_AUDIT_FILE_NAME)),
+        initial_model_tensor_fingerprint_schema: initial_model_sha256
+            .map(|_| super::model_identity::MODEL_TENSOR_FINGERPRINT_SCHEMA.to_string()),
+        initial_model_sha256: initial_model_sha256.map(str::to_string),
         planned_max_iters: Some(config.training.max_iters),
         horizon_extension: None,
         launch_mode: config.training.launch_mode,
@@ -157,11 +220,46 @@ pub fn write_experiment_manifest(
             ));
         }
         if let Some(previous) = existing.launches.last()
+            && previous.next_latent_objective_contract_version
+                != launch.next_latent_objective_contract_version
+        {
+            return Err(anyhow!(
+                "NextLat objective contract changed in {}: existing={:?}, requested={:?}; start an explicit weights-only transfer run instead of an exact resume",
+                path.display(),
+                previous.next_latent_objective_contract_version,
+                launch.next_latent_objective_contract_version,
+            ));
+        }
+        if let Some(previous) = existing.launches.last()
             && previous.training_contract_sha256 != launch.training_contract_sha256
         {
             launch.horizon_extension = Some(validate_horizon_extension(
                 config, run_dir, &existing, previous, &launch,
             )?);
+        }
+        if let Some(previous) = existing.launches.last()
+            && previous.ruliad_supervision_audit_sha256 != launch.ruliad_supervision_audit_sha256
+        {
+            return Err(anyhow!(
+                "experiment Ruliad supervision audit mismatch in {}: existing={:?}, requested={:?}",
+                path.display(),
+                previous.ruliad_supervision_audit_sha256,
+                launch.ruliad_supervision_audit_sha256,
+            ));
+        }
+        if let Some(requested) = launch.initial_model_sha256.as_deref()
+            && let Some(recorded) = existing
+                .launches
+                .iter()
+                .find_map(|previous| previous.initial_model_sha256.as_deref())
+            && recorded != requested
+        {
+            return Err(anyhow!(
+                "experiment initial model identity mismatch in {}: existing={}, requested={}",
+                path.display(),
+                recorded,
+                requested,
+            ));
         }
         existing
     } else {
@@ -202,6 +300,7 @@ fn effective_config_sha256(config: &TrainingConfig) -> Result<String> {
 
 fn training_contract_sha256(config: &TrainingConfig) -> Result<String> {
     let mut contract = config.clone();
+    contract.training.provenance = Default::default();
     contract.training.launch_mode = Default::default();
     contract.training.resume_run_dir = None;
     contract.training.resume_checkpoint_epoch = None;
@@ -367,12 +466,17 @@ fn checkpoint_completed_steps(
         .join("checkpoint")
         .join(format!("source-selection-state-{epoch}.json"));
     if source_path.is_file() {
-        let progress: LegacySourceSelectionProgress =
+        let progress: SourceSelectionCheckpointProgress =
             serde_json::from_slice(&fs::read(&source_path).with_context(|| {
                 format!("read legacy source progress {}", source_path.display())
             })?)
             .with_context(|| format!("parse legacy source progress {}", source_path.display()))?;
-        return Ok(progress.absolute_step_offset.saturating_add(1));
+        return Ok(match progress {
+            SourceSelectionCheckpointProgress::Clocked { clock } => clock.completed_run_steps,
+            SourceSelectionCheckpointProgress::Legacy {
+                absolute_step_offset,
+            } => absolute_step_offset.saturating_add(1),
+        });
     }
 
     Ok(epoch
@@ -527,6 +631,217 @@ fn write_json_atomically(path: &Path, value: &impl Serialize) -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::load_training_config;
+
+    #[test]
+    fn alibi_schedule_change_is_not_an_exact_resume_or_horizon_extension() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut config = load_training_config(&[
+            workspace.join("config/language/experiments/next_latent/capacity-base.toml")
+        ])
+        .unwrap();
+        let write = |config: &TrainingConfig| {
+            let model = crate::build_model_config(&config.model, config.training.block_size);
+            write_experiment_manifest(
+                config,
+                &model,
+                directory.path(),
+                "alibi-contract",
+                "ndarray",
+            )
+        };
+        write(&config).unwrap();
+        write(&config).unwrap();
+        config.model.alibi_slopes = Some(vec![0.25, 0.0625, 0.015625, 0.00390625]);
+        assert!(write(&config).unwrap_err().to_string().contains("contract"));
+        config.training.resume_horizon_extension.enabled = true;
+        config.training.max_iters *= 2;
+        assert!(write(&config).is_err());
+    }
+
+    #[test]
+    fn next_latent_objective_revision_cannot_silently_resume_an_old_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut config = load_training_config(&[
+            workspace.join("config/language/experiments/predictive_coding/local-pc-smoke.toml")
+        ])
+        .unwrap();
+        config.training.latent_reasoning.enabled = true;
+        config.training.latent_reasoning.next_latent.enabled = true;
+        let tokenizer = config.dataset.tokenizer.load(&workspace).unwrap();
+        let model_config = crate::build_model_config_with_tokenizer(
+            &config.model,
+            config.training.block_size,
+            tokenizer.as_ref(),
+        )
+        .unwrap();
+        let write = |config: &TrainingConfig| {
+            write_experiment_manifest(
+                config,
+                &model_config,
+                directory.path(),
+                "nextlat-revision",
+                "ndarray",
+            )
+        };
+        write(&config).unwrap();
+        write(&config).unwrap();
+        let path = directory.path().join(EXPERIMENT_MANIFEST_FILE_NAME);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            manifest["launches"][1]["next_latent_objective_contract_version"],
+            2
+        );
+        for launch in manifest["launches"].as_array_mut().unwrap() {
+            launch
+                .as_object_mut()
+                .unwrap()
+                .remove("next_latent_objective_contract_version");
+        }
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        config.training.resume_horizon_extension.enabled = true;
+        config.training.max_iters *= 2;
+        let error = write(&config).unwrap_err().to_string();
+        assert!(
+            error.contains("NextLat objective contract changed"),
+            "{error}"
+        );
+        assert!(error.contains("weights-only transfer"), "{error}");
+    }
+
+    #[test]
+    fn provenance_capture_does_not_change_the_resume_contract() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut config = load_training_config(&[
+            workspace.join("config/language/experiments/predictive_coding/local-pc-smoke.toml")
+        ])
+        .unwrap();
+        let original = training_contract_sha256(&config).unwrap();
+        let effective = effective_config_sha256(&config).unwrap();
+        let serialized = serde_json::to_value(&config).unwrap();
+        assert!(serialized["training"].get("provenance").is_none());
+        config.training.provenance.initial_model_fingerprint = false;
+        assert_eq!(original, training_contract_sha256(&config).unwrap());
+        assert_ne!(effective, effective_config_sha256(&config).unwrap());
+    }
+
+    #[test]
+    fn experiment_manifest_rejects_a_changed_supervision_audit() {
+        let directory = tempfile::tempdir().expect("temporary run directory");
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let config = load_training_config(&[
+            workspace.join("config/language/experiments/predictive_coding/local-pc-smoke.toml"),
+            workspace.join(
+                "config/language/experiments/predictive_coding/pc-fixed-prediction.overlay.toml",
+            ),
+        ])
+        .expect("training config");
+        let tokenizer = config
+            .dataset
+            .tokenizer
+            .load(&workspace)
+            .expect("tokenizer");
+        let model_config = crate::build_model_config_with_tokenizer(
+            &config.model,
+            config.training.block_size,
+            tokenizer.as_ref(),
+        )
+        .expect("model config");
+
+        write_experiment_manifest_with_supervision_audit(
+            &config,
+            &model_config,
+            directory.path(),
+            "audit-manifest-test",
+            "ndarray",
+            Some("audit-a"),
+        )
+        .expect("first audited launch");
+        let error = write_experiment_manifest_with_supervision_audit(
+            &config,
+            &model_config,
+            directory.path(),
+            "audit-manifest-test",
+            "ndarray",
+            Some("audit-b"),
+        )
+        .expect_err("a checkpoint run must retain its startup supervision identity");
+        assert!(
+            error
+                .to_string()
+                .contains("Ruliad supervision audit mismatch"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn experiment_manifest_records_and_preserves_initial_model_identity() {
+        let directory = tempfile::tempdir().expect("temporary run directory");
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let config = load_training_config(&[
+            workspace.join("config/language/experiments/predictive_coding/local-pc-smoke.toml"),
+            workspace.join(
+                "config/language/experiments/predictive_coding/pc-fixed-prediction.overlay.toml",
+            ),
+        ])
+        .expect("training config");
+        let tokenizer = config
+            .dataset
+            .tokenizer
+            .load(&workspace)
+            .expect("tokenizer");
+        let model_config = crate::build_model_config_with_tokenizer(
+            &config.model,
+            config.training.block_size,
+            tokenizer.as_ref(),
+        )
+        .expect("model config");
+
+        write_experiment_manifest_with_identities(
+            &config,
+            &model_config,
+            directory.path(),
+            "model-identity-manifest-test",
+            "ndarray",
+            None,
+            Some("initial-a"),
+        )
+        .expect("first launch with model identity");
+        let manifest: ExperimentManifest = serde_json::from_slice(
+            &fs::read(directory.path().join(EXPERIMENT_MANIFEST_FILE_NAME))
+                .expect("read experiment manifest"),
+        )
+        .expect("parse experiment manifest");
+        assert_eq!(
+            manifest.launches[0]
+                .initial_model_tensor_fingerprint_schema
+                .as_deref(),
+            Some(crate::train::model_identity::MODEL_TENSOR_FINGERPRINT_SCHEMA)
+        );
+        assert_eq!(
+            manifest.launches[0].initial_model_sha256.as_deref(),
+            Some("initial-a")
+        );
+
+        let error = write_experiment_manifest_with_identities(
+            &config,
+            &model_config,
+            directory.path(),
+            "model-identity-manifest-test",
+            "ndarray",
+            None,
+            Some("initial-b"),
+        )
+        .expect_err("a run cannot change its recorded initial model identity");
+        assert!(
+            error
+                .to_string()
+                .contains("initial model identity mismatch"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn experiment_manifest_appends_launches_without_replacing_identity() {

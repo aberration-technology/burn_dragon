@@ -39,7 +39,26 @@ prompt = ""
 fn default_objective_is_next_token() {
     let config = parse_config("");
     assert!(config.training.objective.is_next_token());
+    assert_eq!(
+        config.training.ruliad_supervision.proof_policy.target,
+        crate::config::RuliadProofPolicyTarget::ExpertSet
+    );
     config.validate().expect("default objective validates");
+}
+
+#[test]
+fn validation_batch_budget_rejects_zero_before_launch() {
+    let mut config = parse_config("");
+    config.training.validation.batches = Some(0);
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("training.validation.batches must be > 0")
+    );
+    config.training.validation.batches = Some(128);
+    config.validate().expect("explicit validation budget");
 }
 
 #[test]
@@ -165,6 +184,59 @@ fn explicit_streaming_batching_is_independent_of_state_persistence() {
             .sequence_batching
             .uses_streaming_loader(config.training.tbptt_persist_across_steps)
     );
+}
+
+#[test]
+fn stateless_streaming_rejects_answer_masked_noop_updates() {
+    let mut config = parse_config("sequence_batching = \"streaming\"");
+    config.dataset.source = crate::config::DatasetSourceConfig::UniversalityRuliad {
+        config: PathBuf::from("ruliad.toml"),
+    };
+    config.training.ruliad_supervision.mode =
+        crate::config::RuliadSupervisionMode::AnswerCompletion;
+    let error = config
+        .validate()
+        .expect_err("stateless streamed context-only batches must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("zero-gradient optimizer updates")
+    );
+
+    config.training.sequence_batching = crate::config::SequenceBatchingMode::Random;
+    config
+        .validate()
+        .expect("random answer windows should retain supervised targets per update");
+}
+
+#[test]
+fn ruliad_live_documents_per_step_is_positive_and_source_scoped() {
+    let mut config = parse_config("");
+    config.dataset.ruliad_source_selection_documents_per_step = Some(8);
+    assert!(
+        config
+            .validate()
+            .expect_err("the live Ruliad control must not leak into other datasets")
+            .to_string()
+            .contains("requires dataset.type=\"universality_ruliad\"")
+    );
+
+    config.dataset.source = crate::config::DatasetSourceConfig::UniversalityRuliad {
+        config: PathBuf::from("ruliad.toml"),
+    };
+    config.dataset.ruliad_source_selection_documents_per_step = Some(0);
+    assert!(
+        config
+            .validate()
+            .expect_err("zero live documents cannot produce a batch")
+            .to_string()
+            .contains("must be > 0")
+    );
+
+    config.dataset.ruliad_source_selection_documents_per_step = Some(8);
+    config
+        .validate()
+        .expect("a positive Ruliad live-document bound should validate");
 }
 
 #[test]
@@ -383,6 +455,48 @@ fn next_latent_training_does_not_require_inference_latent_reasoning() {
     config
         .validate()
         .expect("NextLat transition training should not require model.latent_reasoning");
+}
+
+#[test]
+fn next_latent_rejects_unsupported_target_and_memory_contracts() {
+    let mut base = parse_config("");
+    base.model.next_latent_transition = Some(Default::default());
+    base.model.next_latent_transition.as_mut().unwrap().enabled = true;
+    base.training.latent_reasoning.enabled = true;
+    base.training.latent_reasoning.jepa_future_offsets.clear();
+    base.training.latent_reasoning.sigreg.enabled = false;
+    base.training.latent_reasoning.next_latent.enabled = true;
+    base.validate().unwrap();
+
+    let mut ema = base.clone();
+    ema.training.latent_reasoning.target_encoder =
+        crate::config::LatentReasoningTargetEncoder::EmaTeacher;
+    assert!(
+        ema.validate()
+            .unwrap_err()
+            .to_string()
+            .contains("stream history")
+    );
+
+    let mut corrupt = base.clone();
+    corrupt.training.input_corruption.enabled = true;
+    assert!(
+        corrupt
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("same-pass target")
+    );
+
+    let mut auto_batch = base;
+    auto_batch.training.auto_batch_size.enabled = true;
+    assert!(
+        auto_batch
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("latent auxiliary memory")
+    );
 }
 
 #[test]
@@ -1297,6 +1411,103 @@ fn backpropagation_accepts_the_matched_static_verifier_terminal() {
 }
 
 #[test]
+fn proof_policy_probe_rejects_a_different_prompt_context() {
+    let mut config = verifier_terminal_config();
+    config.training.ruliad_policy_probe.enabled = true;
+    config.training.ruliad_policy_probe.prompt_context =
+        crate::config::RuliadProofPolicyPromptContext::LocalActionState;
+
+    let error = config
+        .validate()
+        .expect_err("training and evaluation must share one proof-policy prompt contract");
+    assert!(
+        error.to_string().contains("prompt_context must match"),
+        "unexpected error: {error}"
+    );
+
+    config
+        .training
+        .ruliad_supervision
+        .proof_policy
+        .prompt_context = crate::config::RuliadProofPolicyPromptContext::LocalActionState;
+    config
+        .validate()
+        .expect("matching local-action training and probe prompts should validate");
+}
+
+#[test]
+fn required_proof_policy_update_requires_the_policy_to_be_enabled() {
+    let mut config = parse_config("");
+    config
+        .training
+        .ruliad_supervision
+        .proof_policy
+        .require_scheduled_update = true;
+    let error = config
+        .validate()
+        .expect_err("a disabled policy cannot promise scheduled updates");
+    assert!(
+        error
+            .to_string()
+            .contains("require_scheduled_update requires proof_policy.enabled=true"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn joint_verifier_terminal_supports_full_block_streams_and_owns_the_objective() {
+    let mut config = verifier_terminal_config();
+    config.training.local_predictive_coding.terminal_criterion =
+        crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSetJoint;
+    config.training.tbptt_chunk_size = Some(config.training.block_size);
+    config
+        .validate()
+        .expect("full-block stateless joint terminals should validate");
+
+    config.training.tbptt_persist_across_steps = true;
+    config.training.sequence_batching = crate::config::SequenceBatchingMode::Streaming;
+    config
+        .validate()
+        .expect("joint factors should preserve stream state across complete loader blocks");
+    config.training.tbptt_chunk_size = Some(config.training.block_size / 2);
+    config.training.local_predictive_coding.solver =
+        crate::config::LocalPredictiveCodingSolver::FixedPrediction;
+    config.training.local_predictive_coding.temporal_credit = burn_pc::PcTemporalCreditConfig {
+        mode: burn_pc::PcTemporalCreditMode::ExactWindow,
+        window_chunks: 2,
+    };
+    config
+        .validate()
+        .expect("joint verifier factors should compose with explicit exact rho credit");
+    config.training.algorithm = TrainingAlgorithm::Backpropagation;
+    assert!(
+        config
+            .validate()
+            .expect_err("backprop joint factors must not silently split one scheduled objective")
+            .to_string()
+            .contains("full-block TBPTT chunk")
+    );
+    config.training.algorithm = TrainingAlgorithm::PredictiveCoding;
+    config.training.local_predictive_coding.temporal_credit =
+        burn_pc::PcTemporalCreditConfig::default();
+    config.training.tbptt_persist_across_steps = false;
+    config.training.sequence_batching = crate::config::SequenceBatchingMode::Auto;
+    config.training.tbptt_chunk_size = Some(config.training.block_size);
+    config
+        .training
+        .ruliad_supervision
+        .prompt_value_binding
+        .enabled = true;
+    assert!(
+        config
+            .validate_ruliad_verifier_terminal(true)
+            .expect_err("the two-factor contract must reject a third replacement objective")
+            .to_string()
+            .contains("owns the complete two-factor objective")
+    );
+}
+
+#[test]
 fn backpropagation_accepts_model_visited_verifier_terminals() {
     for mode in [
         crate::config::RuliadProofPolicyTrainingMode::Dagger,
@@ -1331,7 +1542,7 @@ fn backpropagation_accepts_counterfactual_semantic_energy_verifier_terminal() {
 }
 
 #[test]
-fn fixed_prediction_accepts_exact_semantic_energy_verifier_terminal() {
+fn local_pc_solvers_accept_semantic_and_residual_energy_verifier_terminals() {
     let mut config = verifier_terminal_config();
     config.model.sequence_score_head = Some(burn_dragon_core::SequenceScoreHeadConfig {
         enabled: true,
@@ -1344,25 +1555,486 @@ fn fixed_prediction_accepts_exact_semantic_energy_verifier_terminal() {
     policy.normalization = crate::config::RuliadProofPolicyNormalization::CandidateConditional;
     policy.counterfactual_targets_per_state = 1;
 
-    config
-        .validate()
-        .expect("fixed-prediction PC should accept its analytic sequence-energy VJP");
+    for solver in [
+        crate::config::LocalPredictiveCodingSolver::SynchronousEquilibrium,
+        crate::config::LocalPredictiveCodingSolver::ReverseGaussSeidel,
+        crate::config::LocalPredictiveCodingSolver::FixedPrediction,
+        crate::config::LocalPredictiveCodingSolver::ErrorEquilibrium,
+        crate::config::LocalPredictiveCodingSolver::AugmentedLagrangian,
+    ] {
+        let mut supported = config.clone();
+        supported.training.local_predictive_coding.solver = solver;
+        if solver == crate::config::LocalPredictiveCodingSolver::SynchronousEquilibrium {
+            let layers = supported
+                .model
+                .n_layer
+                .unwrap_or_else(|| burn_dragon_core::DragonConfig::default().n_layer);
+            supported.training.local_predictive_coding.inference.steps = layers + 1;
+        }
+        supported
+            .validate()
+            .unwrap_or_else(|error| panic!("{solver:?} semantic terminal: {error}"));
+    }
 
-    let mut unsupported_solver = config.clone();
-    unsupported_solver.training.local_predictive_coding.solver =
-        crate::config::LocalPredictiveCodingSolver::ErrorEquilibrium;
-    let error = unsupported_solver
+    let mut isolated_fixed = config.clone();
+    isolated_fixed.training.local_predictive_coding.solver =
+        crate::config::LocalPredictiveCodingSolver::FixedPrediction;
+    isolated_fixed
+        .training
+        .ruliad_supervision
+        .proof_policy
+        .gradient_scope = crate::config::RuliadProofPolicyGradientScope::ScoreHeadOnly;
+    isolated_fixed
         .validate()
-        .expect_err("equilibrium PC does not register sequence-score-head derivatives");
-    assert!(error.to_string().contains("fixed-prediction PC"), "{error}");
+        .expect("fixed-prediction PC should support an isolated semantic score head");
+
+    for solver in [
+        crate::config::LocalPredictiveCodingSolver::SynchronousEquilibrium,
+        crate::config::LocalPredictiveCodingSolver::ReverseGaussSeidel,
+    ] {
+        let mut isolated = isolated_fixed.clone();
+        isolated.training.local_predictive_coding.solver = solver;
+        if solver == crate::config::LocalPredictiveCodingSolver::SynchronousEquilibrium {
+            let layers = isolated
+                .model
+                .n_layer
+                .unwrap_or_else(|| burn_dragon_core::DragonConfig::default().n_layer);
+            isolated.training.local_predictive_coding.inference.steps = layers + 1;
+        }
+        isolated
+            .validate()
+            .unwrap_or_else(|error| panic!("{solver:?} isolated score head: {error}"));
+    }
+
+    for solver in [
+        crate::config::LocalPredictiveCodingSolver::ErrorEquilibrium,
+        crate::config::LocalPredictiveCodingSolver::AugmentedLagrangian,
+    ] {
+        let mut unsupported = isolated_fixed.clone();
+        unsupported.training.local_predictive_coding.solver = solver;
+        let error = unsupported
+            .validate()
+            .expect_err("non-equilibrium PC does not provide strict score-head isolation");
+        assert!(
+            error
+                .to_string()
+                .contains("error-equilibrium/augmented-Lagrangian"),
+            "{solver:?}: {error}"
+        );
+    }
+
+    let mut depth_truncated_alm = config.clone();
+    depth_truncated_alm.training.local_predictive_coding.solver =
+        crate::config::LocalPredictiveCodingSolver::AugmentedLagrangian;
+    depth_truncated_alm
+        .training
+        .local_predictive_coding
+        .augmented_lagrangian
+        .steps = depth_truncated_alm
+        .model
+        .n_layer
+        .unwrap_or_else(|| burn_dragon_core::DragonConfig::default().n_layer);
+    let error = depth_truncated_alm
+        .validate()
+        .expect_err("ALM terminal credit must reach the embedding");
+    assert!(
+        error.to_string().contains("steps > model.n_layer"),
+        "{error}"
+    );
+
+    let mut depth_truncated_synchronous = config.clone();
+    depth_truncated_synchronous
+        .training
+        .local_predictive_coding
+        .solver = crate::config::LocalPredictiveCodingSolver::SynchronousEquilibrium;
+    depth_truncated_synchronous
+        .training
+        .local_predictive_coding
+        .inference
+        .steps = depth_truncated_synchronous
+        .model
+        .n_layer
+        .unwrap_or_else(|| burn_dragon_core::DragonConfig::default().n_layer);
+    let error = depth_truncated_synchronous
+        .validate()
+        .expect_err("synchronous terminal credit must reach the embedding");
+    assert!(
+        error.to_string().contains("steps > model.n_layer"),
+        "{error}"
+    );
 
     let mut residual = config;
     residual.training.ruliad_supervision.proof_policy.scoring =
         crate::config::RuliadProofPolicyScoring::ResidualEnergy;
-    let error = residual
+    for solver in [
+        crate::config::LocalPredictiveCodingSolver::SynchronousEquilibrium,
+        crate::config::LocalPredictiveCodingSolver::ReverseGaussSeidel,
+        crate::config::LocalPredictiveCodingSolver::FixedPrediction,
+        crate::config::LocalPredictiveCodingSolver::ErrorEquilibrium,
+        crate::config::LocalPredictiveCodingSolver::AugmentedLagrangian,
+    ] {
+        let mut supported = residual.clone();
+        supported.training.local_predictive_coding.solver = solver;
+        if solver == crate::config::LocalPredictiveCodingSolver::SynchronousEquilibrium {
+            let layers = supported
+                .model
+                .n_layer
+                .unwrap_or_else(|| burn_dragon_core::DragonConfig::default().n_layer);
+            supported.training.local_predictive_coding.inference.steps = layers + 1;
+        }
+        supported
+            .validate()
+            .unwrap_or_else(|error| panic!("{solver:?} residual terminal: {error}"));
+    }
+
+    residual.training.local_predictive_coding.solver =
+        crate::config::LocalPredictiveCodingSolver::FixedPrediction;
+    residual
+        .training
+        .ruliad_supervision
+        .proof_policy
+        .gradient_scope = crate::config::RuliadProofPolicyGradientScope::ScoreHeadOnly;
+    residual
         .validate()
-        .expect_err("residual energy also needs an analytic autoregressive-prior VJP");
-    assert!(error.to_string().contains("fixed-prediction PC"), "{error}");
+        .expect("fixed-prediction PC should support an isolated residual score head");
+}
+
+#[test]
+fn local_pc_objective_routing_is_explicit_and_restricted() {
+    let mut routed = verifier_terminal_config();
+    routed.model.sequence_score_head = Some(burn_dragon_core::SequenceScoreHeadConfig {
+        enabled: true,
+        projection_dim: 64,
+    });
+    routed.training.local_predictive_coding.solver =
+        crate::config::LocalPredictiveCodingSolver::ErrorEquilibrium;
+    routed
+        .training
+        .local_predictive_coding
+        .objective_routing
+        .next_token_solver = Some(crate::config::LocalPredictiveCodingSolver::FixedPrediction);
+    routed.training.local_predictive_coding.terminal_criterion =
+        crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSetJoint;
+    let policy = &mut routed.training.ruliad_supervision.proof_policy;
+    policy.scoring = crate::config::RuliadProofPolicyScoring::ResidualEnergy;
+    policy.gradient_scope = crate::config::RuliadProofPolicyGradientScope::FullModel;
+    policy.normalization = crate::config::RuliadProofPolicyNormalization::CandidateConditional;
+
+    routed
+        .validate()
+        .expect("ePC verifier plus fixed-prediction next-token routing should be executable");
+
+    let mut no_scheduled_verifier = routed.clone();
+    no_scheduled_verifier
+        .training
+        .local_predictive_coding
+        .terminal_criterion = crate::config::LocalPredictiveCodingTerminalCriterion::NextToken;
+    let error = no_scheduled_verifier
+        .validate()
+        .expect_err("a route cannot hide an otherwise unused top-level solver");
+    assert!(error.to_string().contains("requires a verifier terminal"));
+
+    let mut unsupported_route = routed;
+    unsupported_route
+        .training
+        .local_predictive_coding
+        .objective_routing
+        .next_token_solver = Some(crate::config::LocalPredictiveCodingSolver::ErrorEquilibrium);
+    let error = unsupported_route
+        .validate()
+        .expect_err("unvalidated objective routes must fail closed");
+    assert!(error.to_string().contains("currently requires"));
+}
+
+#[test]
+fn verified_progress_policy_requires_candidate_conditional_sequence_scoring() {
+    let mut config = verifier_terminal_config();
+    config.training.ruliad_supervision.proof_policy.target =
+        crate::config::RuliadProofPolicyTarget::VerifiedProgressDistribution;
+    let error = config
+        .validate()
+        .expect_err("token-completion scoring cannot represent dense semantic progress");
+    assert!(
+        error
+            .to_string()
+            .contains("verified_progress_distribution requires semantic/residual energy"),
+        "{error}"
+    );
+
+    config.model.sequence_score_head = Some(burn_dragon_core::SequenceScoreHeadConfig {
+        enabled: true,
+        projection_dim: 64,
+    });
+    let policy = &mut config.training.ruliad_supervision.proof_policy;
+    policy.scoring = crate::config::RuliadProofPolicyScoring::ResidualEnergy;
+    policy.normalization = crate::config::RuliadProofPolicyNormalization::CandidateConditional;
+    config
+        .validate()
+        .expect("residual energy can fit the verifier progress distribution");
+}
+
+#[test]
+fn residual_policy_calibrates_the_deployed_decoder_before_paired_dagger() {
+    let mut config = verifier_terminal_config();
+    config.model.sequence_score_head = Some(burn_dragon_core::SequenceScoreHeadConfig {
+        enabled: true,
+        projection_dim: 64,
+    });
+    let policy = &mut config.training.ruliad_supervision.proof_policy;
+    policy.mode = crate::config::RuliadProofPolicyTrainingMode::StaticThenPairedDagger;
+    policy.scoring = crate::config::RuliadProofPolicyScoring::ResidualEnergy;
+    policy.decoder_calibration_steps = 128;
+    policy.target = crate::config::RuliadProofPolicyTarget::VerifiedProgressDistribution;
+    policy.gradient_scope = crate::config::RuliadProofPolicyGradientScope::FullModel;
+    policy.normalization = crate::config::RuliadProofPolicyNormalization::CandidateConditional;
+    policy.counterfactual_targets_per_state = 1;
+    policy.counterfactual_objective =
+        crate::config::RuliadProofPolicyCounterfactualObjective::TargetGroupConditional;
+    policy.every_steps = 4;
+    policy.start_after_steps = 0;
+    policy.dagger_start_after_steps = 128;
+    config
+        .validate()
+        .expect("decoder calibration should be a cadence-aligned static phase");
+
+    let supervision = config.training.ruliad_supervision;
+    let calibrated = supervision.proof_policy_for_step(124);
+    assert_eq!(
+        calibrated.scoring,
+        crate::config::RuliadProofPolicyScoring::CompletionLikelihood
+    );
+    assert_eq!(
+        calibrated.target,
+        crate::config::RuliadProofPolicyTarget::ExpertSet
+    );
+    assert_eq!(
+        calibrated.gradient_scope,
+        crate::config::RuliadProofPolicyGradientScope::FullModel
+    );
+    assert_eq!(
+        calibrated.normalization,
+        crate::config::RuliadProofPolicyNormalization::VocabularyMarginal
+    );
+    assert_eq!(
+        calibrated.counterfactual_objective,
+        crate::config::RuliadProofPolicyCounterfactualObjective::Independent
+    );
+    let residual = supervision.proof_policy_for_step(128);
+    assert_eq!(
+        residual.scoring,
+        crate::config::RuliadProofPolicyScoring::ResidualEnergy
+    );
+    assert_eq!(
+        residual.target,
+        crate::config::RuliadProofPolicyTarget::VerifiedProgressDistribution
+    );
+    assert_eq!(
+        residual.counterfactual_objective,
+        crate::config::RuliadProofPolicyCounterfactualObjective::TargetGroupConditional
+    );
+
+    config
+        .training
+        .ruliad_supervision
+        .proof_policy
+        .decoder_calibration_steps = 132;
+    assert!(
+        config
+            .validate()
+            .expect_err("decoder calibration may not overlap paired DAgger")
+            .to_string()
+            .contains("finish no later")
+    );
+}
+
+#[test]
+fn target_group_joint_alternates_normalized_objectives_after_decoder_calibration() {
+    let mut config = verifier_terminal_config();
+    config.model.sequence_score_head = Some(burn_dragon_core::SequenceScoreHeadConfig {
+        enabled: true,
+        projection_dim: 64,
+    });
+    let policy = &mut config.training.ruliad_supervision.proof_policy;
+    policy.mode = crate::config::RuliadProofPolicyTrainingMode::StaticThenPairedDagger;
+    policy.scoring = crate::config::RuliadProofPolicyScoring::ResidualEnergy;
+    policy.decoder_calibration_steps = 128;
+    policy.target = crate::config::RuliadProofPolicyTarget::VerifiedProgressDistribution;
+    policy.gradient_scope = crate::config::RuliadProofPolicyGradientScope::PolicyPath;
+    policy.normalization = crate::config::RuliadProofPolicyNormalization::CandidateConditional;
+    policy.counterfactual_targets_per_state = 1;
+    policy.counterfactual_objective =
+        crate::config::RuliadProofPolicyCounterfactualObjective::TargetGroupJoint;
+    policy.every_steps = 4;
+    policy.start_after_steps = 0;
+    policy.dagger_start_after_steps = 128;
+    config
+        .validate()
+        .expect("joint objective should satisfy the paired-policy contract");
+
+    let supervision = config.training.ruliad_supervision;
+    assert_eq!(
+        supervision
+            .proof_policy_for_step(124)
+            .counterfactual_objective,
+        crate::config::RuliadProofPolicyCounterfactualObjective::Independent,
+        "decoder calibration always identifies the full-vocabulary decoder"
+    );
+    assert_eq!(
+        supervision.proof_policy_for_step(124).gradient_scope,
+        crate::config::RuliadProofPolicyGradientScope::FullModel,
+        "decoder calibration must reach the deployed language model"
+    );
+    assert_eq!(
+        supervision
+            .proof_policy_for_step(128)
+            .counterfactual_objective,
+        crate::config::RuliadProofPolicyCounterfactualObjective::Independent,
+        "the first post-calibration update preserves full-menu validity"
+    );
+    assert_eq!(
+        supervision.proof_policy_for_step(128).gradient_scope,
+        crate::config::RuliadProofPolicyGradientScope::PolicyPath,
+        "the configured continuation scope must resume after calibration"
+    );
+    assert_eq!(
+        supervision
+            .proof_policy_for_step(132)
+            .counterfactual_objective,
+        crate::config::RuliadProofPolicyCounterfactualObjective::TargetGroupConditional,
+        "the next scheduled update identifies target binding"
+    );
+    assert_eq!(
+        supervision
+            .proof_policy_for_step(136)
+            .counterfactual_objective,
+        crate::config::RuliadProofPolicyCounterfactualObjective::Independent,
+        "the estimator must alternate by scheduled update rather than raw step"
+    );
+}
+
+#[test]
+fn factorized_joint_routes_autoregressive_and_residual_factors_separately() {
+    use crate::config::{
+        RuliadProofPolicyCounterfactualObjective, RuliadProofPolicyGradientScope,
+        RuliadProofPolicyNormalization, RuliadProofPolicyScoring, RuliadProofPolicyTarget,
+        RuliadProofPolicyTrainingMode,
+    };
+
+    let mut config = verifier_terminal_config();
+    config.model.sequence_score_head = Some(burn_dragon_core::SequenceScoreHeadConfig {
+        enabled: true,
+        projection_dim: 64,
+    });
+    let policy = &mut config.training.ruliad_supervision.proof_policy;
+    policy.mode = RuliadProofPolicyTrainingMode::StaticThenPairedDagger;
+    policy.scoring = RuliadProofPolicyScoring::ResidualEnergy;
+    policy.decoder_calibration_steps = 128;
+    policy.target = RuliadProofPolicyTarget::ExpertSet;
+    policy.gradient_scope = RuliadProofPolicyGradientScope::ScoreHeadOnly;
+    policy.normalization = RuliadProofPolicyNormalization::CandidateConditional;
+    policy.counterfactual_targets_per_state = 1;
+    policy.counterfactual_objective = RuliadProofPolicyCounterfactualObjective::FactorizedJoint;
+    policy.every_steps = 4;
+    policy.start_after_steps = 0;
+    policy.dagger_start_after_steps = 128;
+    config
+        .validate()
+        .expect("factorized joint objective should satisfy the paired-policy contract");
+
+    let supervision = config.training.ruliad_supervision;
+    let calibration = supervision.proof_policy_for_step(124);
+    assert_eq!(
+        calibration.counterfactual_objective,
+        RuliadProofPolicyCounterfactualObjective::Independent
+    );
+    assert_eq!(
+        calibration.scoring,
+        RuliadProofPolicyScoring::CompletionLikelihood
+    );
+    assert_eq!(
+        calibration.normalization,
+        RuliadProofPolicyNormalization::VocabularyMarginal
+    );
+    assert_eq!(
+        calibration.gradient_scope,
+        RuliadProofPolicyGradientScope::FullModel
+    );
+
+    let autoregressive = supervision.proof_policy_for_step(128);
+    assert_eq!(
+        autoregressive.counterfactual_objective,
+        RuliadProofPolicyCounterfactualObjective::Independent
+    );
+    assert_eq!(
+        autoregressive.scoring,
+        RuliadProofPolicyScoring::CompletionLikelihood
+    );
+    assert_eq!(
+        autoregressive.normalization,
+        RuliadProofPolicyNormalization::VocabularyMarginal
+    );
+    assert_eq!(
+        autoregressive.gradient_scope,
+        RuliadProofPolicyGradientScope::FullModel
+    );
+
+    let residual = supervision.proof_policy_for_step(132);
+    assert_eq!(
+        residual.counterfactual_objective,
+        RuliadProofPolicyCounterfactualObjective::TargetGroupConditional
+    );
+    assert_eq!(residual.scoring, RuliadProofPolicyScoring::ResidualEnergy);
+    assert_eq!(
+        residual.normalization,
+        RuliadProofPolicyNormalization::CandidateConditional
+    );
+    assert_eq!(
+        residual.gradient_scope,
+        RuliadProofPolicyGradientScope::ScoreHeadOnly
+    );
+
+    let autoregressive_again = supervision.proof_policy_for_step(136);
+    assert_eq!(
+        autoregressive_again.counterfactual_objective,
+        RuliadProofPolicyCounterfactualObjective::Independent
+    );
+    assert_eq!(
+        autoregressive_again.gradient_scope,
+        RuliadProofPolicyGradientScope::FullModel
+    );
+
+    let mut policy_path = config.clone();
+    policy_path
+        .training
+        .ruliad_supervision
+        .proof_policy
+        .gradient_scope = RuliadProofPolicyGradientScope::PolicyPath;
+    policy_path.validate().expect(
+        "factorized joint should permit recurrent residual credit with a fixed decoder prior",
+    );
+    let residual = policy_path
+        .training
+        .ruliad_supervision
+        .proof_policy_for_step(132);
+    assert_eq!(residual.scoring, RuliadProofPolicyScoring::ResidualEnergy);
+    assert_eq!(
+        residual.gradient_scope,
+        RuliadProofPolicyGradientScope::PolicyPath
+    );
+
+    let mut invalid = config;
+    invalid
+        .training
+        .ruliad_supervision
+        .proof_policy
+        .gradient_scope = RuliadProofPolicyGradientScope::FullModel;
+    assert!(
+        invalid
+            .validate()
+            .expect_err("factorized joint must declare its isolated residual phase")
+            .to_string()
+            .contains("factorized/coupled joint objectives require")
+    );
 }
 
 #[test]
@@ -1461,13 +2133,9 @@ fn local_predictive_coding_verifier_terminal_accepts_dagger_and_rejects_unsuppor
         .ruliad_supervision
         .proof_policy
         .normalization = crate::config::RuliadProofPolicyNormalization::CandidateConditional;
-    let error = config
+    config
         .validate()
-        .expect_err("sequence-level normalization is not the trie terminal objective");
-    assert!(
-        error.to_string().contains("prefix-conditional"),
-        "unexpected error: {error}"
-    );
+        .expect("candidate-conditional completion has an exact sequence-level local terminal");
 }
 
 #[test]
@@ -2741,7 +3409,7 @@ fn ruliad_r3_profile_streams_the_full_formal_proof_contract() {
 }
 
 #[test]
-fn ruliad_r3_stateful_tbptt_profiles_form_a_matched_factorial_ablation() {
+fn ruliad_r3_stateful_tbptt_profiles_reject_unsafe_reset_controls() {
     use crate::config::SequenceBatchingMode;
 
     let arms = [
@@ -2754,9 +3422,19 @@ fn ruliad_r3_stateful_tbptt_profiles_form_a_matched_factorial_ablation() {
     let mut shared_contract = None;
     for (profile, chunk_size, persist) in arms {
         let config = load_profile(profile);
-        config
-            .validate()
-            .unwrap_or_else(|error| panic!("{profile} should validate: {error}"));
+        if persist {
+            config
+                .validate()
+                .unwrap_or_else(|error| panic!("{profile} should validate: {error}"));
+        } else {
+            let error = config
+                .validate()
+                .expect_err("masked streaming reset is unsafe");
+            assert!(
+                error.to_string().contains("context-only batches"),
+                "{profile}: {error}"
+            );
+        }
         assert_eq!(config.training.block_size, 512, "{profile}");
         assert_eq!(
             config.training.tbptt_chunk_size,
@@ -2964,6 +3642,34 @@ fn residual_energy_accepts_score_head_only_counterfactual_training_and_probe() {
 }
 
 #[test]
+fn residual_energy_accepts_policy_path_and_rejects_other_scorers() {
+    use crate::config::{RuliadProofPolicyGradientScope, RuliadProofPolicyScoring};
+
+    let mut config = load_profile("ruliad-r3.action-policy-semantic-energy-fixed-ablation.toml");
+    let policy = &mut config.training.ruliad_supervision.proof_policy;
+    policy.scoring = RuliadProofPolicyScoring::ResidualEnergy;
+    policy.gradient_scope = RuliadProofPolicyGradientScope::PolicyPath;
+    policy.counterfactual_targets_per_state = 1;
+    config.training.ruliad_policy_probe.scoring = RuliadProofPolicyScoring::ResidualEnergy;
+    config.validate().expect(
+        "policy-path residual energy should train recurrent state without the language prior",
+    );
+
+    let mut invalid = config;
+    invalid.training.ruliad_supervision.proof_policy.scoring =
+        RuliadProofPolicyScoring::SemanticEnergy;
+    let error = invalid
+        .validate()
+        .expect_err("policy-path scope requires a separable residual score");
+    assert!(
+        error
+            .to_string()
+            .contains("gradient_scope=policy_path requires scoring=residual_energy"),
+        "{error}"
+    );
+}
+
+#[test]
 fn language_head_only_profile_is_explicit_untied_and_valid() {
     use crate::config::{RuliadProofPolicyGradientScope, RuliadProofPolicyScoring};
 
@@ -3135,19 +3841,14 @@ fn semantic_energy_rejects_an_empty_compatibility_projection() {
 }
 
 #[test]
-fn ruliad_counterfactual_policy_requires_energy_candidates_and_complete_groups() {
+fn ruliad_counterfactual_policy_supports_deployed_decoder_candidates_and_complete_groups() {
     use crate::config::RuliadProofPolicyScoring;
 
     let mut config = load_profile("ruliad-r3.action-policy-semantic-energy-fixed-ablation.toml");
     config.training.ruliad_supervision.proof_policy.scoring =
         RuliadProofPolicyScoring::CompletionLikelihood;
-    let error = config
-        .validate()
-        .expect_err("candidate-normalized full-model completion counterfactuals must be rejected");
-    assert!(
-        error
-            .to_string()
-            .contains("full-model prefix-conditional deployed-decoder completion")
+    config.validate().expect(
+        "candidate-normalized full-model completion supports complete counterfactual groups",
     );
 
     let mut config = load_profile("ruliad-r3.action-policy-semantic-energy-fixed-ablation.toml");
@@ -3174,6 +3875,62 @@ fn ruliad_counterfactual_policy_requires_energy_candidates_and_complete_groups()
         error
             .to_string()
             .contains("target-variant presentation group")
+    );
+}
+
+#[test]
+fn target_group_conditional_policy_requires_complete_candidate_normalized_pairs() {
+    use crate::config::{RuliadProofPolicyCounterfactualObjective, RuliadProofPolicyNormalization};
+
+    let mut config = load_profile("ruliad-r3.action-policy-semantic-energy-fixed-ablation.toml");
+    config
+        .training
+        .ruliad_supervision
+        .proof_policy
+        .counterfactual_objective =
+        RuliadProofPolicyCounterfactualObjective::TargetGroupConditional;
+    config
+        .validate()
+        .expect("complete candidate-normalized target groups should validate");
+
+    let mut joint = config.clone();
+    joint
+        .training
+        .ruliad_supervision
+        .proof_policy
+        .counterfactual_objective = RuliadProofPolicyCounterfactualObjective::TargetGroupJoint;
+    joint
+        .validate()
+        .expect("joint full-menu and target-group objectives should validate");
+
+    let mut unpaired = config.clone();
+    unpaired
+        .training
+        .ruliad_supervision
+        .proof_policy
+        .counterfactual_targets_per_state = 0;
+    let error = unpaired
+        .validate()
+        .expect_err("target-group conditioning requires a retargeted row");
+    assert!(
+        error
+            .to_string()
+            .contains("counterfactual_targets_per_state>0")
+    );
+
+    let mut prefix = config;
+    prefix
+        .training
+        .ruliad_supervision
+        .proof_policy
+        .normalization = RuliadProofPolicyNormalization::PrefixConditional;
+    let error = prefix
+        .validate()
+        .expect_err("target-group conditioning requires complete candidate labels");
+    assert!(
+        error
+            .to_string()
+            .contains("normalization=candidate_conditional")
     );
 }
 
@@ -3808,6 +4565,90 @@ fn local_pc_answer_completion_profile_changes_target_selection_without_weighting
 }
 
 #[test]
+fn local_pc_semantic_policy_profile_is_an_unbounded_typed_action_corpus() {
+    use burn_dragon_universality::{RuliadFamilyKind, RuliadProofActionAnswerContract};
+
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let profile = workspace.join(
+        "config/language/experiments/predictive_coding/local-pc-verifier-1m-semantic-policy.toml",
+    );
+    let config = load_training_config(std::slice::from_ref(&profile))
+        .unwrap_or_else(|error| panic!("load {}: {error}", profile.display()));
+    config
+        .validate()
+        .unwrap_or_else(|error| panic!("validate {}: {error}", profile.display()));
+    assert_eq!(
+        config.training.ruliad_supervision.mode,
+        RuliadSupervisionMode::AnswerCompletion
+    );
+    assert_eq!(
+        config
+            .training
+            .ruliad_supervision
+            .proof_policy
+            .prompt_context,
+        crate::config::RuliadProofPolicyPromptContext::LocalActionState
+    );
+    assert_eq!(
+        config.training.ruliad_policy_probe.prompt_context,
+        crate::config::RuliadProofPolicyPromptContext::LocalActionState
+    );
+
+    let DatasetSourceConfig::UniversalityRuliad { config: corpus } = &config.dataset.source else {
+        panic!("semantic-policy profile must use a Ruliad corpus");
+    };
+    let corpus = burn_dragon_universality::load_ruliad_config(&workspace.join(corpus))
+        .expect("load semantic-policy corpus");
+    assert_eq!(corpus.families.len(), 1);
+    assert_eq!(corpus.families[0].kind, RuliadFamilyKind::FormalProof);
+    let mix = &corpus.source_selection.formal_task_mix;
+    assert_eq!(mix.advance_proof_weight, 0);
+    assert_eq!(mix.select_proof_action_weight, 1);
+    assert_eq!(mix.construct_proof_weight, 0);
+    assert_eq!(mix.check_proof_weight, 0);
+    assert_eq!(
+        mix.proof_action_answer_contract,
+        RuliadProofActionAnswerContract::SemanticStep
+    );
+    assert!(corpus.source_selection.frontier_extension.enabled);
+    assert_eq!(
+        corpus
+            .source_selection
+            .frontier_extension
+            .max_materialized_levels,
+        0,
+        "semantic-policy experiments must retain the unbounded frontier"
+    );
+}
+
+#[test]
+fn local_pc_semantic_stream_profile_carries_unbounded_context_explicitly() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let profile = workspace.join(
+        "config/language/experiments/predictive_coding/local-pc-verifier-1m-semantic-stream.toml",
+    );
+    let config = load_training_config(std::slice::from_ref(&profile))
+        .unwrap_or_else(|error| panic!("load {}: {error}", profile.display()));
+    config
+        .validate()
+        .unwrap_or_else(|error| panic!("validate {}: {error}", profile.display()));
+    assert_eq!(
+        config.training.sequence_batching,
+        crate::config::SequenceBatchingMode::Streaming
+    );
+    assert!(config.training.tbptt_persist_across_steps);
+    assert_eq!(
+        config.training.tbptt_chunk_size,
+        Some(config.training.block_size)
+    );
+    assert_eq!(
+        config.training.validation.objective,
+        crate::config::TrainingValidationObjective::StreamWarm
+    );
+    assert!(config.training.sequence_state_probe.enabled);
+}
+
+#[test]
 fn local_pc_factorized_answer_profile_balances_structure_and_value_updates() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let profile = workspace.join(
@@ -3863,6 +4704,192 @@ fn local_pc_prompt_binding_profile_uses_disjoint_primary_objective_phases() {
 }
 
 #[test]
+fn local_pc_policy_bridge_profile_aligns_policy_binding_and_rendering_phases() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let profile = workspace.join(
+        "config/language/experiments/predictive_coding/local-pc-verifier-1m-policy-bridge.toml",
+    );
+    let config = load_training_config(std::slice::from_ref(&profile))
+        .unwrap_or_else(|error| panic!("load {}: {error}", profile.display()));
+    config
+        .validate()
+        .unwrap_or_else(|error| panic!("validate {}: {error}", profile.display()));
+
+    let supervision = config.training.ruliad_supervision;
+    assert_eq!(supervision.mode, RuliadSupervisionMode::AnswerCompletion);
+    assert_eq!(
+        supervision.prompt_value_binding.context,
+        crate::config::RuliadPromptValueBindingContext::ProofPolicy
+    );
+    assert_eq!(
+        supervision.prompt_value_binding.objective,
+        crate::config::RuliadPromptValueBindingObjective::FullCompletion
+    );
+    assert_eq!(supervision.proof_policy.every_steps, 3);
+    assert_eq!(supervision.prompt_value_binding.every_steps, 3);
+    assert_eq!(supervision.prompt_value_binding.phase_steps, 1);
+    assert_eq!(
+        config.training.local_predictive_coding.terminal_criterion,
+        crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSet
+    );
+
+    for step in 0..9 {
+        let policy_due = supervision.proof_policy.enabled
+            && step >= supervision.proof_policy.start_after_steps
+            && step.is_multiple_of(supervision.proof_policy.every_steps);
+        let binding_due = supervision.prompt_value_binding.active_at_step(step);
+        assert!(
+            !(policy_due && binding_due),
+            "primary phases overlap at step={step}"
+        );
+        assert_eq!(policy_due, step % 3 == 0, "policy step={step}");
+        assert_eq!(binding_due, step % 3 == 1, "binding step={step}");
+        assert_eq!(
+            supervision.needs_ruliad_policy_batch_at_step(step),
+            step % 3 != 2,
+            "policy sidecar step={step}"
+        );
+    }
+
+    let completion_factor = supervision.proof_policy_for_step(0);
+    assert_eq!(
+        completion_factor.scoring,
+        crate::config::RuliadProofPolicyScoring::CompletionLikelihood
+    );
+    assert_eq!(
+        completion_factor.gradient_scope,
+        crate::config::RuliadProofPolicyGradientScope::FullModel
+    );
+    let residual_factor = supervision.proof_policy_for_step(3);
+    assert_eq!(
+        residual_factor.scoring,
+        crate::config::RuliadProofPolicyScoring::ResidualEnergy
+    );
+    assert_eq!(
+        residual_factor.gradient_scope,
+        crate::config::RuliadProofPolicyGradientScope::PolicyPath
+    );
+}
+
+#[test]
+fn local_pc_decoder_coupled_profile_routes_all_three_normalized_policy_factors() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let profile = workspace.join(
+        "config/language/experiments/predictive_coding/local-pc-verifier-1m-decoder-coupled.toml",
+    );
+    let config = load_training_config(std::slice::from_ref(&profile))
+        .unwrap_or_else(|error| panic!("load {}: {error}", profile.display()));
+    config
+        .validate()
+        .unwrap_or_else(|error| panic!("validate {}: {error}", profile.display()));
+
+    let supervision = config.training.ruliad_supervision;
+    assert_eq!(supervision.proof_policy.every_steps, 2);
+    assert_eq!(supervision.prompt_value_binding.every_steps, 2);
+    assert_eq!(supervision.prompt_value_binding.phase_steps, 1);
+    assert_eq!(
+        supervision.proof_policy.counterfactual_objective,
+        crate::config::RuliadProofPolicyCounterfactualObjective::DecoderCoupledJoint
+    );
+    for step in 0..8 {
+        assert_eq!(
+            supervision.prompt_value_binding.active_at_step(step),
+            step % 2 == 1,
+            "binding step={step}"
+        );
+        assert_eq!(
+            supervision.needs_ruliad_policy_batch_at_step(step),
+            true,
+            "policy sidecar step={step}"
+        );
+    }
+
+    let decoder = supervision.proof_policy_for_step(0);
+    assert_eq!(
+        decoder.scoring,
+        crate::config::RuliadProofPolicyScoring::CompletionLikelihood
+    );
+    assert_eq!(
+        decoder.gradient_scope,
+        crate::config::RuliadProofPolicyGradientScope::FullModel
+    );
+    assert_eq!(
+        decoder.counterfactual_objective,
+        crate::config::RuliadProofPolicyCounterfactualObjective::TargetGroupConditional
+    );
+
+    let validity = supervision.proof_policy_for_step(2);
+    assert_eq!(
+        validity.scoring,
+        crate::config::RuliadProofPolicyScoring::ResidualEnergy
+    );
+    assert_eq!(
+        validity.gradient_scope,
+        crate::config::RuliadProofPolicyGradientScope::PolicyPath
+    );
+    assert_eq!(
+        validity.counterfactual_objective,
+        crate::config::RuliadProofPolicyCounterfactualObjective::Independent
+    );
+
+    let target_binding = supervision.proof_policy_for_step(4);
+    assert_eq!(
+        target_binding.scoring,
+        crate::config::RuliadProofPolicyScoring::ResidualEnergy
+    );
+    assert_eq!(
+        target_binding.counterfactual_objective,
+        crate::config::RuliadProofPolicyCounterfactualObjective::TargetGroupConditional
+    );
+    assert_eq!(
+        supervision.proof_policy_for_step(6),
+        decoder,
+        "policy factor cycle must be deterministic"
+    );
+}
+
+#[test]
+fn local_pc_structured_policy_profile_alternates_only_residual_policy_factors() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let profile = workspace.join(
+        "config/language/experiments/predictive_coding/local-pc-verifier-1m-structured-policy.toml",
+    );
+    let config = load_training_config(std::slice::from_ref(&profile))
+        .unwrap_or_else(|error| panic!("load {}: {error}", profile.display()));
+    config
+        .validate()
+        .unwrap_or_else(|error| panic!("validate {}: {error}", profile.display()));
+
+    let supervision = config.training.ruliad_supervision;
+    assert!(!supervision.prompt_value_binding.enabled);
+    assert_eq!(supervision.proof_policy.every_steps, 1);
+    assert_eq!(
+        supervision.proof_policy.counterfactual_objective,
+        crate::config::RuliadProofPolicyCounterfactualObjective::TargetGroupJoint
+    );
+    for step in 0..4 {
+        assert!(supervision.needs_ruliad_policy_batch_at_step(step));
+        let policy = supervision.proof_policy_for_step(step);
+        assert_eq!(
+            policy.scoring,
+            crate::config::RuliadProofPolicyScoring::ResidualEnergy
+        );
+        assert_eq!(
+            policy.gradient_scope,
+            crate::config::RuliadProofPolicyGradientScope::PolicyPath
+        );
+        assert_eq!(
+            policy.counterfactual_objective,
+            if step.is_multiple_of(2) {
+                crate::config::RuliadProofPolicyCounterfactualObjective::Independent
+            } else {
+                crate::config::RuliadProofPolicyCounterfactualObjective::TargetGroupConditional
+            }
+        );
+    }
+}
+
+#[test]
 fn prompt_value_binding_rejects_ambiguous_or_empty_schedule_contracts() {
     let mut config = parse_config("");
     config.training.ruliad_supervision.mode = RuliadSupervisionMode::AnswerCompletion;
@@ -3906,6 +4933,31 @@ fn prompt_value_binding_rejects_ambiguous_or_empty_schedule_contracts() {
             .to_string()
             .contains("max_rows_per_step")
     );
+}
+
+#[test]
+fn proof_policy_prompt_value_binding_requires_the_proof_policy_objective() {
+    let mut config = parse_config("");
+    config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+        config: "target/test-ruliad.toml".into(),
+    };
+    config.training.ruliad_supervision.mode = RuliadSupervisionMode::AnswerCompletion;
+    let binding = &mut config.training.ruliad_supervision.prompt_value_binding;
+    binding.enabled = true;
+    binding.context = crate::config::RuliadPromptValueBindingContext::ProofPolicy;
+
+    assert!(
+        config
+            .validate()
+            .expect_err("proof-policy prompt source without policy objective must fail")
+            .to_string()
+            .contains("proof_policy.enabled")
+    );
+
+    config.training.ruliad_supervision.proof_policy.enabled = true;
+    config
+        .validate()
+        .expect("proof-policy prompt binding should validate with the policy objective enabled");
 }
 
 #[test]
@@ -4092,6 +5144,31 @@ fn local_layer_prediction_overlay_selects_the_normalized_solver() {
         crate::config::PredictiveCodingFactorReduction::Mean
     );
     assert!(!config.training.local_predictive_coding.sync_diagnostics);
+}
+
+#[test]
+fn structured_verifier_accepts_tensorized_layer_local_solver() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../config/language/experiments/predictive_coding");
+    let paths = [
+        root.join("local-pc-verifier-1m-structured-policy.toml"),
+        root.join("pc-layer-local-prediction.overlay.toml"),
+    ];
+    let config = load_training_config(&paths).expect("load layer-local structured verifier");
+    config
+        .validate()
+        .expect("validate layer-local structured verifier");
+    assert_eq!(
+        config.training.local_predictive_coding.solver,
+        crate::config::LocalPredictiveCodingSolver::LayerLocalPrediction
+    );
+    assert!(
+        config
+            .model
+            .sequence_score_head
+            .as_ref()
+            .is_some_and(|head| head.enabled)
+    );
 }
 
 #[test]
@@ -4895,6 +5972,75 @@ fn ruliad_cold_start_override_validates_for_ruliad_dataset() {
     config
         .validate()
         .expect("ruliad cold-start override should validate");
+}
+
+#[test]
+fn ruliad_consolidation_replays_then_releases_unbounded_novel_coordinates() {
+    let config = crate::config::RuliadConsolidationConfig {
+        enabled: true,
+        initial_unique_steps: 4,
+        hold_steps: 20,
+        novelty_interval_steps: 3,
+        seed: 17,
+    };
+    let coordinates = (0..64)
+        .map(|step| config.coordinate(step))
+        .collect::<Vec<_>>();
+
+    for (step, coordinate) in coordinates.iter().take(4).enumerate() {
+        assert!(coordinate.novel);
+        assert_eq!(coordinate.generation_step, step);
+        assert_eq!(coordinate.released_unique_steps, step + 1);
+    }
+    let held_slots = coordinates[4..20]
+        .iter()
+        .map(|coordinate| coordinate.generation_step)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(held_slots, std::collections::BTreeSet::from([0, 1, 2, 3]));
+    assert!(
+        coordinates[4..20]
+            .iter()
+            .all(|coordinate| !coordinate.novel && coordinate.released_unique_steps == 4)
+    );
+    for (offset, step) in (20..64).step_by(3).enumerate() {
+        let coordinate = coordinates[step];
+        assert!(coordinate.novel, "step={step}");
+        assert_eq!(coordinate.generation_step, 4 + offset);
+        assert_eq!(coordinate.released_unique_steps, 5 + offset);
+    }
+    assert!(coordinates[63].released_unique_steps > coordinates[20].released_unique_steps);
+    assert_eq!(
+        coordinates,
+        (0..64)
+            .map(|step| config.coordinate(step))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn ruliad_consolidation_requires_a_valid_ruliad_schedule() {
+    let mut config = parse_config("");
+    config.training.ruliad_supervision.consolidation.enabled = true;
+    let err = config
+        .validate()
+        .expect_err("non-ruliad consolidation must be rejected");
+    assert!(err.to_string().contains("universality_ruliad"));
+
+    config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+        config: "target/test-ruliad.toml".into(),
+    };
+    config
+        .validate()
+        .expect("default consolidation schedule should validate for ruliad");
+    config
+        .training
+        .ruliad_supervision
+        .consolidation
+        .novelty_interval_steps = 0;
+    let err = config
+        .validate()
+        .expect_err("zero novelty cadence must be rejected");
+    assert!(err.to_string().contains("novelty_interval_steps"));
 }
 
 #[test]
@@ -5865,5 +7011,41 @@ enabled = true
     assert!(
         err.to_string().contains("training.gdpo.enabled"),
         "unexpected error: {err}"
+    );
+}
+#[test]
+fn alibi_training_config_validates_shape_values_and_active_memory() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let base = crate::config::load_training_config(&[
+        workspace.join("config/language/experiments/next_latent/capacity-base.toml")
+    ])
+    .unwrap();
+    for slopes in [
+        vec![],
+        vec![0.1],
+        vec![-0.1; 4],
+        vec![f32::NAN; 4],
+        vec![f32::INFINITY; 4],
+    ] {
+        let mut config = base.clone();
+        config.model.alibi_slopes = Some(slopes);
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("alibi_slopes")
+        );
+    }
+    let mut config = base;
+    config.model.alibi_slopes = Some(vec![0.25, 0.0625, 0.015625, 0.00390625]);
+    config.validate().unwrap();
+    config.model.rotary_embedding = Some(RotaryEmbedding::Rope);
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("requires ALiBi linear attention")
     );
 }

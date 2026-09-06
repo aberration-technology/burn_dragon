@@ -1,0 +1,6 @@
+extends = ["corpus.toml"]
+
+# Evaluation control only: same grammar as structural training, unseen split seeds.
+# This does not replace the structural holdout or demonstrate new-law transfer.
+formal_generalization = "structural_train_seed_disjoint_v1"
+validation_samples = 256

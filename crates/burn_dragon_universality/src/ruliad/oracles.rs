@@ -180,6 +180,10 @@ pub enum RuliadSampleSpec {
         /// Missing values preserve the version-7 canonical presentation.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         action_presentation_rotation: Option<usize>,
+        /// Number of verifier-enumerated actions in the presented menu.
+        /// Missing values preserve the historical default action-set size.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action_candidate_count: Option<usize>,
         #[serde(default)]
         action_answer_contract: RuliadProofActionAnswerContract,
         task: RuliadTaskKind,
@@ -253,8 +257,8 @@ pub use classification::{ruliad_sample_math_domains, ruliad_sample_reasoning_mod
 pub use document::{
     RULIAD_V2_DOCUMENT_CLOSE_MARKER, RULIAD_V3_DOCUMENT_CLOSE_MARKER, compact_ruliad_label,
     ruliad_answer_contract, ruliad_answer_values, ruliad_document_close_marker,
-    ruliad_expected_answer, ruliad_prompt_prefix, ruliad_proof_action_prompt,
-    ruliad_proof_action_query, sample_text,
+    ruliad_expected_answer, ruliad_prompt_prefix, ruliad_proof_action_local_prompt,
+    ruliad_proof_action_prompt, ruliad_proof_action_query, sample_text,
 };
 pub use generation::{
     default_proof_tasks, generate_sample, generate_sample_for_source_bucket, load_proof_tasks,

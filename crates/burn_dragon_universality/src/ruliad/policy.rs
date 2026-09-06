@@ -60,6 +60,42 @@ impl RuliadProofActionSet {
             .unwrap_or(0)
     }
 
+    /// Expert-preserving verifier-backed progress for every presented action.
+    ///
+    /// Non-expert mass is the decrease in structural distance to the active
+    /// target. Every certified-equivalent action additionally receives a
+    /// lexicographic guard one unit larger than the greatest observed progress.
+    /// The formal expert therefore remains an argmax even when a structural
+    /// distance heuristic prefers a different local rewrite, while other
+    /// improving transitions retain proportional partial credit. The returned
+    /// integer weights are intentionally unnormalized so downstream objectives
+    /// can normalize on their selected tensor backend.
+    pub fn candidate_progress_units(&self) -> Vec<usize> {
+        let current_distance = ruliad_term_distance(&self.current, &self.target);
+        let mut progress = self
+            .candidates
+            .iter()
+            .map(|candidate| {
+                candidate
+                    .distance_to_goal
+                    .map(|distance| current_distance.saturating_sub(distance))
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        let expert_guard = progress
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or_default()
+            .saturating_add(1);
+        for index in &self.equivalent_indices {
+            if let Some(weight) = progress.get_mut(*index) {
+                *weight = weight.saturating_add(expert_guard);
+            }
+        }
+        progress
+    }
+
     /// Rotate the candidate presentation to the left while preserving proof-action semantics.
     ///
     /// The returned indices are expressed in the rotated presentation. Use
@@ -245,6 +281,29 @@ pub fn proof_action_answer(
             crate::ruliad::wire::encode_model_proof_step(actions.goal, &candidate.step)
         }
     })
+}
+
+/// Render a canonical semantic action under an explicitly presented action menu.
+///
+/// Policy scorers operate in canonical semantic order even when candidate menus are rotated to
+/// remove positional shortcuts. This helper is the single conversion from that semantic index to
+/// the answer contract visible to a model or verifier.
+pub fn proof_action_answer_for_semantic_index(
+    actions: &RuliadProofActionSet,
+    semantic_index: usize,
+    presentation_rotation: usize,
+    contract: crate::ruliad::config::RuliadProofActionAnswerContract,
+) -> Result<String> {
+    let candidate_count = actions.candidates.len();
+    if semantic_index >= candidate_count {
+        return Err(anyhow!(
+            "proof action candidate {semantic_index} is out of range"
+        ));
+    }
+    let rotation = presentation_rotation % candidate_count;
+    let presented_index = (semantic_index + candidate_count - rotation) % candidate_count;
+    let presented = actions.rotate_left(presentation_rotation)?;
+    proof_action_answer(&presented, presented_index, contract)
 }
 
 /// Resolve a contract-bound answer to the represented candidate.
@@ -1169,6 +1228,45 @@ mod tests {
     }
 
     #[test]
+    fn semantic_index_renderer_is_equivariant_for_every_action_and_contract() {
+        let bundle = bundle();
+        let actions = oracle_proof_action_set(
+            &bundle.problem,
+            &bundle.certificate,
+            0,
+            DEFAULT_PROOF_ACTION_CANDIDATES,
+        )
+        .expect("action set");
+
+        for contract in [
+            crate::ruliad::config::RuliadProofActionAnswerContract::PresentationIndex,
+            crate::ruliad::config::RuliadProofActionAnswerContract::SemanticStep,
+        ] {
+            for semantic_index in 0..actions.candidates.len() {
+                for rotation in 0..actions.candidates.len() {
+                    let presented = actions.rotate_left(rotation).expect("presented actions");
+                    let answer = proof_action_answer_for_semantic_index(
+                        &actions,
+                        semantic_index,
+                        rotation,
+                        contract,
+                    )
+                    .expect("rendered answer");
+                    let presented_index =
+                        resolve_proof_action_answer(&presented, &answer, contract)
+                            .expect("resolved answer");
+                    assert_eq!(
+                        actions
+                            .original_index_after_rotation(presented_index, rotation)
+                            .expect("canonical index"),
+                        semantic_index
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn greedy_distance_policy_solves_generated_proof_closed_loop() {
         let bundle = bundle();
         let report = rollout_proof_policy(
@@ -1188,6 +1286,92 @@ mod tests {
         assert_eq!(report.invalid_actions, 0);
         assert_eq!(report.repeated_states, 0);
         assert_eq!(report.solved_goals, report.total_goals);
+    }
+
+    #[test]
+    fn progress_units_rank_the_runtime_distance_expert_and_rotate_equivariantly() {
+        let bundle = bundle();
+        let state = RuliadProofPolicyState::new(&bundle.problem);
+        let actions = state
+            .action_set(&bundle.problem, DEFAULT_PROOF_ACTION_CANDIDATES)
+            .expect("runtime action set");
+        let progress = actions.candidate_progress_units();
+        assert_eq!(progress.len(), actions.candidates.len());
+        assert!(progress.iter().any(|weight| *weight > 0));
+        let maximum = progress.iter().copied().max().unwrap();
+        assert_eq!(progress[actions.selected_index], maximum);
+
+        for rotation in 0..actions.candidates.len() {
+            let rotated = actions.rotate_left(rotation).expect("rotated actions");
+            let rotated_progress = rotated.candidate_progress_units();
+            for presented_index in 0..rotated.candidates.len() {
+                let original_index = actions
+                    .original_index_after_rotation(presented_index, rotation)
+                    .expect("original index");
+                assert_eq!(rotated_progress[presented_index], progress[original_index]);
+            }
+        }
+    }
+
+    #[test]
+    fn progress_target_geometry_is_finite_across_difficulties() {
+        let mut rows = 0usize;
+        let mut argmax_matches_certificate = 0usize;
+        let mut nonzero_actions = 0usize;
+        let mut selected_probability = 0.0f64;
+        let mut entropy_nats = 0.0f64;
+
+        for difficulty in 0..4 {
+            for sample in 0..32u64 {
+                let bundle = generate_formal_bundle(
+                    sample ^ (difficulty as u64).rotate_left(29),
+                    RuliadFormalGeneratorConfig::for_difficulty(difficulty),
+                )
+                .expect("formal target-geometry bundle");
+                for step_index in 0..bundle.certificate.step_count() {
+                    let actions = oracle_proof_action_set(
+                        &bundle.problem,
+                        &bundle.certificate,
+                        step_index,
+                        DEFAULT_PROOF_ACTION_CANDIDATES,
+                    )
+                    .expect("oracle target-geometry action set");
+                    let progress = actions.candidate_progress_units();
+                    let total = progress.iter().sum::<usize>();
+                    assert!(total > 0, "every target row needs positive mass");
+                    let maximum = progress.iter().copied().max().unwrap_or_default();
+                    argmax_matches_certificate +=
+                        usize::from(progress[actions.selected_index] == maximum);
+                    nonzero_actions += progress.iter().filter(|weight| **weight > 0).count();
+                    selected_probability += progress[actions.selected_index] as f64 / total as f64;
+                    entropy_nats += progress
+                        .iter()
+                        .copied()
+                        .filter(|weight| *weight > 0)
+                        .map(|weight| weight as f64 / total as f64)
+                        .map(|probability| -probability * probability.ln())
+                        .sum::<f64>();
+                    rows += 1;
+                }
+            }
+        }
+
+        assert!(rows > 100);
+        let rows_f64 = rows as f64;
+        let mean_support = nonzero_actions as f64 / rows_f64;
+        let mean_selected_probability = selected_probability / rows_f64;
+        let mean_entropy_nats = entropy_nats / rows_f64;
+        assert!(mean_support.is_finite() && mean_support >= 1.0);
+        assert!(
+            mean_selected_probability.is_finite()
+                && (0.0..=1.0).contains(&mean_selected_probability)
+        );
+        assert!(mean_entropy_nats.is_finite() && mean_entropy_nats >= 0.0);
+        assert_eq!(argmax_matches_certificate, rows);
+        eprintln!(
+            "progress target geometry rows={rows} certificate_argmax_rate={:.6} mean_support={mean_support:.6} mean_selected_probability={mean_selected_probability:.6} mean_entropy_nats={mean_entropy_nats:.6}",
+            argmax_matches_certificate as f64 / rows_f64,
+        );
     }
 
     #[test]

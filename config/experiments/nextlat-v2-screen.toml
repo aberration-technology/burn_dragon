@@ -1,0 +1,42 @@
+version = 1
+output = "target/experiments/nextlat-v2-screen"
+repositories = [".", "../burn_pc", "../burn_ecs", "../burn_eggroll", "../burn_p2p"]
+
+[limits]
+system_fraction = 0.90
+headroom_mib = 4096
+poll_seconds = 0.25
+gpu_sample_seconds = 2.0
+shared_gpu_memory = true
+
+[[cases]]
+id = "ce-b4-seed13"
+gpu = true
+expected_peak_mib = 32768
+timeout_seconds = 900
+argv = ["target/release/examples/train_language", "--backend", "cuda", "--config", "config/language/experiments/next_latent/base.toml", "--batch-size", "4", "--max-iters", "256", "--checkpoint-interval-iters", "256"]
+inputs = ["config/language/experiments/next_latent/base.toml", "config/language/experiments/next_latent/corpus.toml"]
+
+[[cases]]
+id = "h1-b4-seed13"
+gpu = true
+expected_peak_mib = 32768
+timeout_seconds = 900
+argv = ["target/release/examples/train_language", "--backend", "cuda", "--config", "config/language/experiments/next_latent/base.toml", "--config", "config/language/experiments/next_latent/h1.overlay.toml", "--batch-size", "4", "--max-iters", "256", "--checkpoint-interval-iters", "256"]
+inputs = ["config/language/experiments/next_latent/base.toml", "config/language/experiments/next_latent/corpus.toml", "config/language/experiments/next_latent/h1.overlay.toml"]
+
+[[cases]]
+id = "h2-b4-seed13"
+gpu = true
+expected_peak_mib = 32768
+timeout_seconds = 900
+argv = ["target/release/examples/train_language", "--backend", "cuda", "--config", "config/language/experiments/next_latent/base.toml", "--config", "config/language/experiments/next_latent/h2.overlay.toml", "--batch-size", "4", "--max-iters", "256", "--checkpoint-interval-iters", "256"]
+inputs = ["config/language/experiments/next_latent/base.toml", "config/language/experiments/next_latent/corpus.toml", "config/language/experiments/next_latent/h2.overlay.toml"]
+
+[[cases]]
+id = "h1-kl-b4-seed13"
+gpu = true
+expected_peak_mib = 32768
+timeout_seconds = 900
+argv = ["target/release/examples/train_language", "--backend", "cuda", "--config", "config/language/experiments/next_latent/base.toml", "--config", "config/language/experiments/next_latent/h1-kl.overlay.toml", "--batch-size", "4", "--max-iters", "256", "--checkpoint-interval-iters", "256"]
+inputs = ["config/language/experiments/next_latent/base.toml", "config/language/experiments/next_latent/corpus.toml", "config/language/experiments/next_latent/h1-kl.overlay.toml"]

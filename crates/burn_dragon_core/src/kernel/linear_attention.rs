@@ -146,15 +146,5 @@ fn apply_pope<B: Backend>(
     (rot.clone(), rot)
 }
 
-pub fn default_alibi_slopes(n_head: usize) -> Vec<f32> {
-    if n_head == 0 {
-        return Vec::new();
-    }
-
-    let mut slopes = Vec::with_capacity(n_head);
-    for idx in 0..n_head {
-        let ratio = idx as f32 / n_head as f32;
-        slopes.push(1.0 / (2.0_f32.powf(ratio)));
-    }
-    slopes
-}
+mod alibi;
+pub use alibi::{default_alibi_slopes, reference_alibi_slopes, validate_alibi_slopes};

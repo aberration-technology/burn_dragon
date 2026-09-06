@@ -1,0 +1,6 @@
+extends = ["in-distribution.corpus.toml"]
+
+# Held out from both development and the earlier short-run confirmation.
+seed = 8817302
+name = "nextlat-memory-long-confirmatory-same-grammar"
+validation_samples = 512

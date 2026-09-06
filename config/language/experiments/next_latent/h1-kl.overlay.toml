@@ -1,0 +1,6 @@
+[training.latent_reasoning]
+enabled = true
+
+[training.latent_reasoning.next_latent]
+horizon = 1
+token_kl_weight = 1.0

@@ -1,0 +1,20 @@
+version = 1
+output = "target/experiments/nextlat-memory-resume-smoke-clock-v2"
+repositories = [".", "../burn_pc", "../burn_ecs", "../burn_eggroll", "../burn_p2p"]
+
+[limits]
+system_fraction = 0.90
+headroom_mib = 4096
+poll_seconds = 0.25
+gpu_sample_seconds = 2.0
+shared_gpu_memory = true
+
+[[cases]]
+id = "reference-exact-resume"
+gpu = true
+expected_peak_mib = 32768
+timeout_seconds = 300
+argv = ["target/release/examples/train_language", "--backend", "cuda", "--config", "config/language/experiments/next_latent/memory-retention.toml", "--config", "config/language/experiments/next_latent/memory-retention-smoke.overlay.toml", "--config", "config/language/experiments/next_latent/memory-resume-smoke.overlay.toml"]
+# The work copy is intentionally mutable (checkpoint pruning and launch append).
+# Immutable originals and a verified copy manifest preserve its starting state.
+inputs = ["config/language/experiments/next_latent/base.toml", "config/language/experiments/next_latent/corpus.toml", "config/language/experiments/next_latent/in-distribution.corpus.toml", "config/language/experiments/next_latent/credit-base.toml", "config/language/experiments/next_latent/capacity-base.toml", "config/language/experiments/next_latent/conditional-answer.overlay.toml", "config/language/experiments/next_latent/alibi-reference.overlay.toml", "config/language/experiments/next_latent/memory-long.overlay.toml", "config/language/experiments/next_latent/memory-retention.toml", "config/language/experiments/next_latent/memory-retention.corpus.toml", "config/language/experiments/next_latent/memory-retention-smoke.corpus.toml", "config/language/experiments/next_latent/memory-retention-smoke.overlay.toml", "config/language/experiments/next_latent/memory-resume-smoke.overlay.toml", "target/experiments/nextlat-clock-resume-work/input-copy.json", "runs/alcoholic-metal/experiment_manifest.json", "runs/alcoholic-metal/config.json", "runs/alcoholic-metal/training_config.json", "runs/alcoholic-metal/launches/launch-0000-config.json", "runs/alcoholic-metal/checkpoint/model-config-2.json", "runs/alcoholic-metal/checkpoint/model-2.bin", "runs/alcoholic-metal/checkpoint/optimizer-2.bin", "runs/alcoholic-metal/checkpoint/scheduler-2.bin", "runs/alcoholic-metal/checkpoint/runtime-state-2.bin", "runs/alcoholic-metal/checkpoint/source-selection-state-2.json", "runs/alcoholic-metal/checkpoint/dynamics-2.json", "runs/alcoholic-metal/checkpoint/stability-2.json", "runs/alcoholic-metal/checkpoint/training-ecs-state-2.json", "runs/alcoholic-metal/checkpoint/training-progress-2.json"]

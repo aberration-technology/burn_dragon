@@ -1,0 +1,3 @@
+[model]
+n_embd = 256
+latent_total = 16384

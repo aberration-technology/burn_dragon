@@ -1,13 +1,20 @@
 use serde::{Deserialize, Serialize};
 
 mod load;
+mod next_latent;
+mod provenance;
 mod schema;
+mod structured_schedule;
 mod validate;
+mod validation;
 
 pub use burn_dragon_train::{
     ContinualBackpropConfig, ContinualBackpropLrCoupling, ContinualBackpropTarget,
 };
 pub use load::load_training_config;
+pub(crate) use next_latent::NEXT_LATENT_OBJECTIVE_CONTRACT_VERSION;
+pub use next_latent::NextLatentPredictionConfig;
+pub use provenance::TrainingProvenanceConfig;
 pub(crate) use schema::RuliadPolicyBatchCadences;
 pub use schema::{
     AutoBatchSizeConfig, CausalInputCorruptionConfig, DatasetConfig, DatasetSourceConfig,
@@ -18,26 +25,30 @@ pub use schema::{
     LatentReasoningSigRegConfig, LatentReasoningSigRegMode, LatentReasoningSigRegTarget,
     LatentReasoningTargetEncoder, LatentReasoningTrainingConfig, LatentStepContractConfig,
     LocalPredictiveCodingAdjointConditioning, LocalPredictiveCodingConfig,
-    LocalPredictiveCodingSolver, LocalPredictiveCodingTerminalCriterion, LogitEntropyFloorConfig,
-    ModuleLrScaleEntry, ModuleLrScaleScheduleConfig, NeuronScalingConfig, NeuronScalingGrowth,
-    NeuronScalingStabilizationConfig, NextLatentPredictionConfig, PredictiveCodingBackwardMode,
-    PredictiveCodingConfig, PredictiveCodingFactorReduction, PredictiveCodingMode,
-    PredictiveCodingObservationContract, PredictiveCodingParameterUpdate,
-    PredictiveCodingStateScope, PredictiveContextRoutingConfig, RepeatUnlikelihoodConfig,
-    RepromptTruncation, ResumeHorizonExtensionConfig, RuliadAnswerContractConfig,
-    RuliadAnswerDenoisingConfig, RuliadAnswerRankingConfig, RuliadCheckpointCapabilityContract,
+    LocalPredictiveCodingObjectiveRoutingConfig, LocalPredictiveCodingSolver,
+    LocalPredictiveCodingTerminalCriterion, LogitEntropyFloorConfig, ModuleLrScaleEntry,
+    ModuleLrScaleScheduleConfig, NeuronScalingConfig, NeuronScalingGrowth,
+    NeuronScalingStabilizationConfig, PredictiveCodingBackwardMode, PredictiveCodingConfig,
+    PredictiveCodingFactorReduction, PredictiveCodingMode, PredictiveCodingObservationContract,
+    PredictiveCodingParameterUpdate, PredictiveCodingStateScope, PredictiveContextRoutingConfig,
+    RepeatUnlikelihoodConfig, RepromptTruncation, ResumeHorizonExtensionConfig,
+    RuliadAnswerContractConfig, RuliadAnswerDenoisingConfig, RuliadAnswerRankingConfig,
+    RuliadCheckpointCapabilityContract, RuliadConsolidationConfig, RuliadConsolidationCoordinate,
     RuliadPolicyProbeConfig, RuliadPolicyPromotionGateConfig, RuliadProbeGenerationConfig,
-    RuliadPromptValueBindingConfig, RuliadProofPolicyCandidateSymmetry,
-    RuliadProofPolicyEffectiveMode, RuliadProofPolicyGradientScope, RuliadProofPolicyNormalization,
-    RuliadProofPolicyPresentationRisk, RuliadProofPolicyScoring,
-    RuliadProofPolicySemanticRefreshConfig, RuliadProofPolicyTrainingConfig,
-    RuliadProofPolicyTrainingMode, RuliadSupervisionConfig, RuliadSupervisionMode,
-    RuliadValidationPanelConfig, RuliadValidationPanelMode, RuliadVerifierRewardConfig,
-    RuliadVerifierRewardMode, SdftObjectiveConfig, SdftSdpoObjectiveConfig, SdpoObjectiveConfig,
-    SelfDistillationKlKind, SequenceBatchingMode, SequenceStateProbeConfig, TeacherRegularization,
-    TrainingAlgorithm, TrainingConfig, TrainingHyperparameters, TrainingObjectiveConfig,
-    TrainingObjectiveKind, TrainingValidationConfig, TrainingValidationExecution,
-    TrainingValidationObjective, TrainingValidationSampling, ValidationDatasetConfig,
+    RuliadPromptValueBindingConfig, RuliadPromptValueBindingContext,
+    RuliadPromptValueBindingObjective, RuliadProofPolicyCandidateSymmetry,
+    RuliadProofPolicyCounterfactualObjective, RuliadProofPolicyEffectiveMode,
+    RuliadProofPolicyGradientScope, RuliadProofPolicyNormalization,
+    RuliadProofPolicyPresentationRisk, RuliadProofPolicyPromptContext, RuliadProofPolicyScoring,
+    RuliadProofPolicySemanticRefreshConfig, RuliadProofPolicyTarget,
+    RuliadProofPolicyTrainingConfig, RuliadProofPolicyTrainingMode, RuliadSupervisionConfig,
+    RuliadSupervisionMode, RuliadValidationPanelConfig, RuliadValidationPanelMode,
+    RuliadVerifierRewardConfig, RuliadVerifierRewardMode, SdftObjectiveConfig,
+    SdftSdpoObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind, SequenceBatchingMode,
+    SequenceStateProbeConfig, TeacherRegularization, TrainingAlgorithm, TrainingConfig,
+    TrainingHyperparameters, TrainingObjectiveConfig, TrainingObjectiveKind,
+    TrainingValidationConfig, TrainingValidationExecution, TrainingValidationObjective,
+    TrainingValidationSampling, ValidationDatasetConfig,
 };
 
 use crate::tokenizer::TokenizerConfig;

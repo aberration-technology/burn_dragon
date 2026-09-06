@@ -23,6 +23,22 @@ fn config() -> RuliadCorpusConfig {
     }
 }
 
+#[test]
+fn structural_train_seed_disjoint_uses_identical_grammar_for_both_splits() {
+    let contract =
+        crate::ruliad::config::RuliadFormalGeneralizationContract::StructuralTrainSeedDisjointV1;
+    for split in [SampleSplit::Train, SampleSplit::Validation] {
+        assert_eq!(
+            super::generation::formal_generation_split(contract, split),
+            RuliadFormalGenerationSplit::StructuralTrainV1
+        );
+    }
+    assert_eq!(
+        serde_json::to_string(&contract).unwrap(),
+        "\"structural_train_seed_disjoint_v1\""
+    );
+}
+
 fn longest_repeated_char_run(text: &str) -> usize {
     let mut longest = 0usize;
     let mut previous = None;
@@ -173,6 +189,51 @@ fn proof_action_sample_hides_selection_behind_a_verifier_backed_menu() {
         format!("c={}", actions.selected_index)
     );
     assert!(verify_spec(&sample.spec).expect("verify").ok);
+}
+
+#[test]
+fn local_proof_action_prompt_is_a_hash_free_verifier_state() {
+    let mut config = config();
+    config.families = formal_ruliad_families();
+    config.source_selection.formal_task_mix = RuliadFormalTaskMixConfig {
+        advance_proof_weight: 0,
+        select_proof_action_weight: 1,
+        construct_proof_weight: 0,
+        check_proof_weight: 0,
+        proof_action_answer_contract: RuliadProofActionAnswerContract::SemanticStep,
+    };
+    let sample =
+        generate_sample(&config, &[], SampleSplit::Train, 1, 19).expect("proof action sample");
+    let RuliadSampleSpec::FormalProof {
+        problem,
+        certificate,
+        proof_step_index: Some(step_index),
+        action_presentation_rotation: Some(rotation),
+        ..
+    } = &sample.spec
+    else {
+        panic!("expected proof-action spec");
+    };
+    let actions = crate::ruliad::policy::oracle_proof_action_set(
+        problem,
+        certificate,
+        *step_index,
+        crate::ruliad::policy::DEFAULT_PROOF_ACTION_CANDIDATES,
+    )
+    .and_then(|actions| actions.rotate_left(*rotation))
+    .expect("presented actions");
+    let query = ruliad_proof_action_query(problem, &actions).expect("action query");
+    let local = ruliad_proof_action_local_prompt(problem, &actions).expect("local prompt");
+    let full = ruliad_proof_action_prompt(problem, &actions).expect("full prompt");
+
+    assert_eq!(local, format!("{query}\n!:"));
+    assert!(local.contains("?:select;g="));
+    assert!(local.contains(";cur="));
+    assert!(local.contains(";dst="));
+    assert!(local.contains(";at="));
+    assert!(!local.contains("\nP:"));
+    assert!(!local.contains("[R3 "));
+    assert!(local.len() < full.len());
 }
 
 #[test]
@@ -1014,6 +1075,7 @@ fn formal_sample_provenance_reports_the_concrete_ir_domain() {
             candidate: None,
             proof_step_index: None,
             action_presentation_rotation: None,
+            action_candidate_count: None,
             action_answer_contract: RuliadProofActionAnswerContract::default(),
             task: RuliadTaskKind::ConstructProof,
         };

@@ -12,6 +12,7 @@ mod dynamics;
 pub mod events;
 mod local_predictive_coding;
 mod manifest;
+mod model_identity;
 pub mod neuron_scaling;
 pub(crate) mod next_latent;
 pub mod objective;
@@ -20,6 +21,7 @@ pub mod phased;
 pub mod profile;
 #[cfg(feature = "rerun")]
 pub mod rerun;
+mod ruliad_objective_fingerprint;
 pub mod ruliad_policy;
 mod runtime_checkpoint;
 pub mod schedule;

@@ -4,6 +4,32 @@ use super::*;
 
 impl TrainingConfig {
     pub(super) fn validate_ruliad_contracts(&self) -> Result<()> {
+        let consolidation = self.training.ruliad_supervision.consolidation;
+        if consolidation.enabled {
+            if !matches!(
+                self.dataset.source,
+                DatasetSourceConfig::UniversalityRuliad { .. }
+            ) {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.consolidation.enabled requires dataset.type=\"universality_ruliad\""
+                ));
+            }
+            if consolidation.initial_unique_steps == 0 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.consolidation.initial_unique_steps must be positive when enabled"
+                ));
+            }
+            if consolidation.hold_steps < consolidation.initial_unique_steps {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.consolidation.hold_steps must be at least initial_unique_steps when enabled"
+                ));
+            }
+            if consolidation.novelty_interval_steps == 0 {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.consolidation.novelty_interval_steps must be positive when enabled"
+                ));
+            }
+        }
         if self.training.ruliad_supervision.answer_ranking.enabled {
             let ranking = self.training.ruliad_supervision.answer_ranking;
             if !ranking.weight.is_finite() || ranking.weight < 0.0 {
@@ -120,6 +146,11 @@ impl TrainingConfig {
             }
         }
         let prompt_value_binding = self.training.ruliad_supervision.prompt_value_binding;
+        if prompt_value_binding.require_scheduled_update && !prompt_value_binding.enabled {
+            return Err(anyhow!(
+                "training.ruliad_supervision.prompt_value_binding.require_scheduled_update requires prompt_value_binding.enabled"
+            ));
+        }
         if prompt_value_binding.enabled {
             if prompt_value_binding.every_steps == 0 {
                 return Err(anyhow!(
@@ -144,6 +175,14 @@ impl TrainingConfig {
             if !self.training.ruliad_supervision.uses_answer_target_mask() {
                 return Err(anyhow!(
                     "training.ruliad_supervision.prompt_value_binding.enabled requires an answer-target supervision mode"
+                ));
+            }
+            if prompt_value_binding.context
+                == crate::config::RuliadPromptValueBindingContext::ProofPolicy
+                && !self.training.ruliad_supervision.proof_policy.enabled
+            {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.prompt_value_binding.context=proof_policy requires training.ruliad_supervision.proof_policy.enabled"
                 ));
             }
             if self.parallel.pipeline.enabled {
@@ -220,6 +259,11 @@ impl TrainingConfig {
             }
         }
         let proof_policy = self.training.ruliad_supervision.proof_policy;
+        if proof_policy.require_scheduled_update && !proof_policy.enabled {
+            return Err(anyhow!(
+                "training.ruliad_supervision.proof_policy.require_scheduled_update requires proof_policy.enabled=true"
+            ));
+        }
         let semantic_refresh = self
             .training
             .ruliad_supervision
@@ -265,6 +309,44 @@ impl TrainingConfig {
             }
         }
         if proof_policy.enabled {
+            if proof_policy.decoder_calibration_steps > 0 {
+                if proof_policy.scoring != crate::config::RuliadProofPolicyScoring::ResidualEnergy
+                    || proof_policy.normalization
+                        != crate::config::RuliadProofPolicyNormalization::CandidateConditional
+                    || proof_policy.mode
+                        != crate::config::RuliadProofPolicyTrainingMode::StaticThenPairedDagger
+                {
+                    return Err(anyhow!(
+                        "proof_policy.decoder_calibration_steps requires candidate-conditional residual_energy with mode=static_then_paired_dagger; calibration itself is always full-model"
+                    ));
+                }
+                let calibration_end = proof_policy
+                    .start_after_steps
+                    .checked_add(proof_policy.decoder_calibration_steps)
+                    .ok_or_else(|| {
+                        anyhow!("proof_policy decoder calibration end overflows usize")
+                    })?;
+                if calibration_end > proof_policy.dagger_start_after_steps {
+                    return Err(anyhow!(
+                        "proof_policy decoder calibration must finish no later than dagger_start_after_steps"
+                    ));
+                }
+                if !calibration_end.is_multiple_of(proof_policy.every_steps.max(1)) {
+                    return Err(anyhow!(
+                        "proof_policy decoder calibration end must align with every_steps"
+                    ));
+                }
+            }
+            if proof_policy.target
+                == crate::config::RuliadProofPolicyTarget::VerifiedProgressDistribution
+                && (!proof_policy.scoring.uses_sequence_score_head()
+                    || proof_policy.normalization
+                        != crate::config::RuliadProofPolicyNormalization::CandidateConditional)
+            {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.proof_policy.target=verified_progress_distribution requires semantic/residual energy with normalization=candidate_conditional"
+                ));
+            }
             if proof_policy.scoring.uses_sequence_score_head() {
                 if !self
                     .model
@@ -289,6 +371,14 @@ impl TrainingConfig {
                 {
                     return Err(anyhow!(
                         "training.ruliad_supervision.proof_policy.gradient_scope=score_head_only requires scoring=semantic_energy or residual_energy"
+                    ));
+                }
+                crate::config::RuliadProofPolicyGradientScope::PolicyPath
+                    if proof_policy.scoring
+                        != crate::config::RuliadProofPolicyScoring::ResidualEnergy =>
+                {
+                    return Err(anyhow!(
+                        "training.ruliad_supervision.proof_policy.gradient_scope=policy_path requires scoring=residual_energy"
                     ));
                 }
                 crate::config::RuliadProofPolicyGradientScope::LanguageHeadOnly
@@ -330,6 +420,7 @@ impl TrainingConfig {
                 }
                 crate::config::RuliadProofPolicyGradientScope::FullModel
                 | crate::config::RuliadProofPolicyGradientScope::ScoreHeadOnly
+                | crate::config::RuliadProofPolicyGradientScope::PolicyPath
                 | crate::config::RuliadProofPolicyGradientScope::LanguageHeadOnly => {}
             }
             if !proof_policy.weight.is_finite() || proof_policy.weight <= 0.0 {
@@ -410,17 +501,48 @@ impl TrainingConfig {
                     == crate::config::RuliadProofPolicyScoring::CompletionLikelihood
                     && proof_policy.gradient_scope
                         == crate::config::RuliadProofPolicyGradientScope::FullModel
-                    && proof_policy.normalization
-                        == crate::config::RuliadProofPolicyNormalization::PrefixConditional;
+                    && matches!(
+                        proof_policy.normalization,
+                        crate::config::RuliadProofPolicyNormalization::CandidateConditional
+                            | crate::config::RuliadProofPolicyNormalization::PrefixConditional
+                    );
                 if !semantic_energy && !isolated_completion && !deployed_decoder_completion {
                     return Err(anyhow!(
-                        "training.ruliad_supervision.proof_policy.counterfactual_targets_per_state requires semantic/residual energy, isolated candidate-conditional language-head completion, or full-model prefix-conditional deployed-decoder completion"
+                        "training.ruliad_supervision.proof_policy.counterfactual_targets_per_state requires semantic/residual energy, isolated candidate-conditional language-head completion, or full-model candidate- or prefix-conditional deployed-decoder completion"
                     ));
                 }
             }
             if proof_policy.counterfactual_targets_per_state >= proof_policy.candidates {
                 return Err(anyhow!(
                     "training.ruliad_supervision.proof_policy.counterfactual_targets_per_state must be less than candidates"
+                ));
+            }
+            if proof_policy
+                .counterfactual_objective
+                .requires_complete_target_group()
+                && (proof_policy.counterfactual_targets_per_state == 0
+                    || proof_policy.normalization
+                        != crate::config::RuliadProofPolicyNormalization::CandidateConditional)
+            {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.proof_policy target-group counterfactual objectives require counterfactual_targets_per_state>0 and normalization=candidate_conditional"
+                ));
+            }
+            if matches!(
+                proof_policy.counterfactual_objective,
+                crate::config::RuliadProofPolicyCounterfactualObjective::FactorizedJoint
+                    | crate::config::RuliadProofPolicyCounterfactualObjective::DecoderCoupledJoint
+            ) && (proof_policy.scoring
+                != crate::config::RuliadProofPolicyScoring::ResidualEnergy
+                || proof_policy.target != crate::config::RuliadProofPolicyTarget::ExpertSet
+                || !matches!(
+                    proof_policy.gradient_scope,
+                    crate::config::RuliadProofPolicyGradientScope::ScoreHeadOnly
+                        | crate::config::RuliadProofPolicyGradientScope::PolicyPath
+                ))
+            {
+                return Err(anyhow!(
+                    "training.ruliad_supervision.proof_policy factorized/coupled joint objectives require scoring=residual_energy, target=expert_set, and gradient_scope=score_head_only or policy_path; effective decoder phases are routed through full-model completion likelihood"
                 ));
             }
             if proof_policy.presentation_risk
@@ -880,6 +1002,28 @@ impl TrainingConfig {
         {
             return Err(anyhow!(
                 "dataset.ruliad_source_selection_cold_start_enabled requires dataset.type=\"universality_ruliad\""
+            ));
+        }
+        if self
+            .dataset
+            .ruliad_source_selection_documents_per_step
+            .is_some_and(|documents| documents == 0)
+        {
+            return Err(anyhow!(
+                "dataset.ruliad_source_selection_documents_per_step must be > 0 when set"
+            ));
+        }
+        if self
+            .dataset
+            .ruliad_source_selection_documents_per_step
+            .is_some()
+            && !matches!(
+                self.dataset.source,
+                DatasetSourceConfig::UniversalityRuliad { .. }
+            )
+        {
+            return Err(anyhow!(
+                "dataset.ruliad_source_selection_documents_per_step requires dataset.type=\"universality_ruliad\""
             ));
         }
         Ok(())

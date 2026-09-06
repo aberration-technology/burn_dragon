@@ -1,0 +1,16 @@
+extends = "local-pc-verifier-1m-policy-bridge.toml"
+
+# Two disjoint primary phases:
+#   even: one factor from the exact policy/decoder likelihood cycle
+#   odd:  full semantic action completion under the deployed policy prompt
+#
+# The policy cycle is itself block-coordinate maximum likelihood over
+# autoregressive target binding, residual full-menu validity, and residual
+# target binding. No weighted auxiliary loss is mixed into an update.
+[training.ruliad_supervision.prompt_value_binding]
+every_steps = 2
+phase_steps = 1
+
+[training.ruliad_supervision.proof_policy]
+every_steps = 2
+counterfactual_objective = "decoder_coupled_joint"

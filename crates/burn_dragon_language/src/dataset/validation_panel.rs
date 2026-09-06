@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -12,11 +13,12 @@ use crate::config::{RuliadValidationPanelMode, TrainingHyperparameters};
 
 use super::{Dataset, RuliadValidationProbeItem, RuliadValidationPromptMode};
 
-const PANEL_SCHEMA_VERSION: u32 = 2;
+const PANEL_SCHEMA_VERSION: u32 = 4;
 const PANEL_LOCK_WAIT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct RuliadValidationPanelRequest {
+    corpus_semantic_fingerprint: Option<String>,
     seed: u64,
     base_items: usize,
     base_difficulty_levels: usize,
@@ -54,8 +56,9 @@ pub(crate) struct ResolvedRuliadValidationPanel {
 fn panel_request(
     training: &TrainingHyperparameters,
     dataset: &Dataset,
-) -> RuliadValidationPanelRequest {
-    RuliadValidationPanelRequest {
+) -> Result<RuliadValidationPanelRequest> {
+    Ok(RuliadValidationPanelRequest {
+        corpus_semantic_fingerprint: dataset.ruliad_semantic_fingerprint()?,
         seed: training.validation.seed,
         base_items: training.events.ruliad_correctness_probe_items,
         base_difficulty_levels: training.validation.ruliad_panel.base_difficulty_levels,
@@ -67,7 +70,7 @@ fn panel_request(
             .to_string(),
         policy_difficulty_levels: training.ruliad_policy_probe.stratified_difficulty_levels,
         tokenizer_vocab_size: dataset.tokenizer().len(),
-    }
+    })
 }
 
 fn dynamic_panel(
@@ -75,7 +78,7 @@ fn dynamic_panel(
     training: &TrainingHyperparameters,
     epoch: usize,
     absolute_step: usize,
-) -> ResolvedRuliadValidationPanel {
+) -> Result<ResolvedRuliadValidationPanel> {
     let base_items = if training.validation.ruliad_panel.base_difficulty_levels == 0 {
         dataset.sample_ruliad_validation_probe_items(
             epoch,
@@ -111,9 +114,8 @@ fn dynamic_panel(
     let policy_items = if !training.ruliad_policy_probe.enabled {
         Vec::new()
     } else if training.ruliad_policy_probe.stratified_difficulty_levels > 0 {
-        dataset.sample_ruliad_validation_probe_items_stratified(
-            epoch,
-            absolute_step,
+        dataset.sample_ruliad_task_probe_items_fixed(
+            training.validation.seed,
             training.ruliad_policy_probe.items,
             burn_dragon_universality::RuliadTaskKind::SelectProofAction.label(),
             training.ruliad_policy_probe.stratified_difficulty_levels,
@@ -125,12 +127,26 @@ fn dynamic_panel(
             .cloned()
             .collect()
     };
-    ResolvedRuliadValidationPanel {
+    validate_difficulty_strata(
+        "base",
+        &base_items,
+        training.validation.ruliad_panel.base_difficulty_levels,
+        training.events.ruliad_correctness_probe_items,
+    )?;
+    if training.ruliad_policy_probe.enabled {
+        validate_difficulty_strata(
+            "policy",
+            &policy_items,
+            training.ruliad_policy_probe.stratified_difficulty_levels,
+            training.ruliad_policy_probe.items,
+        )?;
+    }
+    Ok(ResolvedRuliadValidationPanel {
         base_items,
         training_serialization_items,
         policy_items,
         fingerprint_sha256: None,
-    }
+    })
 }
 
 fn materialize_payload(
@@ -172,9 +188,8 @@ fn materialize_payload(
     let policy_items = if !request.policy_enabled {
         Vec::new()
     } else if request.policy_difficulty_levels > 0 {
-        dataset.sample_ruliad_validation_probe_items_stratified(
-            0,
-            0,
+        dataset.sample_ruliad_task_probe_items_fixed(
+            request.seed,
             request.policy_items,
             &request.policy_task_kind,
             request.policy_difficulty_levels,
@@ -214,12 +229,51 @@ fn materialize_payload(
             expected_policy_items
         );
     }
+    validate_difficulty_strata(
+        "base",
+        &base_items,
+        request.base_difficulty_levels,
+        request.base_items,
+    )?;
+    if request.policy_enabled {
+        validate_difficulty_strata(
+            "policy",
+            &policy_items,
+            request.policy_difficulty_levels,
+            expected_policy_items,
+        )?;
+    }
     Ok(RuliadValidationPanelPayload {
         request,
         base_items,
         training_serialization_items,
         policy_items,
     })
+}
+
+fn validate_difficulty_strata(
+    panel: &str,
+    items: &[RuliadValidationProbeItem],
+    requested_levels: usize,
+    requested_items: usize,
+) -> Result<()> {
+    if requested_levels == 0 {
+        return Ok(());
+    }
+    let expected_levels = requested_levels.min(requested_items);
+    let observed = items
+        .iter()
+        .filter_map(|item| item.item.difficulty_level)
+        .collect::<BTreeSet<_>>();
+    if observed.len() != expected_levels {
+        bail!(
+            "Ruliad {panel} panel materialized {} difficulty strata, expected {}: {:?}",
+            observed.len(),
+            expected_levels,
+            observed,
+        );
+    }
+    Ok(())
 }
 
 fn payload_fingerprint(payload: &RuliadValidationPanelPayload) -> Result<String> {
@@ -265,6 +319,20 @@ fn validate_manifest(
         policy_items,
         ..
     } = manifest.payload;
+    validate_difficulty_strata(
+        "base",
+        &base_items,
+        expected_request.base_difficulty_levels,
+        expected_request.base_items,
+    )?;
+    if expected_request.policy_enabled {
+        validate_difficulty_strata(
+            "policy",
+            &policy_items,
+            expected_request.policy_difficulty_levels,
+            expected_request.policy_items,
+        )?;
+    }
     Ok(ResolvedRuliadValidationPanel {
         base_items,
         training_serialization_items,
@@ -359,13 +427,13 @@ pub(crate) fn resolve_ruliad_validation_panel(
 ) -> Result<ResolvedRuliadValidationPanel> {
     let config = &training.validation.ruliad_panel;
     if matches!(config.mode, RuliadValidationPanelMode::Dynamic) {
-        return Ok(dynamic_panel(dataset, training, epoch, absolute_step));
+        return dynamic_panel(dataset, training, epoch, absolute_step);
     }
     let path = config
         .path
         .as_deref()
         .ok_or_else(|| anyhow!("persisted Ruliad validation panel requires a path"))?;
-    let request = panel_request(training, dataset);
+    let request = panel_request(training, dataset)?;
     match config.mode {
         RuliadValidationPanelMode::Dynamic => unreachable!(),
         RuliadValidationPanelMode::CreateOrReuse => create_or_reuse(path, dataset, &request),
@@ -380,6 +448,7 @@ mod tests {
     #[test]
     fn manifest_rejects_tampering_and_request_drift() {
         let request = RuliadValidationPanelRequest {
+            corpus_semantic_fingerprint: Some("corpus-v1".into()),
             seed: 7,
             base_items: 0,
             base_difficulty_levels: 4,
@@ -417,6 +486,19 @@ mod tests {
                     payload: payload.clone(),
                 },
                 &drifted,
+            )
+            .is_err()
+        );
+        let mut changed_corpus = request.clone();
+        changed_corpus.corpus_semantic_fingerprint = Some("corpus-v2".into());
+        assert!(
+            validate_manifest(
+                RuliadValidationPanelManifest {
+                    schema_version: PANEL_SCHEMA_VERSION,
+                    fingerprint_sha256: payload_fingerprint(&payload).unwrap(),
+                    payload: payload.clone(),
+                },
+                &changed_corpus,
             )
             .is_err()
         );

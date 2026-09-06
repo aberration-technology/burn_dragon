@@ -1,0 +1,6 @@
+[training.validation]
+# More state-carry evidence without increasing training-time loss readbacks.
+batches = 128
+
+[training.sequence_state_probe]
+paired_batches = 64

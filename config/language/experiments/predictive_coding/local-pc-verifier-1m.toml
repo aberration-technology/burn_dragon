@@ -16,7 +16,9 @@ every_epochs = 1
 # search is a separate, substantially more expensive promotion gate.
 closed_loop_every_epochs = 1000000
 items = 32
-max_steps = 16
+# Never cap a proof below its verifier certificate. Automatic mode remains
+# finite per item and allows four certificate lengths for recovery/search.
+max_steps = 0
 candidates = 4
 beam_width = 1
 scoring_batch_rows = 32

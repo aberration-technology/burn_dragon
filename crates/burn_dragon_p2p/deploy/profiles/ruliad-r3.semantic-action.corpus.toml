@@ -19,7 +19,9 @@ eos_id = 271
 
 [source_selection]
 enabled = true
-difficulty_levels = { min = 0, max = 1 }
+# Materialize four fixed comparison strata initially. Frontier extension remains
+# unbounded and can generate levels beyond this range as capability advances.
+difficulty_levels = { min = 0, max = 3 }
 
 [source_selection.formal_task_mix]
 advance_proof_weight = 0

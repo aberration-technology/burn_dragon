@@ -6,6 +6,11 @@ use super::*;
 pub struct RuliadModelEvaluation {
     pub report: burn_dragon_universality::RuliadEvalReport,
     pub item_count: usize,
+    pub teacher_forced: RuliadTeacherForcedEvaluation,
+    /// Mean number of model-token IDs emitted through the first document-close
+    /// token. This is distinct from the universality report's legacy
+    /// whitespace-segment count for decoded symbolic text.
+    pub mean_generated_model_tokens: f64,
     pub elapsed_ms: f64,
     pub generation_mean_batch_rows: f64,
     pub generation_maximum_batch_rows: usize,
@@ -56,6 +61,8 @@ where
     Ok(Some(RuliadModelEvaluation {
         report: evaluation.report,
         item_count: evaluation.item_count,
+        teacher_forced: evaluation.teacher_forced,
+        mean_generated_model_tokens: evaluation.mean_generated_model_tokens,
         elapsed_ms: evaluation.elapsed_ms,
         generation_mean_batch_rows: evaluation.generation_stats.mean_batch_rows,
         generation_maximum_batch_rows: evaluation.generation_stats.maximum_batch_rows,
@@ -115,6 +122,8 @@ where
 pub(super) struct RuliadCorrectnessEvaluation {
     pub(super) report: burn_dragon_universality::RuliadEvalReport,
     pub(super) item_count: usize,
+    pub(super) teacher_forced: RuliadTeacherForcedEvaluation,
+    pub(super) mean_generated_model_tokens: f64,
     pub(super) elapsed_ms: f64,
     pub(super) generation_stats: RuliadProbeGenerationStats,
 }
@@ -144,6 +153,21 @@ where
     B::Device: Clone,
 {
     let probe_started = burn_dragon_time::Instant::now();
+    let teacher_forced = evaluate_ruliad_teacher_forced_context(
+        dataset,
+        model,
+        training,
+        probe_items,
+        training_batch_size,
+        device,
+    )?;
+    if run_name.is_none() {
+        eprintln!(
+            "ruliad checkpoint panel={dataset_name} stage=teacher_forced_finished items={} elapsed_ms={}",
+            probe_items.len(),
+            probe_started.elapsed().as_millis()
+        );
+    }
     let mut items = Vec::with_capacity(probe_items.len());
     let mut completions = Vec::with_capacity(probe_items.len());
     let mut generated_token_rows = Vec::with_capacity(probe_items.len());
@@ -182,6 +206,12 @@ where
         &generation_budgets,
         training_batch_size,
     )?;
+    if run_name.is_none() {
+        eprintln!(
+            "ruliad checkpoint panel={dataset_name} stage=generation_finished elapsed_ms={}",
+            probe_started.elapsed().as_millis()
+        );
+    }
     let generation_mode = match (
         generation_stats.batched_rows > 0,
         generation_stats.independent_rows > 0,
@@ -217,13 +247,16 @@ where
     }
 
     let report = burn_dragon_universality::evaluate_completions(dataset_name, &items, &completions);
+    let completion_degeneracy =
+        ruliad_completion_degeneracy_summary(&generated_token_rows, close_token_id);
+    let mean_generated_model_tokens = completion_degeneracy
+        .map(RuliadCompletionDegeneracySummary::mean_model_tokens)
+        .unwrap_or(0.0);
     let elapsed_ms = probe_started.elapsed().as_millis() as f64;
     if let (Some(run_name), Some(run_dir), Some(probe_name), Some(bus)) =
         (run_name, run_dir, probe_name, bus)
     {
         let schema_alignment = ruliad_answer_schema_alignment_summary(&items, &completions);
-        let completion_degeneracy =
-            ruliad_completion_degeneracy_summary(&generated_token_rows, close_token_id);
         let examples = ruliad_probe_examples(
             &items,
             &completions,
@@ -259,6 +292,17 @@ where
             completion_degeneracy,
             generation_budget: ruliad_probe_generation_budget_summary(&generation_budgets),
         });
+        emit_ruliad_teacher_forced_metrics(
+            RuliadProbeIdentity {
+                run_name,
+                epoch,
+                absolute_step,
+                probe_name,
+            },
+            metric_prefix,
+            teacher_forced,
+            bus,
+        );
         let metric_scope = metric_prefix.unwrap_or("Ruliad");
         for (name, value) in [
             (format!("{metric_scope} Probe Elapsed MS"), elapsed_ms),
@@ -358,6 +402,8 @@ where
     Ok(RuliadCorrectnessEvaluation {
         report,
         item_count: items.len(),
+        teacher_forced,
+        mean_generated_model_tokens,
         elapsed_ms,
         generation_stats,
     })
@@ -792,6 +838,12 @@ pub(super) struct RuliadCompletionDegeneracySummary {
     pub(super) max_period_2_to_16_fraction: f64,
     pub(super) max_period_2_to_64_fraction: f64,
     pub(super) dominant_period_2_to_64: usize,
+}
+
+impl RuliadCompletionDegeneracySummary {
+    pub(super) fn mean_model_tokens(self) -> f64 {
+        ratio_usize(self.token_count, self.sequence_count)
+    }
 }
 
 pub(super) fn ruliad_answer_schema_alignment_summary(
@@ -1582,7 +1634,9 @@ pub(super) fn ruliad_capability_probe_sample(
         actual_answer_dominant_fraction: Some(f64::from(report.actual_answer_dominant_fraction)),
         field_value_distinct_ratio: Some(f64::from(report.field_value_distinct_ratio)),
         field_value_dominant_fraction: Some(f64::from(report.actual_field_value_dominant_fraction)),
-        mean_completion_tokens: f64::from(report.mean_completion_tokens),
+        mean_completion_tokens: completion_degeneracy
+            .map(RuliadCompletionDegeneracySummary::mean_model_tokens)
+            .unwrap_or_else(|| f64::from(report.mean_completion_tokens)),
         achieved_difficulty_level: ruliad_achieved_verifier_difficulty(report),
         output_entropy_bits: output_degeneracy.map(|stats| stats.entropy_bits),
         output_distinct_2_fraction: output_degeneracy.map(|stats| stats.distinct_2_fraction),
@@ -1647,14 +1701,18 @@ pub(super) fn ruliad_achieved_verifier_difficulty(
 pub(super) fn run_source_weighted_validation_forward_only<B>(
     env: &ForwardEggrollTrainEnvironment<'_, B>,
     valid_model: &LanguageTrainModel<B>,
-    epoch: usize,
     steps_per_epoch: usize,
-    bus: &TrainingEventBus,
+    event: TrainingEventContext<'_>,
 ) -> Result<Option<f64>>
 where
     B: BackendTrait + Clone + 'static,
     B::Device: Clone,
 {
+    let TrainingEventContext {
+        epoch,
+        absolute_step: training_absolute_step,
+        bus,
+    } = event;
     let requested_batches = env.training.events.source_weighted_validation_batches;
     if requested_batches == 0 {
         return Ok(None);
@@ -1690,7 +1748,7 @@ where
             split: TrainingMetricSplit::Valid,
             epoch,
             step_in_epoch: count,
-            absolute_step,
+            absolute_step: training_absolute_step,
             name: "Source Weighted Loss".to_string(),
             value: loss,
             running_value: total / count as f64,

@@ -1,0 +1,61 @@
+extends = "local-pc-verifier-1m-decoder-coupled.toml"
+
+# Matched E1 pilot, not a production recipe or a long-horizon promotion.
+[dataset]
+ruliad_source_selection_feedback_updates_enabled = false
+ruliad_source_selection_cold_start_enabled = false
+
+[training]
+batch_size = 8
+block_size = 1024
+max_iters = 512
+checkpoint_interval_iters = 128
+log_frequency = 16
+seed = 13
+tbptt_chunk_size = 64
+tbptt_persist_across_steps = true
+sequence_batching = "streaming"
+launch_mode = "fresh"
+
+[training.provenance]
+initial_model_fingerprint = true
+
+[training.events]
+flush_every_steps = 8
+source_selection_every_steps = 16
+source_weighted_validation_batches = 1
+degeneracy_probe_every_epochs = 1
+degeneracy_probe_tokens = 64
+ruliad_correctness_probe_every_epochs = 1
+ruliad_correctness_probe_items = 64
+ruliad_correctness_probe_tokens = 64
+
+[training.validation]
+sampling = "fixed_holdout"
+objective = "fixed_holdout"
+
+[training.validation.ruliad_panel]
+mode = "create_or_reuse"
+path = "target/experiments/panels/evaluation-contract-v4.json"
+base_difficulty_levels = 4
+
+[training.ruliad_supervision.proof_policy]
+# Keep model-visited training out of this evaluator-correctness pilot.
+dagger_start_after_steps = 2048
+
+[training.ruliad_supervision.prompt_value_binding]
+require_scheduled_update = true
+
+[training.ruliad_policy_probe]
+scoring = "residual_energy"
+normalization = "candidate_conditional"
+prompt_context = "local_action_state"
+
+[training.continual_backprop]
+enabled = false
+
+[training.neuron_scaling]
+enabled = false
+
+[training.dynamics]
+enabled = false

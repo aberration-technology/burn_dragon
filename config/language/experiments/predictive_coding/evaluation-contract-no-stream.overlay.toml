@@ -1,0 +1,5 @@
+# Ablate maintenance of stream state that these self-contained policy/decoder
+# objectives do not read. Keep streaming DATA and within-row recurrent attention.
+# This is not evidence against TBPTT on objectives that consume carried state.
+[training]
+tbptt_persist_across_steps = false

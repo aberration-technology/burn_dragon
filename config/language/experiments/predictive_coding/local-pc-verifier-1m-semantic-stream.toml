@@ -1,0 +1,20 @@
+extends = "local-pc-verifier-1m-semantic-policy.toml"
+
+# Unbounded proof documents are consumed as ordered blocks. Rho carries the
+# prompt/proof state into the answer block; host supervision metadata prevents
+# context-only blocks from becoming AdamW decay updates.
+[training]
+block_size = 128
+batch_size = 32
+tbptt_chunk_size = 128
+tbptt_persist_across_steps = true
+sequence_batching = "streaming"
+
+[training.validation]
+sampling = "fixed_holdout"
+objective = "stream_warm"
+
+[training.sequence_state_probe]
+enabled = true
+paired_batches = 8
+max_rho_slots = 64

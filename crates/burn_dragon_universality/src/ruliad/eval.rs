@@ -214,6 +214,7 @@ fn ruliad_presented_action_set(
         certificate,
         proof_step_index: Some(step_index),
         action_presentation_rotation,
+        action_candidate_count,
         action_answer_contract,
         task,
         ..
@@ -228,7 +229,9 @@ fn ruliad_presented_action_set(
         problem,
         certificate,
         *step_index,
-        crate::ruliad::policy::DEFAULT_PROOF_ACTION_CANDIDATES,
+        action_candidate_count
+            .unwrap_or(crate::ruliad::policy::DEFAULT_PROOF_ACTION_CANDIDATES)
+            .max(2),
     )
     .ok()?;
     let actions = actions
@@ -1756,6 +1759,7 @@ fn score_formal_certificate_answer(
         certificate: oracle_certificate,
         proof_step_index,
         action_presentation_rotation,
+        action_candidate_count,
         action_answer_contract,
         task,
         ..
@@ -1778,6 +1782,7 @@ fn score_formal_certificate_answer(
             oracle_certificate,
             *proof_step_index,
             *action_presentation_rotation,
+            *action_candidate_count,
             *action_answer_contract,
         ));
     }
@@ -1846,6 +1851,7 @@ fn score_formal_action_answer(
     oracle_certificate: &crate::ruliad::ir::RuliadProofCertificate,
     proof_step_index: Option<usize>,
     action_presentation_rotation: Option<usize>,
+    action_candidate_count: Option<usize>,
     answer_contract: crate::ruliad::config::RuliadProofActionAnswerContract,
 ) -> AnswerFieldScore {
     let malformed = || AnswerFieldScore {
@@ -1862,7 +1868,9 @@ fn score_formal_action_answer(
         problem,
         oracle_certificate,
         step_index,
-        crate::ruliad::policy::DEFAULT_PROOF_ACTION_CANDIDATES,
+        action_candidate_count
+            .unwrap_or(crate::ruliad::policy::DEFAULT_PROOF_ACTION_CANDIDATES)
+            .max(2),
     ) else {
         return malformed();
     };
@@ -3874,6 +3882,7 @@ mod tests {
             candidate: None,
             proof_step_index: None,
             action_presentation_rotation: None,
+            action_candidate_count: None,
             action_answer_contract: Default::default(),
             task: RuliadTaskKind::ConstructProof,
         };
@@ -3918,6 +3927,7 @@ mod tests {
             candidate: None,
             proof_step_index: Some(step_index),
             action_presentation_rotation: None,
+            action_candidate_count: None,
             action_answer_contract: Default::default(),
             task: RuliadTaskKind::AdvanceProof,
         };
@@ -3961,6 +3971,7 @@ mod tests {
             candidate: None,
             proof_step_index: Some(step_index),
             action_presentation_rotation: Some(action_presentation_rotation),
+            action_candidate_count: Some(actions.candidates.len()),
             action_answer_contract: Default::default(),
             task: RuliadTaskKind::SelectProofAction,
         };
@@ -3995,10 +4006,11 @@ mod tests {
             &bundle.problem,
             &bundle.certificate,
             step_index,
-            crate::ruliad::policy::DEFAULT_PROOF_ACTION_CANDIDATES,
+            3,
         )
         .and_then(|actions| actions.rotate_left(rotation))
         .expect("presented actions");
+        assert_eq!(actions.candidates.len(), 3);
         let contract = crate::ruliad::config::RuliadProofActionAnswerContract::SemanticStep;
         let expected =
             crate::ruliad::policy::proof_action_answer(&actions, actions.selected_index, contract)
@@ -4009,6 +4021,7 @@ mod tests {
             candidate: None,
             proof_step_index: Some(step_index),
             action_presentation_rotation: Some(rotation),
+            action_candidate_count: Some(actions.candidates.len()),
             action_answer_contract: contract,
             task: RuliadTaskKind::SelectProofAction,
         };
@@ -4093,6 +4106,7 @@ mod tests {
             candidate: None,
             proof_step_index: None,
             action_presentation_rotation: None,
+            action_candidate_count: None,
             action_answer_contract: Default::default(),
             task: RuliadTaskKind::ConstructProof,
         };

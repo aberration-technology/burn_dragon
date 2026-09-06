@@ -186,6 +186,10 @@ impl<B: Backend> Attention<B> {
         device: &B::Device,
         kernel: &FusedKernelConfig,
     ) -> Self {
+        if let Some(slopes) = &kernel.alibi_slopes {
+            linear_attention::validate_alibi_slopes(slopes, n_head)
+                .unwrap_or_else(|error| panic!("invalid attention config: {error}"));
+        }
         let freqs = Self::build_freqs(latent, kernel.rope_theta, kernel.rotary_embedding, device);
         let use_alibi = matches!(kernel.rotary_embedding, RotaryEmbedding::Alibi);
         let (use_alibi, slopes) = if use_alibi {

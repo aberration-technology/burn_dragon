@@ -5,16 +5,20 @@ use super::*;
 pub(super) fn run_source_weighted_validation<B>(
     env: &TrainEnvironment<'_, B>,
     valid_model: &LanguageTrainModel<ValidBackend<B>>,
-    epoch: usize,
     steps_per_epoch: usize,
     batch_size: usize,
-    bus: &TrainingEventBus,
     context_routing: Option<&crate::train::PredictiveContextRoutingRuntime<B>>,
+    event: TrainingEventContext<'_>,
 ) -> Result<Option<f64>>
 where
     B: AutodiffBackend + Clone + 'static,
     B::Device: Clone,
 {
+    let TrainingEventContext {
+        epoch,
+        absolute_step: training_absolute_step,
+        bus,
+    } = event;
     let requested_batches = env.training.events.source_weighted_validation_batches;
     if requested_batches == 0 {
         return Ok(None);
@@ -55,7 +59,7 @@ where
             split: TrainingMetricSplit::Valid,
             epoch,
             step_in_epoch: count,
-            absolute_step,
+            absolute_step: training_absolute_step,
             name: "Source Weighted Loss".to_string(),
             value: loss,
             running_value: total / count as f64,
@@ -80,7 +84,9 @@ pub(super) struct RuliadCorrectnessValidation<'a, B: BackendTrait> {
 #[derive(Clone, Debug)]
 pub(super) struct RuliadCorrectnessValidationResult {
     pub(super) free_run: burn_dragon_universality::RuliadEvalReport,
+    pub(super) policy_context_free_run: Option<burn_dragon_universality::RuliadEvalReport>,
     pub(super) closed_loop_policy: Option<RuliadPolicyRolloutProbeResult>,
+    pub(super) constrained_policy: Option<RuliadCorrectnessConstrainedPolicyResult>,
 }
 
 pub(super) fn ruliad_constrained_policy_probe_due(
@@ -158,6 +164,7 @@ where
         );
     }
     let probe_items = panel.base_items;
+    let policy_items = panel.policy_items;
     if probe_items.is_empty() {
         return Ok(None);
     }
@@ -196,7 +203,7 @@ where
             base_absolute_step,
             device,
             training,
-            &panel.policy_items,
+            &policy_items,
             bus,
         )?)
     } else {
@@ -244,8 +251,36 @@ where
             bus,
         );
     }
-    if ruliad_constrained_policy_probe_due(training, epoch) {
-        run_ruliad_correctness_constrained_policy_probe(
+    let constrained_policy_due = ruliad_constrained_policy_probe_due(training, epoch);
+    let policy_context_free_run = if constrained_policy_due && !policy_items.is_empty() {
+        let policy_context_items = ruliad_policy_context_probe_items(
+            dataset,
+            &policy_items,
+            &training.ruliad_policy_probe,
+        )?;
+        Some(run_ruliad_correctness_validation_for_items(
+            run_name,
+            run_dir,
+            dataset,
+            model,
+            epoch,
+            base_absolute_step,
+            device,
+            training,
+            &policy_context_items,
+            training_batch_size,
+            "ruliad_policy_context_probe",
+            "ruliad_correctness_policy_context",
+            Some("Ruliad Policy Context"),
+            None,
+            bus,
+            RuliadProbeDecodeMode::FreeRun,
+        )?)
+    } else {
+        None
+    };
+    let constrained_policy = if constrained_policy_due {
+        Some(run_ruliad_correctness_constrained_policy_probe(
             run_name,
             dataset,
             model,
@@ -253,10 +288,13 @@ where
             base_absolute_step,
             device,
             training,
-            &probe_items,
+            &policy_items,
             bus,
-        )?;
-    }
+            RuliadPolicyControlMode::Disabled,
+        )?)
+    } else {
+        None
+    };
     if training.events.ruliad_contract_probe_enabled {
         let _ = run_ruliad_correctness_validation_for_items(
             run_name,
@@ -322,7 +360,9 @@ where
     }
     Ok(Some(RuliadCorrectnessValidationResult {
         free_run: base_report,
+        policy_context_free_run,
         closed_loop_policy: policy_probe_result,
+        constrained_policy,
     }))
 }
 
@@ -454,7 +494,9 @@ where
     });
     Ok(Some(RuliadCorrectnessValidationResult {
         free_run: base.report,
+        policy_context_free_run: None,
         closed_loop_policy: None,
+        constrained_policy: None,
     }))
 }
 
@@ -564,6 +606,15 @@ pub(super) struct RuliadCorrectnessConstrainedPolicySummary {
     pub(super) elapsed_ms: f64,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct RuliadCorrectnessConstrainedPolicyResult {
+    pub(super) summary: RuliadCorrectnessConstrainedPolicySummary,
+    pub(super) difficulty_summaries: BTreeMap<usize, RuliadCorrectnessConstrainedPolicySummary>,
+    pub(super) source_summaries: BTreeMap<String, RuliadCorrectnessConstrainedPolicySummary>,
+    pub(super) structured_decode: Option<RuliadStructuredPolicyEvaluation>,
+    pub(super) controls: Option<RuliadPolicyControlEvaluation>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct RuliadConstrainedActionScore {
     pub(super) equivalent_top1: bool,
@@ -573,11 +624,33 @@ pub(super) struct RuliadConstrainedActionScore {
 }
 
 pub(super) struct RuliadCorrectnessConstrainedPolicyJob {
+    pub(super) difficulty_level: usize,
+    pub(super) source_label: String,
     pub(super) presentations: Vec<RuliadPolicyActionPresentation>,
     pub(super) prompt_contexts: Vec<RuliadPolicyActionPromptContext>,
     pub(super) base_context: Option<RuliadPolicyActionPromptContext>,
     pub(super) selected_index: usize,
     pub(super) equivalent_indices: Vec<usize>,
+}
+
+pub(super) fn update_ruliad_correctness_constrained_summaries(
+    result: &mut RuliadCorrectnessConstrainedPolicyResult,
+    job: &RuliadCorrectnessConstrainedPolicyJob,
+    mut update: impl FnMut(&mut RuliadCorrectnessConstrainedPolicySummary),
+) {
+    update(&mut result.summary);
+    update(
+        result
+            .difficulty_summaries
+            .entry(job.difficulty_level)
+            .or_default(),
+    );
+    update(
+        result
+            .source_summaries
+            .entry(job.source_label.clone())
+            .or_default(),
+    );
 }
 
 #[derive(Clone)]
@@ -793,6 +866,7 @@ pub(super) fn proof_action_set_with_swapped_state(
 pub(super) fn context_swapped_action_requests(
     dataset: &Dataset,
     jobs: &[RuliadCorrectnessConstrainedPolicyJob],
+    prompt_context: crate::config::RuliadProofPolicyPromptContext,
 ) -> Result<Vec<crate::train::ruliad_policy::EncodedRuliadProofActionRequest>> {
     if jobs.len() < 2 {
         return Ok(Vec::new());
@@ -825,11 +899,12 @@ pub(super) fn context_swapped_action_requests(
                         &original_context.actions,
                         &donor_context.actions,
                     );
-                    let prompt = burn_dragon_universality::ruliad::ruliad_proof_action_prompt(
+                    let prompt = crate::train::ruliad_policy::ruliad_proof_policy_prompt(
+                        prompt_context,
                         &original_context.problem,
                         &counterfactual_actions,
                     )?;
-                    let prompt_tokens = dataset
+                    let prompt_tokens: Vec<i64> = dataset
                         .encode_ruliad_payload_tokens(&prompt)
                         .ok_or_else(|| anyhow!("Ruliad dataset cannot encode context-swap prompt"))?
                         .into_iter()
@@ -838,6 +913,7 @@ pub(super) fn context_swapped_action_requests(
                     Ok(
                         crate::train::ruliad_policy::EncodedRuliadProofActionPresentation {
                             rotation: presentation.rotation,
+                            original_prompt_token_count: prompt_tokens.len(),
                             prompt_tokens,
                             candidate_tokens: presentation.candidate_tokens.clone(),
                         },
@@ -884,6 +960,7 @@ pub(super) fn encoded_ruliad_policy_action_request(
                 .map(|presentation| {
                     crate::train::ruliad_policy::EncodedRuliadProofActionPresentation {
                         rotation: presentation.rotation,
+                        original_prompt_token_count: presentation.prompt_tokens.len(),
                         prompt_tokens: presentation.prompt_tokens.clone(),
                         candidate_tokens: presentation.candidate_tokens.clone(),
                     }
@@ -915,6 +992,7 @@ fn encode_ruliad_policy_candidate_tokens(
 pub(super) fn counterfactual_target_action_jobs(
     dataset: &Dataset,
     jobs: &[RuliadCorrectnessConstrainedPolicyJob],
+    prompt_context: crate::config::RuliadProofPolicyPromptContext,
 ) -> Result<Vec<(usize, RuliadCorrectnessConstrainedPolicyJob)>> {
     let mut counterfactual_jobs = Vec::with_capacity(jobs.len());
     for (job_index, job) in jobs.iter().enumerate() {
@@ -944,7 +1022,8 @@ pub(super) fn counterfactual_target_action_jobs(
         let mut prompt_contexts = Vec::with_capacity(job.presentations.len());
         for presentation in &job.presentations {
             let presented_actions = counterfactual_actions.rotate_left(presentation.rotation)?;
-            let prompt = burn_dragon_universality::ruliad::ruliad_proof_action_prompt(
+            let prompt = crate::train::ruliad_policy::ruliad_proof_policy_prompt(
+                prompt_context,
                 &counterfactual_problem,
                 &presented_actions,
             )?;
@@ -972,6 +1051,8 @@ pub(super) fn counterfactual_target_action_jobs(
         counterfactual_jobs.push((
             job_index,
             RuliadCorrectnessConstrainedPolicyJob {
+                difficulty_level: job.difficulty_level,
+                source_label: job.source_label.clone(),
                 presentations,
                 prompt_contexts,
                 base_context: Some(RuliadPolicyActionPromptContext {
@@ -1111,6 +1192,87 @@ pub(super) fn record_ruliad_correctness_orbit_diagnostics(
     }
 }
 
+/// Materialize free-generation rows from the exact state representation used by the typed proof
+/// policy. This keeps policy selection, autoregressive rendering, and verifier scoring on one
+/// conditional contract while preserving the separate document-prompt probes.
+pub(super) fn ruliad_policy_context_probe_items(
+    dataset: &Dataset,
+    probe_items: &[crate::dataset::RuliadValidationProbeItem],
+    config: &crate::config::RuliadPolicyProbeConfig,
+) -> Result<Vec<crate::dataset::RuliadValidationProbeItem>> {
+    probe_items
+        .iter()
+        .map(|probe| {
+            let Some(burn_dragon_universality::RuliadSampleSpec::FormalProof {
+                problem,
+                certificate,
+                proof_step_index,
+                action_answer_contract,
+                task: burn_dragon_universality::ruliad::RuliadTaskKind::SelectProofAction,
+                ..
+            }) = probe.item.spec.as_ref()
+            else {
+                return Err(anyhow!(
+                    "policy-context generation panel contains a non-proof-action item"
+                ));
+            };
+            let actions = burn_dragon_universality::ruliad::oracle_proof_action_set(
+                problem,
+                certificate,
+                proof_step_index.unwrap_or_default(),
+                config.candidates,
+            )?;
+            let prompt = crate::train::ruliad_policy::ruliad_proof_policy_prompt(
+                config.prompt_context,
+                problem,
+                &actions,
+            )?;
+            let answer_contract = match config.scoring {
+                crate::config::RuliadProofPolicyScoring::CompletionLikelihood => {
+                    *action_answer_contract
+                }
+                crate::config::RuliadProofPolicyScoring::SemanticEnergy
+                | crate::config::RuliadProofPolicyScoring::ResidualEnergy => {
+                    burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::SemanticStep
+                }
+            };
+            let expected_answer = burn_dragon_universality::ruliad::proof_action_answer(
+                &actions,
+                actions.selected_index,
+                answer_contract,
+            )?;
+            let prompt_tokens = dataset
+                .encode_ruliad_payload_tokens(&prompt)
+                .ok_or_else(|| anyhow!("failed to encode the proof-policy prompt"))?
+                .into_iter()
+                .map(i64::from)
+                .collect::<Vec<_>>();
+            if prompt_tokens.is_empty() {
+                return Err(anyhow!("proof-policy prompt encoded to no tokens"));
+            }
+
+            let mut item = probe.item.clone();
+            item.prompt = prompt;
+            item.expected_answer = expected_answer;
+            if let Some(burn_dragon_universality::RuliadSampleSpec::FormalProof {
+                action_presentation_rotation,
+                action_candidate_count,
+                action_answer_contract,
+                ..
+            }) = item.spec.as_mut()
+            {
+                *action_presentation_rotation = Some(0);
+                *action_candidate_count = Some(config.candidates);
+                *action_answer_contract = answer_contract;
+            }
+            Ok(crate::dataset::RuliadValidationProbeItem {
+                item,
+                prompt_tokens,
+            })
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_ruliad_correctness_constrained_policy_probe<B>(
     run_name: &str,
@@ -1122,7 +1284,8 @@ pub(super) fn run_ruliad_correctness_constrained_policy_probe<B>(
     training: &TrainingHyperparameters,
     probe_items: &[crate::dataset::RuliadValidationProbeItem],
     bus: &TrainingEventBus,
-) -> Result<RuliadCorrectnessConstrainedPolicySummary>
+    control_mode: RuliadPolicyControlMode,
+) -> Result<RuliadCorrectnessConstrainedPolicyResult>
 where
     B: BackendTrait + Clone + 'static,
     B::Device: Clone,
@@ -1130,6 +1293,7 @@ where
     let config = training.ruliad_policy_probe;
     let started = burn_dragon_time::Instant::now();
     let mut jobs = Vec::<RuliadCorrectnessConstrainedPolicyJob>::new();
+    let mut structured_items = Vec::new();
     for (probe_index, probe) in probe_items.iter().enumerate() {
         let Some(burn_dragon_universality::RuliadSampleSpec::FormalProof {
             problem,
@@ -1162,7 +1326,8 @@ where
                         burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::SemanticStep
                     }
                 };
-                let prompt_text = burn_dragon_universality::ruliad::ruliad_proof_action_prompt(
+                let prompt_text = crate::train::ruliad_policy::ruliad_proof_policy_prompt(
+                    config.prompt_context,
                     problem,
                     &presented_actions,
                 )
@@ -1201,7 +1366,22 @@ where
             continue;
         };
         let (presentations, prompt_contexts) = encoded_presentations.into_iter().unzip();
+        let answer_contract = match action_answer_contract {
+            burn_dragon_universality::RuliadProofActionAnswerContract::PresentationIndex => {
+                "action_index"
+            }
+            burn_dragon_universality::RuliadProofActionAnswerContract::SemanticStep => {
+                "proof_action_step"
+            }
+        };
         jobs.push(RuliadCorrectnessConstrainedPolicyJob {
+            difficulty_level: probe.item.difficulty_level.unwrap_or_default(),
+            source_label: burn_dragon_universality::ruliad_source_capability_label(
+                &probe.item.family,
+                &probe.item.task_kind,
+                probe.item.difficulty_level.unwrap_or_default(),
+                answer_contract,
+            ),
             presentations,
             prompt_contexts,
             base_context: Some(RuliadPolicyActionPromptContext {
@@ -1211,24 +1391,40 @@ where
             selected_index: actions.selected_index,
             equivalent_indices: actions.equivalent_indices,
         });
+        let mut structured_item = probe.item.clone();
+        if let Some(burn_dragon_universality::RuliadSampleSpec::FormalProof {
+            action_candidate_count,
+            ..
+        }) = structured_item.spec.as_mut()
+        {
+            *action_candidate_count = Some(config.candidates);
+        }
+        structured_items.push(structured_item);
     }
 
-    let mut summary = RuliadCorrectnessConstrainedPolicySummary::default();
+    let mut result = RuliadCorrectnessConstrainedPolicyResult::default();
     let requests = jobs
         .iter()
         .map(encoded_ruliad_policy_action_request)
         .collect::<Result<Vec<_>>>()?;
-    let swapped_requests = context_swapped_action_requests(dataset, &jobs)?;
-    let counterfactual_jobs = counterfactual_target_action_jobs(dataset, &jobs)?;
+    let swapped_requests = context_swapped_action_requests(dataset, &jobs, config.prompt_context)?;
+    let counterfactual_jobs =
+        counterfactual_target_action_jobs(dataset, &jobs, config.prompt_context)?;
     let counterfactual_requests = counterfactual_jobs
         .iter()
         .map(|(_, job)| encoded_ruliad_policy_action_request(job))
         .collect::<Result<Vec<_>>>()?;
     let original_request_count = requests.len();
     let swapped_request_count = swapped_requests.len();
+    let counterfactual_request_count = counterfactual_requests.len();
+    let controls = match control_mode {
+        RuliadPolicyControlMode::Disabled => Vec::new(),
+        RuliadPolicyControlMode::Checkpoint => no_context_action_requests(dataset, &requests)?,
+    };
     let mut scoring_requests = requests;
     scoring_requests.extend(swapped_requests);
     scoring_requests.extend(counterfactual_requests);
+    scoring_requests.extend(controls);
     let mut decisions =
         crate::train::ruliad_policy::select_ruliad_proof_actions_batch_with_contract(
             &model.model,
@@ -1243,29 +1439,46 @@ where
     } else {
         Vec::new()
     };
-    let counterfactual_decisions = if auxiliary_decisions.len() > swapped_request_count {
+    let mut counterfactual_decisions = if auxiliary_decisions.len() > swapped_request_count {
         auxiliary_decisions.split_off(swapped_request_count)
     } else {
         Vec::new()
     };
+    let control_decisions = if counterfactual_decisions.len() > counterfactual_request_count {
+        counterfactual_decisions.split_off(counterfactual_request_count)
+    } else {
+        Vec::new()
+    };
     let swapped_decisions = auxiliary_decisions;
+    if control_mode == RuliadPolicyControlMode::Checkpoint {
+        result.controls = Some(evaluate_ruliad_policy_controls(
+            &structured_items,
+            &jobs,
+            &decisions,
+            &control_decisions,
+        )?);
+    }
     for (index, job) in jobs.iter().enumerate() {
         let Some(decision) = decisions.get(index) else {
             continue;
         };
-        record_ruliad_correctness_constrained_scores(
-            &mut summary,
-            job,
-            &decision.orbit.averaged_log_probs,
-        );
-        record_ruliad_correctness_orbit_diagnostics(&mut summary, job, &decision.orbit);
-        if let Some(swapped) = swapped_decisions.get(index) {
-            record_ruliad_correctness_context_swap(
-                &mut summary,
+        update_ruliad_correctness_constrained_summaries(&mut result, job, |summary| {
+            record_ruliad_correctness_constrained_scores(
+                summary,
                 job,
                 &decision.orbit.averaged_log_probs,
-                &swapped.orbit.averaged_log_probs,
             );
+            record_ruliad_correctness_orbit_diagnostics(summary, job, &decision.orbit);
+        });
+        if let Some(swapped) = swapped_decisions.get(index) {
+            update_ruliad_correctness_constrained_summaries(&mut result, job, |summary| {
+                record_ruliad_correctness_context_swap(
+                    summary,
+                    job,
+                    &decision.orbit.averaged_log_probs,
+                    &swapped.orbit.averaged_log_probs,
+                );
+            });
         }
     }
     for ((original_index, counterfactual_job), counterfactual_decision) in
@@ -1274,14 +1487,66 @@ where
         let Some(original_decision) = decisions.get(*original_index) else {
             continue;
         };
-        record_ruliad_correctness_counterfactual_target(
-            &mut summary,
+        update_ruliad_correctness_constrained_summaries(
+            &mut result,
             counterfactual_job,
-            &original_decision.orbit.averaged_log_probs,
-            &counterfactual_decision.orbit.averaged_log_probs,
+            |summary| {
+                record_ruliad_correctness_counterfactual_target(
+                    summary,
+                    counterfactual_job,
+                    &original_decision.orbit.averaged_log_probs,
+                    &counterfactual_decision.orbit.averaged_log_probs,
+                );
+            },
         );
     }
-    summary.elapsed_ms = started.elapsed().as_micros() as f64 / 1_000.0;
+    let structured = evaluate_ruliad_structured_policy_decisions(
+        "ruliad_correctness",
+        &structured_items,
+        &jobs,
+        &decisions,
+    )?;
+    if structured.evaluation.report.verifier_match_count != result.summary.equivalent_top1 {
+        return Err(anyhow!(
+            "structured proof-policy verifier disagrees with semantic top-1: verifier={} constrained={}",
+            structured.evaluation.report.verifier_match_count,
+            result.summary.equivalent_top1
+        ));
+    }
+    let structured_examples = ruliad_probe_examples(
+        &structured.items,
+        &structured.completions,
+        training.events.capability_probe_example_count,
+    );
+    emit_ruliad_correctness_metrics_with_labels(RuliadCorrectnessMetrics {
+        identity: RuliadProbeIdentity {
+            run_name,
+            epoch,
+            absolute_step,
+            probe_name: "ruliad_correctness_structured_policy",
+        },
+        report: &structured.evaluation.report,
+        bus,
+        metric_prefix: Some("Ruliad Structured Policy"),
+        output_degeneracy: None,
+        examples: &structured_examples,
+        schema_alignment: ruliad_answer_schema_alignment_summary(
+            &structured.items,
+            &structured.completions,
+        ),
+        completion_degeneracy: None,
+        generation_budget: None,
+    });
+    result.structured_decode = Some(structured.evaluation);
+    let elapsed_ms = started.elapsed().as_micros() as f64 / 1_000.0;
+    result.summary.elapsed_ms = elapsed_ms;
+    for summary in result.difficulty_summaries.values_mut() {
+        summary.elapsed_ms = elapsed_ms;
+    }
+    for summary in result.source_summaries.values_mut() {
+        summary.elapsed_ms = elapsed_ms;
+    }
+    let summary = &result.summary;
     for (name, value) in [
         ("Ruliad Correctness Constrained Items", summary.items as f64),
         (
@@ -1458,7 +1723,7 @@ where
             running_value: value,
         });
     }
-    Ok(summary)
+    Ok(result)
 }
 
 impl RuliadPolicyRolloutProbeSummary {
@@ -1599,7 +1864,8 @@ pub(super) fn prepare_ruliad_policy_search_expansions(
                         burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::SemanticStep
                     }
                 };
-                let prompt = burn_dragon_universality::ruliad::ruliad_proof_action_prompt(
+                let prompt = crate::train::ruliad_policy::ruliad_proof_policy_prompt(
+                    config.prompt_context,
                     &search.problem,
                     &presented_actions,
                 )

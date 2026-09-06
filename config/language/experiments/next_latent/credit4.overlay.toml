@@ -1,0 +1,2 @@
+[training]
+tbptt_credit_window_chunks = 4

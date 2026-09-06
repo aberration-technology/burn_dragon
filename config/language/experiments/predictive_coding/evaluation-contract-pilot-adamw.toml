@@ -1,0 +1,4 @@
+extends = "evaluation-contract-pilot.toml"
+
+[training]
+algorithm = "backpropagation"

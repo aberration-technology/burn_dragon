@@ -391,16 +391,21 @@ impl OnlineRuliadCorpus {
                     accumulator.trace_answer_weight_units = accumulator
                         .trace_answer_weight_units
                         .saturating_add(trace_answer.weight_units);
-                    if let Some(span) =
-                        query_to_answer_token_span(&self.tokenizer, &document.serialized_preview)
-                    {
+                    if let Some(geometry) = query_to_answer_token_geometry(
+                        &self.tokenizer,
+                        &document.serialized_preview,
+                    ) {
                         accumulator.query_conditioning_samples =
                             accumulator.query_conditioning_samples.saturating_add(1);
-                        accumulator.query_to_answer_tokens =
-                            accumulator.query_to_answer_tokens.saturating_add(span);
+                        accumulator.query_to_answer_tokens = accumulator
+                            .query_to_answer_tokens
+                            .saturating_add(geometry.span);
                         accumulator.max_query_to_answer_tokens =
-                            accumulator.max_query_to_answer_tokens.max(span);
-                        if span <= block_size {
+                            accumulator.max_query_to_answer_tokens.max(geometry.span);
+                        let query_block = geometry.query_token_offset / block_size;
+                        let answer_block =
+                            geometry.answer_token_offset.saturating_sub(1) / block_size;
+                        if query_block == answer_block {
                             accumulator.query_visible_within_block_samples = accumulator
                                 .query_visible_within_block_samples
                                 .saturating_add(1);
@@ -907,6 +912,9 @@ impl OnlineRuliadCorpus {
                     RuliadFormalGeneralizationContract::StructuralHoldoutV1,
                     SampleSplit::Validation,
                 ) => "structural_validation_v1",
+                (RuliadFormalGeneralizationContract::StructuralTrainSeedDisjointV1, _) => {
+                    "structural_train_seed_disjoint_v1"
+                }
             };
             reasoning_modes.push(partition.to_string());
         }
@@ -1227,14 +1235,30 @@ fn supervision_mask_summary(
     }
 }
 
-fn query_to_answer_token_span(tokenizer: &RuliadByteTokenizer, text: &str) -> Option<usize> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QueryAnswerTokenGeometry {
+    query_token_offset: usize,
+    answer_token_offset: usize,
+    span: usize,
+}
+
+fn query_to_answer_token_geometry(
+    tokenizer: &RuliadByteTokenizer,
+    text: &str,
+) -> Option<QueryAnswerTokenGeometry> {
     let query_line_break = text.find("\n?:")?;
     let query_start = query_line_break.saturating_add(1);
     let answer_line_break = text[query_start..]
         .find("\n!:")?
         .saturating_add(query_start);
     let answer_marker_end = answer_line_break.saturating_add(3);
-    Some(tokenizer.payload_token_count(text.get(query_start..answer_marker_end)?))
+    let query_token_offset = tokenizer.payload_token_count(text.get(..query_start)?);
+    let answer_token_offset = tokenizer.payload_token_count(text.get(..answer_marker_end)?);
+    Some(QueryAnswerTokenGeometry {
+        query_token_offset,
+        answer_token_offset,
+        span: answer_token_offset.saturating_sub(query_token_offset),
+    })
 }
 
 fn ratio(numerator: usize, denominator: usize) -> f64 {
@@ -1415,6 +1439,49 @@ mod tests {
             assert!(!document.serialized_preview.contains("identity_left"));
             assert!(!document.serialized_preview.contains("identity_right"));
             assert!(!document.serialized_preview.contains("compose"));
+        }
+    }
+
+    #[test]
+    fn structural_train_seed_disjoint_preserves_training_and_separates_validation() {
+        use crate::ruliad::config::RuliadFormalGeneralizationContract;
+        let mut config = config();
+        config.serialization.document_tokens = 8192;
+        config.formal_generalization = RuliadFormalGeneralizationContract::StructuralHoldoutV1;
+        config.families = vec![RuliadFamilyConfig {
+            kind: RuliadFamilyKind::FormalProof,
+            weight: 1,
+            width: Some(UsizeRangeConfig { min: 2, max: 2 }),
+            steps: Some(UsizeRangeConfig { min: 2, max: 2 }),
+        }];
+        let original = OnlineRuliadCorpus::new(config.clone()).unwrap();
+        config.formal_generalization =
+            RuliadFormalGeneralizationContract::StructuralTrainSeedDisjointV1;
+        let control = OnlineRuliadCorpus::new(config).unwrap();
+        for sample in 0..2 {
+            let train = original
+                .generate_document_for_epoch(SampleSplit::Train, 11, sample)
+                .unwrap();
+            let control_train = control
+                .generate_document_for_epoch(SampleSplit::Train, 11, sample)
+                .unwrap();
+            let validation = control
+                .generate_document_for_epoch(SampleSplit::Validation, 0, sample)
+                .unwrap();
+            assert_eq!(train.tokens, control_train.tokens);
+            assert_eq!(train.oracle_hash, control_train.oracle_hash);
+            assert_ne!(train.oracle_hash, validation.oracle_hash);
+            assert!(
+                validation
+                    .reasoning_modes
+                    .iter()
+                    .any(|mode| mode == "structural_train_seed_disjoint_v1")
+            );
+            assert!(
+                !validation
+                    .serialized_preview
+                    .contains("structural_train_seed_disjoint")
+            );
         }
     }
 

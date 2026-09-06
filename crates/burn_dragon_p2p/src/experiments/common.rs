@@ -11,7 +11,7 @@ use burn_dragon_language::api::checkpoint::apply_init_checkpoint_to_language_cor
 use burn_dragon_language::api::inference::build_model_config_with_tokenizer;
 use burn_dragon_language::config::ValidationDatasetConfig;
 use burn_dragon_language::dataset::{
-    Dataset, DatasetSplit, RandomDataLoader, SequenceBatch, StreamingDataLoader,
+    Dataset, DatasetSplit, RandomDataLoader, RuliadPolicyBatch, SequenceBatch, StreamingDataLoader,
     TokenSequenceDataset,
 };
 use burn_dragon_language::summary_event_mask_tensor;
@@ -69,6 +69,8 @@ use crate::random_scaffold::{
 
 pub type DragonLearningComponents<B> =
     LearningComponentsMarker<B, ResolvedLrScheduler, LanguageTrainModel<B>, LanguageOptimizer<B>>;
+
+pub(crate) const RULIAD_POLICY_BATCH_CONTRACT: &str = "deterministic-lease-reconstruction-v1";
 
 type DragonLearnerProjectBuilder<B> = BurnLearnerProjectBuilder<DragonLearningComponents<B>>;
 type DragonValidationSource<B> = (
@@ -308,16 +310,77 @@ where
     }
 }
 
-#[derive(Clone, Debug)]
+type RuliadPolicyBatchFactory =
+    dyn Fn(usize, usize, usize) -> Result<Option<RuliadPolicyBatch>> + Send + Sync;
+
+#[derive(Clone)]
 pub struct TokenWindowBatcher {
     summary_event_token_ids: Option<Vec<u32>>,
+    ruliad_policy_batch_factory: Option<Arc<RuliadPolicyBatchFactory>>,
+}
+
+impl std::fmt::Debug for TokenWindowBatcher {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TokenWindowBatcher")
+            .field("summary_event_token_ids", &self.summary_event_token_ids)
+            .field(
+                "ruliad_policy_batch_factory",
+                &self
+                    .ruliad_policy_batch_factory
+                    .as_ref()
+                    .map(|_| "configured"),
+            )
+            .finish()
+    }
 }
 
 impl TokenWindowBatcher {
     pub fn new(summary_event_token_ids: Option<Vec<u32>>) -> Self {
         Self {
             summary_event_token_ids,
+            ruliad_policy_batch_factory: None,
         }
+    }
+
+    fn with_ruliad_policy_dataset(
+        mut self,
+        dataset: Arc<Dataset>,
+        supervision: burn_dragon_language::RuliadSupervisionConfig,
+        steps_per_epoch: usize,
+    ) -> Self {
+        if !supervision.needs_ruliad_policy_batch() {
+            return self;
+        }
+        let steps_per_epoch = steps_per_epoch.max(1);
+        let stratified_difficulty_levels = supervision.proof_policy.stratified_difficulty_levels;
+        self.ruliad_policy_batch_factory = Some(Arc::new(
+            move |schedule_step, sample_step, batch_size| {
+                if !supervision.needs_ruliad_policy_batch_at_step(schedule_step) {
+                    return Ok(None);
+                }
+                let epoch_index = schedule_step / steps_per_epoch;
+                dataset
+                    .source_selected_ruliad_policy_batch(
+                        DatasetSplit::Train,
+                        epoch_index,
+                        sample_step,
+                        batch_size,
+                        stratified_difficulty_levels,
+                    )
+                    .map(Some)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "signed Dragon objective requires a Ruliad policy batch at schedule step {schedule_step}, but the configured corpus could not materialize one"
+                        )
+                    })
+            },
+        ));
+        self
+    }
+
+    fn requires_ruliad_policy_batch(&self) -> bool {
+        self.ruliad_policy_batch_factory.is_some()
     }
 }
 
@@ -458,6 +521,23 @@ where
     )
 }
 
+fn bind_ruliad_policy_pipeline_contract(
+    mut descriptor: LeaseDataPipelineDescriptor,
+    batcher: &TokenWindowBatcher,
+) -> LeaseDataPipelineDescriptor {
+    if batcher.requires_ruliad_policy_batch() {
+        descriptor = descriptor
+            .with_metadata_entry("ruliad_policy_batch", RULIAD_POLICY_BATCH_CONTRACT)
+            .with_metadata_entry("ruliad_policy_curriculum", "frozen-feedback-v1")
+            .with_metadata_entry(
+                "ruliad_policy_schedule",
+                "one-based-window-span-plus-batch-v1",
+            )
+            .with_metadata_entry("ruliad_policy_sample_key", "fnv1a-shard-coordinates-v1");
+    }
+    descriptor
+}
+
 impl TokenWindowBatcher {
     fn batch_items<B: Backend>(
         &self,
@@ -465,6 +545,17 @@ impl TokenWindowBatcher {
         reset_stream_state: bool,
         device: &B::Device,
     ) -> SequenceBatch<B> {
+        self.batch_items_at_step(items, reset_stream_state, None, device)
+            .expect("token-window records must satisfy the Dragon batch contract")
+    }
+
+    fn batch_items_at_step<B: Backend>(
+        &self,
+        items: Vec<TokenWindowRecord>,
+        reset_stream_state: bool,
+        schedule: Option<(usize, usize)>,
+        device: &B::Device,
+    ) -> Result<SequenceBatch<B>> {
         let batch_size = items.len().max(1);
         let block_size = items
             .first()
@@ -512,7 +603,29 @@ impl TokenWindowBatcher {
             self.summary_event_token_ids.as_deref(),
             device,
         );
-        SequenceBatch::<B> {
+        let ruliad_policy_batch = match (&self.ruliad_policy_batch_factory, schedule) {
+            (Some(factory), Some((schedule_step, sample_step))) => {
+                let batch = factory(schedule_step, sample_step, batch_size)?;
+                if let Some(batch) = batch.as_ref() {
+                    ensure!(
+                        batch.samples.len() == batch_size,
+                        "Ruliad policy batch row count {} does not match token-window batch size {batch_size}",
+                        batch.samples.len(),
+                    );
+                }
+                batch.map(Arc::new)
+            }
+            (Some(_), None) => {
+                bail!(
+                    "Ruliad policy supervision requires a lease window schedule; generic token-window batching cannot silently omit it"
+                )
+            }
+            (None, _) => None,
+        };
+        let supervised_token_count = loss_mask
+            .as_ref()
+            .map(|mask| mask.iter().filter(|value| **value != 0).count());
+        Ok(SequenceBatch::<B> {
             inputs: Tensor::<B, 2, Int>::from_data(
                 TensorData::new(inputs, [batch_size, block_size]),
                 device,
@@ -527,14 +640,12 @@ impl TokenWindowBatcher {
                     device,
                 )
             }),
+            supervised_token_count,
             summary_event_mask,
-            ruliad_policy_batch: None,
-            // Sharded P2P windows are scheduled by the learner/lease runtime,
-            // not by Dragon's generated-data clock. The training backend uses
-            // its run-local update counter for scheduled objectives here.
-            absolute_step: None,
+            ruliad_policy_batch,
+            absolute_step: schedule.map(|(schedule_step, _)| schedule_step),
             reset_stream_state,
-        }
+        })
     }
 
     fn stream_aligned_batches<B: Backend>(
@@ -552,16 +663,48 @@ impl TokenWindowBatcher {
             window_id,
         )?;
         let mut batches = Vec::with_capacity(plan.len());
-        for planned in plan {
+        let window_span = max_batches.unwrap_or(plan.len()).max(1);
+        // P2P window IDs are one-based in the training runtime. Keep window zero useful for
+        // direct tests and activation-time probes without underflowing.
+        let window_index = window_id.unwrap_or_default().saturating_sub(1) as usize;
+        for (batch_index, planned) in plan.into_iter().enumerate() {
             let items = planned
                 .record_indices
                 .iter()
                 .map(|index| records[*index].clone())
-                .collect();
-            batches.push(self.batch_items::<B>(items, planned.reset_stream_state, device));
+                .collect::<Vec<_>>();
+            let schedule_step = window_index
+                .saturating_mul(window_span)
+                .saturating_add(batch_index);
+            let sample_step = ruliad_policy_sample_step(&items, schedule_step);
+            batches.push(self.batch_items_at_step::<B>(
+                items,
+                planned.reset_stream_state,
+                Some((schedule_step, sample_step)),
+                device,
+            )?);
         }
         Ok(batches)
     }
+}
+
+fn ruliad_policy_sample_step(records: &[TokenWindowRecord], fallback: usize) -> usize {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut state = OFFSET;
+    let mut mix = |value: u64| {
+        for byte in value.to_le_bytes() {
+            state ^= u64::from(byte);
+            state = state.wrapping_mul(PRIME);
+        }
+    };
+    mix(fallback as u64);
+    for record in records {
+        mix(record.stream_group_id.unwrap_or(u64::MAX));
+        mix(record.stream_row.unwrap_or(usize::MAX) as u64);
+        mix(record.chunk_index.unwrap_or(usize::MAX) as u64);
+    }
+    state as usize
 }
 
 impl<B: Backend> Batcher<B, TokenWindowRecord, SequenceBatch<B>> for TokenWindowBatcher {
@@ -621,6 +764,7 @@ fn validation_dataset_config_for(
         validation: None,
         ruliad_source_selection_feedback_updates_enabled: None,
         ruliad_source_selection_cold_start_enabled: None,
+        ruliad_source_selection_documents_per_step: None,
         source: validation_cfg.source.clone(),
         tokenizer: dataset_cfg.tokenizer.clone(),
     }
@@ -793,6 +937,36 @@ fn insert_train_loss_metrics(
     metrics.insert("train_loss".into(), MetricValue::Float(mean));
     metrics.insert("train_loss_mean".into(), MetricValue::Float(mean));
     metrics.insert("train_loss_last".into(), MetricValue::Float(loss));
+}
+
+fn insert_local_predictive_coding_metrics(
+    metrics: &mut BTreeMap<String, MetricValue>,
+    snapshot: burn_dragon_language::train::LocalPredictiveCodingProfileSnapshot,
+) {
+    metrics.insert(
+        "predictive_coding_steps".into(),
+        MetricValue::Integer(snapshot.steps.min(i64::MAX as u64) as i64),
+    );
+    metrics.insert(
+        "predictive_coding_global_backward_calls".into(),
+        MetricValue::Integer(snapshot.global_backward_calls.min(i64::MAX as u64) as i64),
+    );
+    metrics.insert(
+        "predictive_coding_structured_terminal_steps".into(),
+        MetricValue::Integer(snapshot.structured_terminal_steps.min(i64::MAX as u64) as i64),
+    );
+    metrics.insert(
+        "predictive_coding_structured_terminal_skipped_steps".into(),
+        MetricValue::Integer(
+            snapshot
+                .structured_terminal_skipped_steps
+                .min(i64::MAX as u64) as i64,
+        ),
+    );
+    metrics.insert(
+        "predictive_coding_structured_terminal_rows".into(),
+        MetricValue::Integer(snapshot.structured_terminal_rows.min(i64::MAX as u64) as i64),
+    );
 }
 
 fn insert_ruliad_source_selection_metrics(
@@ -989,6 +1163,7 @@ fn insert_ruliad_model_evaluation_metrics(
     evaluation: &burn_dragon_language::train::schedule::RuliadModelEvaluation,
 ) {
     let report = &evaluation.report;
+    let teacher_forced = evaluation.teacher_forced;
     let item_count = report.item_count.max(1) as f64;
     for (key, value) in [
         ("ruliad_exact_accuracy", report.exact_accuracy as f64),
@@ -1034,6 +1209,10 @@ fn insert_ruliad_model_evaluation_metrics(
             "ruliad_missing_completion_rate",
             report.missing_completion_count as f64 / item_count,
         ),
+        (
+            "ruliad_mean_generated_model_tokens",
+            evaluation.mean_generated_model_tokens,
+        ),
         ("ruliad_probe_elapsed_ms", evaluation.elapsed_ms),
         (
             "ruliad_probe_generation_mean_batch_rows",
@@ -1042,6 +1221,27 @@ fn insert_ruliad_model_evaluation_metrics(
         (
             "ruliad_probe_generation_batched_row_fraction",
             evaluation.generation_batched_row_fraction,
+        ),
+        ("ruliad_teacher_forced_nll", teacher_forced.mean_nll),
+        (
+            "ruliad_teacher_forced_token_accuracy",
+            teacher_forced.token_accuracy,
+        ),
+        (
+            "ruliad_teacher_forced_first_token_accuracy",
+            teacher_forced.first_token_accuracy,
+        ),
+        (
+            "ruliad_teacher_forced_sequence_accuracy",
+            teacher_forced.sequence_accuracy,
+        ),
+        (
+            "ruliad_context_swap_teacher_forced_nll",
+            teacher_forced.context_swap_mean_nll,
+        ),
+        (
+            "ruliad_context_binding_nll_gain",
+            teacher_forced.context_binding_nll_gain,
         ),
     ] {
         metrics.insert(key.into(), MetricValue::Float(value));
@@ -1056,11 +1256,283 @@ fn insert_ruliad_model_evaluation_metrics(
             "ruliad_probe_generation_maximum_in_flight_rows",
             evaluation.generation_maximum_in_flight_rows,
         ),
+        ("ruliad_teacher_forced_items", teacher_forced.items),
+        (
+            "ruliad_teacher_forced_completion_tokens",
+            teacher_forced.completion_tokens,
+        ),
+        (
+            "ruliad_context_swap_teacher_forced_items",
+            teacher_forced.context_swap_items,
+        ),
     ] {
         metrics.insert(key.into(), MetricValue::Integer(value as i64));
     }
     insert_ruliad_eval_group_metrics(metrics, "difficulty", &report.difficulty_scores);
     insert_ruliad_eval_group_metrics(metrics, "task", &report.task_scores);
+}
+
+fn insert_ruliad_policy_rollout_metrics(
+    metrics: &mut BTreeMap<String, MetricValue>,
+    prefix: &str,
+    rollout: &burn_dragon_language::train::schedule::RuliadPolicyRolloutEvaluation,
+) {
+    metrics.insert(
+        format!("{prefix}_items"),
+        MetricValue::Integer(rollout.items as i64),
+    );
+    for (suffix, value) in [
+        ("solve_rate", rollout.solve_rate),
+        ("goal_completion_rate", rollout.goal_completion_rate),
+        ("valid_action_rate", rollout.valid_action_rate),
+        ("invalid_action_rate", rollout.invalid_action_rate),
+        ("repeated_state_rate", rollout.repeated_state_rate),
+        ("backtrack_rate", rollout.backtrack_rate),
+        ("mean_backtracks", rollout.mean_backtracks),
+        ("top1_expert_rate", rollout.top1_expert_rate),
+        ("frontier_exhaustion_rate", rollout.frontier_exhaustion_rate),
+        ("mean_steps", rollout.mean_steps),
+    ] {
+        metrics.insert(format!("{prefix}_{suffix}"), MetricValue::Float(value));
+    }
+}
+
+fn insert_ruliad_constrained_policy_metrics(
+    metrics: &mut BTreeMap<String, MetricValue>,
+    prefix: &str,
+    constrained: &burn_dragon_language::train::schedule::RuliadConstrainedPolicyEvaluation,
+) {
+    metrics.insert(
+        format!("{prefix}_items"),
+        MetricValue::Integer(constrained.items as i64),
+    );
+    for (suffix, value) in [
+        ("equivalent_top1_rate", constrained.equivalent_top1_rate),
+        ("preferred_top1_rate", constrained.preferred_top1_rate),
+        ("equivalent_nll", constrained.equivalent_nll),
+        ("valid_invalid_margin", constrained.valid_invalid_margin),
+        (
+            "canonical_equivalent_top1_rate",
+            constrained.canonical_equivalent_top1_rate,
+        ),
+        (
+            "canonical_preferred_top1_rate",
+            constrained.canonical_preferred_top1_rate,
+        ),
+        (
+            "worst_presentation_equivalent_top1_rate",
+            constrained.worst_presentation_equivalent_top1_rate,
+        ),
+        ("orbit_js_divergence", constrained.orbit_js_divergence),
+        (
+            "orbit_top1_consensus_fraction",
+            constrained.orbit_top1_consensus_fraction,
+        ),
+        (
+            "context_swap_top1_change_rate",
+            constrained.context_swap_top1_change_rate,
+        ),
+        (
+            "context_swap_equivalent_probability_drop",
+            constrained.context_swap_equivalent_probability_drop,
+        ),
+        (
+            "counterfactual_target_top1_change_rate",
+            constrained.counterfactual_target_top1_change_rate,
+        ),
+        (
+            "counterfactual_target_equivalent_probability_gain",
+            constrained.counterfactual_target_equivalent_probability_gain,
+        ),
+        ("elapsed_ms", constrained.elapsed_ms),
+    ] {
+        metrics.insert(format!("{prefix}_{suffix}"), MetricValue::Float(value));
+    }
+}
+
+fn insert_ruliad_structured_policy_metrics(
+    metrics: &mut BTreeMap<String, MetricValue>,
+    evaluation: &burn_dragon_language::train::schedule::RuliadStructuredPolicyEvaluation,
+) {
+    let report = &evaluation.report;
+    let scored = report.scored_count.max(1) as f64;
+    metrics.insert(
+        "ruliad_typed_policy_structured_items".into(),
+        MetricValue::Integer(evaluation.item_count as i64),
+    );
+    for (suffix, value) in [
+        ("exact_accuracy", report.exact_accuracy as f64),
+        ("semantic_accuracy", report.semantic_accuracy as f64),
+        ("verifier_accuracy", report.verifier_accuracy as f64),
+        ("partial_credit_rate", report.partial_credit_rate as f64),
+        ("answer_field_accuracy", report.answer_field_accuracy as f64),
+        (
+            "answer_termination_rate",
+            report.answer_termination_rate as f64,
+        ),
+        ("completion_quality", report.mean_completion_quality as f64),
+        ("presented_action_rate", report.presented_action_rate as f64),
+        (
+            "schema_valid_wrong_rate",
+            report.schema_valid_wrong_count as f64 / scored,
+        ),
+        (
+            "malformed_rate",
+            report.malformed_completion_count as f64 / scored,
+        ),
+        (
+            "missing_rate",
+            report.missing_completion_count as f64 / scored,
+        ),
+    ] {
+        metrics.insert(
+            format!("ruliad_typed_policy_structured_{suffix}"),
+            MetricValue::Float(value),
+        );
+    }
+    insert_ruliad_eval_group_metrics(
+        metrics,
+        "typed_policy_structured_difficulty",
+        &report.difficulty_scores,
+    );
+    insert_ruliad_eval_group_metrics(
+        metrics,
+        "typed_policy_structured_source",
+        &report.source_scores,
+    );
+}
+
+fn insert_ruliad_evaluation_suite_metrics(
+    metrics: &mut BTreeMap<String, MetricValue>,
+    suite: &burn_dragon_language::train::schedule::RuliadEvaluationSuiteReport,
+) {
+    insert_ruliad_model_evaluation_metrics(metrics, &suite.free_run);
+    let policy_context = &suite.policy_context_free_run;
+    let policy_report = &policy_context.report;
+    let policy_items = policy_report.item_count.max(1) as f64;
+    for (suffix, value) in [
+        ("exact_accuracy", policy_report.exact_accuracy as f64),
+        ("semantic_accuracy", policy_report.semantic_accuracy as f64),
+        ("verifier_accuracy", policy_report.verifier_accuracy as f64),
+        (
+            "partial_credit_rate",
+            policy_report.partial_credit_rate as f64,
+        ),
+        (
+            "answer_field_accuracy",
+            policy_report.answer_field_accuracy as f64,
+        ),
+        (
+            "answer_termination_rate",
+            policy_report.answer_termination_rate as f64,
+        ),
+        (
+            "completion_quality",
+            policy_report.mean_completion_quality as f64,
+        ),
+        (
+            "malformed_rate",
+            policy_report.malformed_completion_count as f64 / policy_items,
+        ),
+        (
+            "missing_rate",
+            policy_report.missing_completion_count as f64 / policy_items,
+        ),
+        (
+            "mean_generated_model_tokens",
+            policy_context.mean_generated_model_tokens,
+        ),
+        ("elapsed_ms", policy_context.elapsed_ms),
+        ("teacher_forced_nll", policy_context.teacher_forced.mean_nll),
+        (
+            "teacher_forced_token_accuracy",
+            policy_context.teacher_forced.token_accuracy,
+        ),
+        (
+            "teacher_forced_first_token_accuracy",
+            policy_context.teacher_forced.first_token_accuracy,
+        ),
+        (
+            "teacher_forced_sequence_accuracy",
+            policy_context.teacher_forced.sequence_accuracy,
+        ),
+        (
+            "context_swap_teacher_forced_nll",
+            policy_context.teacher_forced.context_swap_mean_nll,
+        ),
+        (
+            "context_binding_nll_gain",
+            policy_context.teacher_forced.context_binding_nll_gain,
+        ),
+    ] {
+        metrics.insert(
+            format!("ruliad_typed_policy_free_{suffix}"),
+            MetricValue::Float(value),
+        );
+    }
+    metrics.insert(
+        "ruliad_typed_policy_free_items".into(),
+        MetricValue::Integer(policy_context.item_count as i64),
+    );
+    metrics.insert(
+        "ruliad_typed_policy_free_teacher_forced_items".into(),
+        MetricValue::Integer(policy_context.teacher_forced.items as i64),
+    );
+    metrics.insert(
+        "ruliad_typed_policy_free_context_swap_teacher_forced_items".into(),
+        MetricValue::Integer(policy_context.teacher_forced.context_swap_items as i64),
+    );
+    metrics.insert(
+        "ruliad_typed_policy_panel_fingerprint_sha256".into(),
+        MetricValue::Text(suite.panel_fingerprint_sha256.clone()),
+    );
+    insert_ruliad_structured_policy_metrics(metrics, &suite.structured_policy_decode);
+    insert_ruliad_constrained_policy_metrics(
+        metrics,
+        "ruliad_typed_policy",
+        &suite.constrained_policy,
+    );
+    for (difficulty, constrained) in &suite.constrained_policy_by_difficulty {
+        insert_ruliad_constrained_policy_metrics(
+            metrics,
+            &format!("ruliad_typed_policy_difficulty_{difficulty}"),
+            constrained,
+        );
+    }
+    for (source, constrained) in &suite.constrained_policy_by_source {
+        let source = metric_key_component(source);
+        if !source.is_empty() {
+            insert_ruliad_constrained_policy_metrics(
+                metrics,
+                &format!("ruliad_typed_policy_source_{source}"),
+                constrained,
+            );
+        }
+    }
+    metrics.insert(
+        "ruliad_typed_policy_closed_loop_observed".into(),
+        MetricValue::Bool(suite.closed_loop_rollout.is_some()),
+    );
+    if let Some(rollout) = suite.closed_loop_rollout.as_ref() {
+        insert_ruliad_policy_rollout_metrics(metrics, "ruliad_typed_policy_rollout", rollout);
+    }
+    for (difficulty, rollout) in &suite.rollout_by_difficulty {
+        insert_ruliad_policy_rollout_metrics(
+            metrics,
+            &format!("ruliad_typed_policy_rollout_difficulty_{difficulty}"),
+            rollout,
+        );
+    }
+    for (source, rollout) in &suite.rollout_by_source {
+        let source = metric_key_component(source);
+        if !source.is_empty() {
+            insert_ruliad_policy_rollout_metrics(
+                metrics,
+                &format!("ruliad_typed_policy_rollout_source_{source}"),
+                rollout,
+            );
+        }
+    }
 }
 
 fn language_evaluate<B>(
@@ -1100,33 +1572,71 @@ where
     if !matches!(split, EvalSplit::Train)
         && let Some(ruliad) = ruliad
     {
-        match burn_dragon_language::train::schedule::evaluate_ruliad_model_free_run(
-            &ruliad.dataset,
-            model,
-            &ruliad.training,
-            0,
-            0,
-            ruliad.training.events.ruliad_correctness_probe_items,
-            ruliad.training.batch_size,
-            "burn_dragon_p2p_ruliad_validation_v1",
-            &ruliad.device,
-        ) {
-            Ok(Some(evaluation)) => {
+        let typed_policy_enabled = ruliad.training.ruliad_policy_probe.enabled
+            && ruliad.training.ruliad_policy_probe.items > 0;
+        let evaluation = if typed_policy_enabled {
+            let options = burn_dragon_language::train::schedule::RuliadEvaluationSuiteOptions {
+                panel_seed: ruliad.training.validation.seed,
+                free_run_items: ruliad.training.events.ruliad_correctness_probe_items,
+                policy_items: ruliad.training.ruliad_policy_probe.items,
+                difficulty_levels: ruliad
+                    .training
+                    .ruliad_policy_probe
+                    .stratified_difficulty_levels
+                    .max(1),
+                training_batch_size: ruliad.training.batch_size.max(1),
+                // Candidate validation runs for every proposed head. Closed-loop search is kept
+                // for explicit promotion audits so normal consensus cannot be stalled by a long
+                // sequential verifier rollout.
+                include_closed_loop_rollout: false,
+                epoch: 0,
+                absolute_step: 0,
+                dataset_name: "burn_dragon_p2p_ruliad_validation_v2".to_string(),
+            };
+            burn_dragon_language::train::schedule::evaluate_ruliad_model_suite(
+                &ruliad.dataset,
+                model,
+                &ruliad.training,
+                &options,
+                &ruliad.device,
+            )
+            .map(|suite| {
+                let mut suite_metrics = BTreeMap::new();
+                insert_ruliad_evaluation_suite_metrics(&mut suite_metrics, &suite);
+                suite_metrics
+            })
+        } else {
+            burn_dragon_language::train::schedule::evaluate_ruliad_model_free_run(
+                &ruliad.dataset,
+                model,
+                &ruliad.training,
+                0,
+                0,
+                ruliad.training.events.ruliad_correctness_probe_items,
+                ruliad.training.batch_size,
+                "burn_dragon_p2p_ruliad_validation_v1",
+                &ruliad.device,
+            )
+            .and_then(|evaluation| {
+                evaluation
+                    .map(|evaluation| {
+                        let mut evaluation_metrics = BTreeMap::new();
+                        insert_ruliad_model_evaluation_metrics(
+                            &mut evaluation_metrics,
+                            &evaluation,
+                        );
+                        evaluation_metrics
+                    })
+                    .ok_or_else(|| anyhow::anyhow!("formal validation panel is empty"))
+            })
+        };
+        match evaluation {
+            Ok(evaluation_metrics) => {
                 metrics.insert(
                     "ruliad_evaluation_completed".into(),
                     MetricValue::Bool(true),
                 );
-                insert_ruliad_model_evaluation_metrics(&mut metrics, &evaluation);
-            }
-            Ok(None) => {
-                metrics.insert(
-                    "ruliad_evaluation_completed".into(),
-                    MetricValue::Bool(false),
-                );
-                metrics.insert(
-                    "ruliad_evaluation_error".into(),
-                    MetricValue::Text("formal validation panel is empty".into()),
-                );
+                metrics.extend(evaluation_metrics);
             }
             Err(error) => {
                 metrics.insert(
@@ -1146,8 +1656,33 @@ where
     }
 }
 
+fn prepare_replayable_ruliad_policy_dataset(
+    config: &TrainingConfig,
+) -> Result<Option<Arc<Dataset>>> {
+    let Some(dataset_config) = replayable_ruliad_policy_dataset_config(config) else {
+        return Ok(None);
+    };
+    Ok(Some(
+        prepare_datasets(&dataset_config, &config.training)?.train,
+    ))
+}
+
+fn replayable_ruliad_policy_dataset_config(config: &TrainingConfig) -> Option<DatasetConfig> {
+    if !config
+        .training
+        .ruliad_supervision
+        .needs_ruliad_policy_batch()
+    {
+        return None;
+    }
+    let mut dataset_config = config.dataset.clone();
+    dataset_config.ruliad_source_selection_feedback_updates_enabled = Some(false);
+    Some(dataset_config)
+}
+
 fn build_train_loader<B>(
     datasets: &burn_dragon_language::train::utils::PreparedDatasets,
+    ruliad_policy_dataset: Option<Arc<Dataset>>,
     config: &TrainingConfig,
     steps_per_epoch: usize,
     total_steps: usize,
@@ -1163,29 +1698,51 @@ where
         .sequence_batching
         .uses_streaming_loader(config.training.tbptt_persist_across_steps)
     {
-        Arc::new(
-            StreamingDataLoader::<B>::new(
-                Arc::clone(&datasets.train),
-                DatasetSplit::Train,
-                device,
-                steps_per_epoch,
-                Some(total_steps),
-                config.training.min_logical_block_size,
-                config.training.seed,
-            )
-            .with_summary_event_token_ids(summary_event_token_ids),
+        let loader = StreamingDataLoader::<B>::new(
+            Arc::clone(&datasets.train),
+            DatasetSplit::Train,
+            device,
+            steps_per_epoch,
+            Some(total_steps),
+            config.training.min_logical_block_size,
+            config.training.seed,
         )
+        .with_ruliad_policy_supervision(config.training.ruliad_supervision)
+        .with_ruliad_policy_stratified_difficulty_levels(
+            config
+                .training
+                .ruliad_supervision
+                .proof_policy
+                .stratified_difficulty_levels,
+        )
+        .with_summary_event_token_ids(summary_event_token_ids);
+        let loader = match ruliad_policy_dataset {
+            Some(dataset) => loader.with_ruliad_policy_dataset(dataset),
+            None => loader,
+        };
+        Arc::new(loader)
     } else {
-        Arc::new(
-            RandomDataLoader::<B>::new(
-                Arc::clone(&datasets.train),
-                DatasetSplit::Train,
-                device,
-                steps_per_epoch,
-                Some(total_steps),
-            )
-            .with_summary_event_token_ids(summary_event_token_ids),
+        let loader = RandomDataLoader::<B>::new(
+            Arc::clone(&datasets.train),
+            DatasetSplit::Train,
+            device,
+            steps_per_epoch,
+            Some(total_steps),
         )
+        .with_ruliad_policy_supervision(config.training.ruliad_supervision)
+        .with_ruliad_policy_stratified_difficulty_levels(
+            config
+                .training
+                .ruliad_supervision
+                .proof_policy
+                .stratified_difficulty_levels,
+        )
+        .with_summary_event_token_ids(summary_event_token_ids);
+        let loader = match ruliad_policy_dataset {
+            Some(dataset) => loader.with_ruliad_policy_dataset(dataset),
+            None => loader,
+        };
+        Arc::new(loader)
     }
 }
 
@@ -1320,7 +1877,7 @@ fn attach_sharded_dataset<B>(
     dataset_source: &burn_dragon_language::DatasetSourceConfig,
     datasets: &burn_dragon_language::train::utils::PreparedDatasets,
     shard_export: &DragonShardExportConfig,
-    summary_event_token_ids: Option<Vec<u32>>,
+    batcher: TokenWindowBatcher,
     max_train_batches: usize,
 ) -> Result<(
     burn_p2p::burn::BurnLearnerProjectBuilder<DragonLearningComponents<B>>,
@@ -1356,7 +1913,7 @@ where
         &shard_export.root,
         &records,
         config,
-        "dragon-bounded-stream-segment-balanced-v3-target-masks",
+        "dragon-bounded-stream-segment-balanced-v4-target-masks-policy-schedule",
         |record_index, record| {
             stream_segment_partition_key(record_index, record, max_train_batches)
         },
@@ -1366,19 +1923,22 @@ where
     } else {
         sharded
     };
-    let descriptor = dragon_sharded_input_descriptor(
-        experiment_kind,
-        dataset_source,
-        sharded.registration(),
-        sharded.microshard_plan().microshards.len(),
-        shard_export.http_upstream.as_deref(),
+    let descriptor = bind_ruliad_policy_pipeline_contract(
+        dragon_sharded_input_descriptor(
+            experiment_kind,
+            dataset_source,
+            sharded.registration(),
+            sharded.microshard_plan().microshards.len(),
+            shard_export.http_upstream.as_deref(),
+        ),
+        &batcher,
     );
     let dataset_view_id = sharded.registration().view.dataset_view_id.clone();
     Ok((
         builder.with_data_pipeline(dragon_sharded_data_pipeline::<B>(
             descriptor,
             sharded,
-            TokenWindowBatcher::new(summary_event_token_ids),
+            batcher,
             datasets.train.batch_size(),
             max_train_batches,
         )),
@@ -1393,7 +1953,7 @@ fn attach_existing_sharded_dataset<B>(
     shard_dataset: &DragonExistingShardDatasetConfig,
     batch_size: usize,
     max_train_batches: usize,
-    summary_event_token_ids: Option<Vec<u32>>,
+    batcher: TokenWindowBatcher,
 ) -> Result<burn_p2p::burn::BurnLearnerProjectBuilder<DragonLearningComponents<B>>>
 where
     B: AutodiffBackend + Clone + 'static,
@@ -1406,18 +1966,21 @@ where
     } else {
         sharded.with_local_upstream(shard_dataset.root.display().to_string())
     };
-    let descriptor = dragon_sharded_input_descriptor(
-        experiment_kind,
-        dataset_source,
-        sharded.registration(),
-        sharded.microshard_plan().microshards.len(),
-        shard_dataset.http_upstream.as_deref(),
+    let descriptor = bind_ruliad_policy_pipeline_contract(
+        dragon_sharded_input_descriptor(
+            experiment_kind,
+            dataset_source,
+            sharded.registration(),
+            sharded.microshard_plan().microshards.len(),
+            shard_dataset.http_upstream.as_deref(),
+        ),
+        &batcher,
     );
     Ok(
         builder.with_data_pipeline(dragon_sharded_data_pipeline::<B>(
             descriptor,
             sharded,
-            TokenWindowBatcher::new(summary_event_token_ids),
+            batcher,
             batch_size,
             max_train_batches,
         )),
@@ -1636,6 +2199,7 @@ where
             scheduler_iters,
             &device,
         )?;
+        let local_predictive_coding_profile = model.local_predictive_coding_profile();
         let random_scaffold = dragon_random_scaffold_p2p_contract::<B>(
             &model,
             dragon_model_schema_hash(&model_config),
@@ -1658,12 +2222,16 @@ where
                 target_window_seconds: 30,
             }
         })
-        .with_step_metrics(|step_index, output, metrics| {
+        .with_step_metrics(move |step_index, output, metrics| {
             metrics.insert(
                 "train_steps".into(),
                 MetricValue::Integer((step_index + 1) as i64),
             );
             insert_train_loss_metrics(metrics, step_index, mean_loss_from_train_output_ref(output));
+            insert_local_predictive_coding_metrics(
+                metrics,
+                local_predictive_coding_profile.snapshot(),
+            );
             Ok(())
         });
         if let Some((validation_loader, validation_dataset)) = prepare_validation_loader_only::<B>(
@@ -1692,6 +2260,14 @@ where
                     )
                 });
         }
+        let mut token_window_batcher = TokenWindowBatcher::new(summary_event_token_ids);
+        if let Some(policy_dataset) = prepare_replayable_ruliad_policy_dataset(&config)? {
+            token_window_batcher = token_window_batcher.with_ruliad_policy_dataset(
+                policy_dataset,
+                config.training.ruliad_supervision,
+                steps_per_epoch,
+            );
+        }
         builder = attach_existing_sharded_dataset::<B>(
             builder,
             experiment_kind,
@@ -1699,7 +2275,7 @@ where
             existing_shards,
             config.training.batch_size,
             config.training.max_iters,
-            summary_event_token_ids,
+            token_window_batcher,
         )?;
         builder = attach_dragon_workload_update_applier(builder, &config, random_scaffold.as_ref());
         (
@@ -1709,6 +2285,7 @@ where
         )
     } else {
         let datasets = prepare_datasets(&config.dataset, &config.training)?;
+        let ruliad_policy_dataset = prepare_replayable_ruliad_policy_dataset(&config)?;
         let summary_event_token_ids = summary_event_token_ids(&datasets.train);
         let steps_per_epoch = datasets.train.steps_per_epoch(DatasetSplit::Train);
         let train_schedule = resolve_train_schedule(&config.training, steps_per_epoch)?;
@@ -1720,6 +2297,7 @@ where
 
         let train_loader = build_train_loader::<B>(
             &datasets,
+            ruliad_policy_dataset.as_ref().map(Arc::clone),
             &config,
             train_schedule.steps_per_epoch,
             total_steps,
@@ -1741,6 +2319,7 @@ where
             scheduler_iters,
             &device,
         )?;
+        let local_predictive_coding_profile = model.local_predictive_coding_profile();
         let random_scaffold = dragon_random_scaffold_p2p_contract::<B>(
             &model,
             dragon_model_schema_hash(&model_config),
@@ -1795,6 +2374,10 @@ where
             {
                 insert_ruliad_source_selection_metrics(metrics, &snapshot);
             }
+            insert_local_predictive_coding_metrics(
+                metrics,
+                local_predictive_coding_profile.snapshot(),
+            );
             Ok(())
         });
 
@@ -1805,7 +2388,15 @@ where
                 &config.dataset.source,
                 &datasets,
                 shard_export,
-                summary_event_token_ids.clone(),
+                TokenWindowBatcher::new(summary_event_token_ids.clone())
+                    .with_ruliad_policy_dataset(
+                        ruliad_policy_dataset
+                            .as_ref()
+                            .map(Arc::clone)
+                            .unwrap_or_else(|| Arc::clone(&datasets.train)),
+                        config.training.ruliad_supervision,
+                        train_schedule.steps_per_epoch,
+                    ),
                 config.training.max_iters,
             )?;
             builder = next_builder;
@@ -1996,8 +2587,11 @@ where
 #[cfg(test)]
 mod tests {
     use burn::backend::NdArray;
+    use burn_autodiff::Autodiff;
 
     use super::*;
+
+    type AutodiffTestBackend = Autodiff<NdArray<f32>>;
 
     fn record(
         group: Option<u64>,
@@ -2050,6 +2644,243 @@ mod tests {
                 .expect("tokens"),
             vec![30, 31, 31, 32]
         );
+    }
+
+    #[test]
+    fn sharded_batches_materialize_contract_bound_ruliad_policy_metadata() {
+        let device = burn::tensor::Device::<NdArray<f32>>::default();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_calls = Arc::clone(&calls);
+        let mut batcher = TokenWindowBatcher::new(None);
+        batcher.ruliad_policy_batch_factory =
+            Some(Arc::new(move |schedule_step, sample_step, batch_size| {
+                observed_calls.lock().expect("call lock").push((
+                    schedule_step,
+                    sample_step,
+                    batch_size,
+                ));
+                Ok(Some(RuliadPolicyBatch {
+                    samples: (0..batch_size)
+                        .map(
+                            |sample_index| burn_dragon_language::dataset::RuliadPolicySample {
+                                item: burn_dragon_universality::RuliadEvalItem {
+                                    oracle_hash: format!("oracle-{sample_index}"),
+                                    sample_index,
+                                    split: burn_dragon_universality::SampleSplit::Train,
+                                    family: "formal_proof".into(),
+                                    task_kind: "select_proof_action".into(),
+                                    math_domains: vec!["category_theory".into()],
+                                    reasoning_modes: vec!["deduction".into()],
+                                    prompt: "state".into(),
+                                    expected_answer: "action".into(),
+                                    difficulty_level: Some(0),
+                                    spec: None,
+                                },
+                                prompt_tokens: vec![1, 2, 3],
+                            },
+                        )
+                        .collect(),
+                    tokenization: burn_dragon_universality::RuliadTokenizationConfig::default(),
+                    stop_token_id: Some(4),
+                    sampling_metadata: None,
+                }))
+            }));
+
+        let batches = batcher
+            .stream_aligned_batches::<NdArray<f32>>(
+                vec![
+                    record(Some(7), Some(0), Some(0), 10, true),
+                    record(Some(7), Some(1), Some(0), 11, true),
+                ],
+                2,
+                Some(4),
+                Some(1),
+                &device,
+            )
+            .expect("policy-aligned batch");
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].absolute_step, Some(0));
+        assert_eq!(
+            batches[0]
+                .ruliad_policy_batch
+                .as_ref()
+                .expect("policy metadata")
+                .samples
+                .len(),
+            2
+        );
+        let calls = calls.lock().expect("call lock");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, 0);
+        assert_eq!(calls[0].2, 2);
+        assert_ne!(
+            calls[0].1, 0,
+            "sample identity must include shard coordinates"
+        );
+    }
+
+    #[test]
+    fn sharded_policy_materialization_fails_closed() {
+        let device = burn::tensor::Device::<NdArray<f32>>::default();
+        let mut batcher = TokenWindowBatcher::new(None);
+        batcher.ruliad_policy_batch_factory = Some(Arc::new(|_, _, _| {
+            Err(anyhow::anyhow!("policy sidecar unavailable"))
+        }));
+        let error = match batcher.stream_aligned_batches::<NdArray<f32>>(
+            vec![record(Some(7), Some(0), Some(0), 10, true)],
+            1,
+            Some(1),
+            Some(1),
+            &device,
+        ) {
+            Ok(_) => panic!("required policy metadata must not be omitted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("policy sidecar unavailable"));
+    }
+
+    #[test]
+    fn sharded_policy_batch_executes_local_pc_terminal_without_global_backward() {
+        let device = burn::tensor::Device::<AutodiffTestBackend>::default();
+        let bundle = burn_dragon_universality::ruliad::formal::generate_formal_bundle(
+            83,
+            burn_dragon_universality::ruliad::RuliadFormalGeneratorConfig {
+                rewrite_depth: 2,
+                leaf_count: 3,
+                context_depth: 1,
+                distractor_axioms: 1,
+                ..Default::default()
+            },
+        )
+        .expect("formal policy fixture");
+        let proof_step_index = 1.min(bundle.certificate.step_count().saturating_sub(1));
+        let actions = burn_dragon_universality::ruliad::oracle_proof_action_set(
+            &bundle.problem,
+            &bundle.certificate,
+            proof_step_index,
+            4,
+        )
+        .expect("proof action menu");
+        let answer_contract =
+            burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::SemanticStep;
+        let prompt =
+            burn_dragon_universality::ruliad::ruliad_proof_action_prompt(&bundle.problem, &actions)
+                .expect("proof prompt");
+        let expected_answer = burn_dragon_universality::ruliad::proof_action_answer(
+            &actions,
+            actions.selected_index,
+            answer_contract,
+        )
+        .expect("proof answer");
+        let tokenization = burn_dragon_universality::RuliadTokenizationConfig::StructuredSymbolic {
+            vocab_size: 272,
+            eos_id: Some(271),
+        };
+        let policy_batch = RuliadPolicyBatch {
+            samples: vec![burn_dragon_language::dataset::RuliadPolicySample {
+                item: burn_dragon_universality::RuliadEvalItem {
+                    oracle_hash: bundle.problem.canonical_hash().expect("problem hash"),
+                    sample_index: 83,
+                    split: burn_dragon_universality::SampleSplit::Train,
+                    family: "formal_proof".into(),
+                    task_kind: "select_proof_action".into(),
+                    math_domains: vec!["formal_proof".into()],
+                    reasoning_modes: vec!["proof_construction".into()],
+                    prompt,
+                    expected_answer,
+                    difficulty_level: Some(0),
+                    spec: Some(burn_dragon_universality::RuliadSampleSpec::FormalProof {
+                        problem: bundle.problem,
+                        certificate: bundle.certificate,
+                        candidate: None,
+                        proof_step_index: Some(proof_step_index),
+                        action_presentation_rotation: Some(0),
+                        action_answer_contract: answer_contract,
+                        action_candidate_count: None,
+                        task: burn_dragon_universality::RuliadTaskKind::SelectProofAction,
+                    }),
+                },
+                prompt_tokens: vec![1],
+            }],
+            tokenization,
+            stop_token_id: Some(271),
+            sampling_metadata: None,
+        };
+        let mut batcher = TokenWindowBatcher::new(None);
+        batcher.ruliad_policy_batch_factory =
+            Some(Arc::new(move |_, _, _| Ok(Some(policy_batch.clone()))));
+        let batch = batcher
+            .stream_aligned_batches::<AutodiffTestBackend>(
+                vec![TokenWindowRecord {
+                    inputs: (0..512).map(|index| (index % 270 + 1) as i64).collect(),
+                    targets: (0..512)
+                        .map(|index| ((index + 1) % 270 + 1) as i64)
+                        .collect(),
+                    loss_mask: None,
+                    reset_stream_state: true,
+                    stream_group_id: Some(7),
+                    stream_row: Some(0),
+                    chunk_index: Some(0),
+                }],
+                1,
+                Some(1),
+                Some(1),
+                &device,
+            )
+            .expect("sharded policy batch")
+            .remove(0);
+
+        let mut model_config = burn_dragon_language::DragonConfig {
+            n_layer: 1,
+            n_embd: 8,
+            n_head: 1,
+            mlp_internal_dim_multiplier: 2,
+            vocab_size: 272,
+            dropout: 0.0,
+            ..Default::default()
+        };
+        model_config.sequence_kernel =
+            burn_dragon_core::SequenceKernelConfig::dense_score_short_context();
+        model_config.fused_kernels.rotary_embedding = burn_dragon_core::RotaryEmbedding::Alibi;
+        let model = LanguageTrainModel::new(burn_dragon_language::DragonModel::new(
+            model_config,
+            &device,
+        ))
+        .with_training_algorithm(burn_dragon_language::TrainingAlgorithm::PredictiveCoding)
+        .with_local_predictive_coding(burn_dragon_language::LocalPredictiveCodingConfig {
+            solver: burn_dragon_language::LocalPredictiveCodingSolver::FixedPrediction,
+            terminal_criterion: burn_dragon_language::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSet,
+            ..Default::default()
+        })
+        .with_ruliad_supervision(burn_dragon_language::RuliadSupervisionConfig {
+            proof_policy: burn_dragon_language::config::RuliadProofPolicyTrainingConfig {
+                enabled: true,
+                scoring: burn_dragon_language::config::RuliadProofPolicyScoring::CompletionLikelihood,
+                gradient_scope: burn_dragon_language::config::RuliadProofPolicyGradientScope::FullModel,
+                normalization: burn_dragon_language::config::RuliadProofPolicyNormalization::CandidateConditional,
+                candidate_symmetry: burn_dragon_language::config::RuliadProofPolicyCandidateSymmetry::BalancedRotation,
+                presentation_risk: burn_dragon_language::config::RuliadProofPolicyPresentationRisk::Mean,
+                weight: 1.0,
+                every_steps: 1,
+                start_after_steps: 0,
+                stratified_difficulty_levels: 1,
+                max_rows_per_update: 1,
+                max_presentation_rows_per_update: 4,
+                candidates: 4,
+                max_completion_tokens: 128,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let profile = model.local_predictive_coding_profile();
+        let output = burn_train::TrainStep::step(&model, batch);
+
+        assert!(!output.grads.is_empty());
+        let snapshot = profile.snapshot();
+        assert_eq!(snapshot.structured_terminal_steps, 1, "{snapshot:?}");
+        assert!(snapshot.structured_terminal_rows > 0, "{snapshot:?}");
+        assert_eq!(snapshot.global_backward_calls, 0, "{snapshot:?}");
     }
 
     #[test]
@@ -2110,6 +2941,35 @@ mod tests {
     }
 
     #[test]
+    fn p2p_policy_sidecar_freezes_feedback_without_changing_primary_dataset() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut config = burn_dragon_language::load_training_config(&[
+            manifest_dir.join("deploy/profiles/ruliad-r3.typed-policy.training.toml")
+        ])
+        .expect("load typed-policy profile");
+        config.training.algorithm = burn_dragon_language::TrainingAlgorithm::PredictiveCoding;
+        config.training.local_predictive_coding.terminal_criterion =
+            burn_dragon_language::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSet;
+        let primary_feedback = config
+            .dataset
+            .ruliad_source_selection_feedback_updates_enabled;
+        let policy_config = replayable_ruliad_policy_dataset_config(&config)
+            .expect("typed policy supervision requires sidecar");
+
+        assert_eq!(
+            policy_config.ruliad_source_selection_feedback_updates_enabled,
+            Some(false)
+        );
+        assert_eq!(
+            config
+                .dataset
+                .ruliad_source_selection_feedback_updates_enabled,
+            primary_feedback,
+            "building the sidecar contract must not mutate the adaptive token curriculum"
+        );
+    }
+
+    #[test]
     fn train_loss_metrics_keep_mean_and_last_batch_distinct() {
         let mut metrics = BTreeMap::new();
         for (step_index, loss) in [3.0, 1.0, 4.0].into_iter().enumerate() {
@@ -2165,6 +3025,19 @@ mod tests {
         let evaluation = burn_dragon_language::train::schedule::RuliadModelEvaluation {
             report: report.clone(),
             item_count: 1,
+            teacher_forced: burn_dragon_language::train::schedule::RuliadTeacherForcedEvaluation {
+                items: 1,
+                completion_tokens: 12,
+                mean_nll: 0.25,
+                token_accuracy: 0.75,
+                first_token_accuracy: 1.0,
+                sequence_accuracy: 0.0,
+                context_swap_items: 1,
+                context_swap_mean_nll: 0.75,
+                context_binding_nll_gain: 0.5,
+                ..Default::default()
+            },
+            mean_generated_model_tokens: 12.0,
             elapsed_ms: 12.5,
             generation_mean_batch_rows: 4.0,
             generation_maximum_batch_rows: 8,
@@ -2186,11 +3059,142 @@ mod tests {
             metrics.get("ruliad_probe_generation_maximum_batch_rows"),
             Some(&MetricValue::Integer(8))
         );
+        assert_eq!(
+            metrics.get("ruliad_context_binding_nll_gain"),
+            Some(&MetricValue::Float(0.5))
+        );
         assert!(metrics.keys().any(|key| {
             key.starts_with("ruliad_difficulty_") && key.ends_with("_verifier_accuracy")
         }));
         assert!(metrics.keys().any(|key| {
             key.starts_with("ruliad_task_") && key.ends_with("_answer_field_accuracy")
         }));
+    }
+
+    #[test]
+    fn p2p_ruliad_suite_metrics_keep_typed_policy_distinct_from_free_generation() {
+        let free_run_report =
+            burn_dragon_universality::evaluate_completions("typed-policy-metric-fixture", &[], &[]);
+        let free_run = burn_dragon_language::train::schedule::RuliadModelEvaluation {
+            report: free_run_report,
+            item_count: 8,
+            teacher_forced: burn_dragon_language::train::schedule::RuliadTeacherForcedEvaluation {
+                items: 8,
+                completion_tokens: 64,
+                mean_nll: 0.4,
+                token_accuracy: 0.8,
+                first_token_accuracy: 0.875,
+                sequence_accuracy: 0.5,
+                context_swap_items: 8,
+                context_swap_mean_nll: 0.9,
+                context_binding_nll_gain: 0.5,
+                ..Default::default()
+            },
+            mean_generated_model_tokens: 12.0,
+            elapsed_ms: 3.0,
+            generation_mean_batch_rows: 4.0,
+            generation_maximum_batch_rows: 8,
+            generation_maximum_in_flight_rows: 4,
+            generation_batched_row_fraction: 1.0,
+        };
+        let constrained_policy =
+            burn_dragon_language::train::schedule::RuliadConstrainedPolicyEvaluation {
+                items: 8,
+                equivalent_top1_rate: 0.875,
+                preferred_top1_rate: 0.75,
+                equivalent_nll: 0.25,
+                valid_invalid_margin: 1.5,
+                canonical_equivalent_top1_rate: 0.875,
+                canonical_preferred_top1_rate: 0.75,
+                worst_presentation_equivalent_top1_rate: 0.75,
+                orbit_js_divergence: 0.01,
+                orbit_top1_consensus_fraction: 0.95,
+                context_swap_top1_change_rate: 0.5,
+                context_swap_equivalent_probability_drop: 0.2,
+                counterfactual_target_top1_change_rate: 0.625,
+                counterfactual_target_equivalent_probability_gain: 0.3,
+                elapsed_ms: 5.0,
+            };
+        let source = "source:formal_proof:select_proof_action@d2#proof_action_step".to_string();
+        let structured_policy_decode =
+            burn_dragon_language::train::schedule::RuliadStructuredPolicyEvaluation {
+                report: free_run.report.clone(),
+                item_count: 8,
+            };
+        let suite = burn_dragon_language::train::schedule::RuliadEvaluationSuiteReport {
+            model_tensor_fingerprint_sha256: "fixture-model".to_string(),
+            version: 6,
+            panel_fingerprint_sha256: "fixed-panel".into(),
+            free_run: free_run.clone(),
+            training_serialization_free_run: free_run.clone(),
+            policy_context_free_run: free_run,
+            structured_policy_decode,
+            constrained_policy,
+            constrained_policy_by_difficulty: BTreeMap::from([(2, constrained_policy)]),
+            constrained_policy_by_source: BTreeMap::from([(source.clone(), constrained_policy)]),
+            closed_loop_rollout: Some(
+                burn_dragon_language::train::schedule::RuliadPolicyRolloutEvaluation {
+                    items: 8,
+                    solve_rate: 0.75,
+                    goal_completion_rate: 0.875,
+                    valid_action_rate: 1.0,
+                    invalid_action_rate: 0.0,
+                    repeated_state_rate: 0.0,
+                    backtrack_rate: 0.0,
+                    mean_backtracks: 0.0,
+                    top1_expert_rate: 0.875,
+                    frontier_exhaustion_rate: 0.0,
+                    mean_steps: 3.0,
+                },
+            ),
+            rollout_by_difficulty: BTreeMap::new(),
+            rollout_by_source: BTreeMap::new(),
+        };
+        let mut metrics = BTreeMap::new();
+        insert_ruliad_evaluation_suite_metrics(&mut metrics, &suite);
+
+        assert_eq!(
+            metrics.get("ruliad_verifier_accuracy"),
+            Some(&MetricValue::Float(0.0))
+        );
+        assert_eq!(
+            metrics.get("ruliad_typed_policy_equivalent_top1_rate"),
+            Some(&MetricValue::Float(0.875))
+        );
+        assert_eq!(
+            metrics.get("ruliad_typed_policy_free_verifier_accuracy"),
+            Some(&MetricValue::Float(0.0))
+        );
+        assert_eq!(
+            metrics.get("ruliad_typed_policy_free_context_binding_nll_gain"),
+            Some(&MetricValue::Float(0.5))
+        );
+        assert_eq!(
+            metrics.get("ruliad_typed_policy_structured_verifier_accuracy"),
+            Some(&MetricValue::Float(0.0))
+        );
+        assert_eq!(
+            metrics.get("ruliad_typed_policy_counterfactual_target_top1_change_rate"),
+            Some(&MetricValue::Float(0.625))
+        );
+        assert_eq!(
+            metrics.get("ruliad_typed_policy_difficulty_2_equivalent_top1_rate"),
+            Some(&MetricValue::Float(0.875))
+        );
+        assert_eq!(
+            metrics.get(&format!(
+                "ruliad_typed_policy_source_{}_counterfactual_target_equivalent_probability_gain",
+                metric_key_component(&source)
+            )),
+            Some(&MetricValue::Float(0.3))
+        );
+        assert_eq!(
+            metrics.get("ruliad_typed_policy_rollout_solve_rate"),
+            Some(&MetricValue::Float(0.75))
+        );
+        assert_eq!(
+            metrics.get("ruliad_typed_policy_panel_fingerprint_sha256"),
+            Some(&MetricValue::Text("fixed-panel".into()))
+        );
     }
 }

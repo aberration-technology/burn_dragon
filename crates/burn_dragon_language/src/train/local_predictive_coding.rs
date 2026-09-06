@@ -4,7 +4,7 @@ use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{Int, Tensor};
 use burn_dragon_core::{
     DragonModel, DragonPredictiveCodingLayerTrace, DragonPredictiveCodingLayerVjp,
-    DragonPredictiveCodingParameterIds, ModelState,
+    DragonPredictiveCodingParameterIds, DragonPredictiveCodingSequenceScoreHeadVjp, ModelState,
 };
 use burn_dragon_time::Instant;
 
@@ -16,6 +16,7 @@ mod adjoint;
 mod alm;
 mod criterion;
 mod diagnostics;
+mod equilibrium;
 mod graph;
 mod telemetry;
 mod verifier;
@@ -27,9 +28,12 @@ pub use telemetry::{
     LocalPredictiveCodingProfile, LocalPredictiveCodingProfileSnapshot,
     LocalPredictiveCodingStepReport,
 };
+#[cfg(test)]
+pub(crate) use verifier::prepare_ruliad_verifier_terminal;
 pub(crate) use verifier::{
     RuliadVerifierPanelStats, lift_ruliad_verifier_terminal,
     prepare_ruliad_verifier_terminal_at_step, verifier_terminal_due,
+    verifier_terminal_preserves_primary,
 };
 
 #[derive(Debug)]
@@ -94,6 +98,58 @@ fn factor_scale(config: &LocalPredictiveCodingConfig, factors: usize) -> f32 {
     match config.factor_reduction {
         PredictiveCodingFactorReduction::Sum => 1.0,
         PredictiveCodingFactorReduction::Mean => 1.0 / factors.max(1) as f32,
+    }
+}
+
+fn register_terminal_head_derivatives<B: Backend>(
+    grads: &mut GradientsParams,
+    parameter_ids: &DragonPredictiveCodingParameterIds,
+    grad_lm_head: Option<Tensor<B, 2>>,
+    grad_sequence_score_head: Option<DragonPredictiveCodingSequenceScoreHeadVjp<B>>,
+    scale: f32,
+    objective_weight: Option<Tensor<B, 1>>,
+) {
+    if let Some(mut grad_lm_head) = grad_lm_head {
+        grad_lm_head = grad_lm_head.mul_scalar(scale);
+        if let Some(weight) = objective_weight.as_ref() {
+            grad_lm_head = grad_lm_head * weight.clone().reshape([1, 1]);
+        }
+        grads.register(parameter_ids.lm_head, grad_lm_head);
+    }
+
+    match (parameter_ids.sequence_score_head, grad_sequence_score_head) {
+        (Some(ids), Some(score)) => {
+            let matrix_weight = objective_weight
+                .as_ref()
+                .map(|weight| weight.clone().reshape([1, 1]));
+            let scale_matrix = |tensor: Tensor<B, 2>| {
+                let tensor = tensor.mul_scalar(scale);
+                match matrix_weight.as_ref() {
+                    Some(weight) => tensor * weight.clone(),
+                    None => tensor,
+                }
+            };
+            let scale_vector = |tensor: Tensor<B, 1>| {
+                let tensor = tensor.mul_scalar(scale);
+                match objective_weight.as_ref() {
+                    Some(weight) => tensor * weight.clone(),
+                    None => tensor,
+                }
+            };
+            grads.register(ids.query_weight, scale_matrix(score.grad_query_weight));
+            grads.register(ids.query_bias, scale_vector(score.grad_query_bias));
+            grads.register(
+                ids.candidate_weight,
+                scale_matrix(score.grad_candidate_weight),
+            );
+            grads.register(ids.candidate_bias, scale_vector(score.grad_candidate_bias));
+            grads.register(ids.score_weight, scale_matrix(score.grad_score_weight));
+            grads.register(ids.score_bias, scale_vector(score.grad_score_bias));
+        }
+        (Some(_), None) | (None, None) => {}
+        (None, Some(_)) => {
+            panic!("sequence score terminal requires predictive-coding parameter IDs")
+        }
     }
 }
 
@@ -702,6 +758,10 @@ where
         config,
     );
     let result = match config.solver {
+        LocalPredictiveCodingSolver::SynchronousEquilibrium
+        | LocalPredictiveCodingSolver::ReverseGaussSeidel => {
+            equilibrium::train_step::<B>(&plain, context, config, started, profile)
+        }
         LocalPredictiveCodingSolver::ErrorEquilibrium => {
             error_equilibrium_train_step::<B>(&plain, context, config, started, profile)
         }
@@ -717,6 +777,9 @@ where
             config,
             profile,
         ),
+        LocalPredictiveCodingSolver::LayerLocalPrediction => {
+            layer_local_prediction_train_step::<B>(&plain, context, config, started, profile)
+        }
         LocalPredictiveCodingSolver::AugmentedLagrangian => {
             alm::augmented_lagrangian_train_step::<B>(&plain, context, config, started, profile)
         }
@@ -1060,7 +1123,12 @@ where
         parameter_ids.norm_shift,
         layer_vjp.grad_norm_shift + initial_vjp.grad_norm_shift,
     );
-    grads.register(parameter_ids.lm_head, terminal.grad_lm_head);
+    grads.register(
+        parameter_ids.lm_head,
+        terminal
+            .grad_lm_head
+            .expect("next-token parallel adjoint must update the language head"),
+    );
 
     let report = LocalPredictiveCodingStepReport {
         solver: config.solver,
@@ -1503,49 +1571,14 @@ where
         parameter_ids.norm_shift,
         shared.grad_norm_shift + initial_vjp.grad_norm_shift,
     );
-    let mut grad_lm_head = terminal.grad_lm_head.mul_scalar(scale);
-    if let Some(weight) = objective_weight.as_ref() {
-        grad_lm_head = grad_lm_head * weight.clone().reshape([1, 1]);
-    }
-    grads.register(parameter_ids.lm_head, grad_lm_head);
-    match (
-        parameter_ids.sequence_score_head,
+    register_terminal_head_derivatives(
+        &mut grads,
+        &parameter_ids,
+        terminal.grad_lm_head,
         terminal.grad_sequence_score_head,
-    ) {
-        (Some(ids), Some(score)) => {
-            let matrix_weight = objective_weight
-                .as_ref()
-                .map(|weight| weight.clone().reshape([1, 1]));
-            let vector_weight = objective_weight.as_ref().cloned();
-            let scale_matrix = |tensor: Tensor<B::InnerBackend, 2>| {
-                let tensor = tensor.mul_scalar(scale);
-                match matrix_weight.as_ref() {
-                    Some(weight) => tensor * weight.clone(),
-                    None => tensor,
-                }
-            };
-            let scale_vector = |tensor: Tensor<B::InnerBackend, 1>| {
-                let tensor = tensor.mul_scalar(scale);
-                match vector_weight.as_ref() {
-                    Some(weight) => tensor * weight.clone(),
-                    None => tensor,
-                }
-            };
-            grads.register(ids.query_weight, scale_matrix(score.grad_query_weight));
-            grads.register(ids.query_bias, scale_vector(score.grad_query_bias));
-            grads.register(
-                ids.candidate_weight,
-                scale_matrix(score.grad_candidate_weight),
-            );
-            grads.register(ids.candidate_bias, scale_vector(score.grad_candidate_bias));
-            grads.register(ids.score_weight, scale_matrix(score.grad_score_weight));
-            grads.register(ids.score_bias, scale_vector(score.grad_score_bias));
-        }
-        (Some(_), None) | (None, None) => {}
-        (None, Some(_)) => {
-            panic!("sequence score terminal requires predictive-coding parameter IDs")
-        }
-    }
+        scale,
+        objective_weight,
+    );
     let gradient_pack_ns =
         local_pc_detail_finish::<B::InnerBackend>(gradient_pack_started, &device).unwrap_or(0);
     if crate::train::profile::detail_enabled() {
@@ -1866,9 +1899,13 @@ where
         parameter_ids.norm_shift,
         batched_vjp.grad_norm_shift + initial_vjp.grad_norm_shift,
     );
-    grads.register(
-        parameter_ids.lm_head,
-        terminal.grad_lm_head.mul_scalar(scale),
+    register_terminal_head_derivatives(
+        &mut grads,
+        &parameter_ids,
+        terminal.grad_lm_head,
+        terminal.grad_sequence_score_head,
+        scale,
+        None,
     );
 
     let report = LocalPredictiveCodingStepReport {
@@ -1910,21 +1947,9 @@ where
     }
 }
 
-struct LayerLocalPredictionContext<B: Backend> {
-    parameter_ids: DragonPredictiveCodingParameterIds,
-    inputs: Tensor<B, 2, Int>,
-    targets: Tensor<B, 2, Int>,
-    loss_mask: Option<Tensor<B, 2, Int>>,
-    activities: Vec<Tensor<B, 4>>,
-    traces: Vec<DragonPredictiveCodingLayerTrace<B>>,
-    neuron_mask: Option<Tensor<B, 4>>,
-    activity_mask: Option<Tensor<B, 4>>,
-    terminal_state: ModelState<B>,
-}
-
 fn layer_local_prediction_train_step<B: AutodiffBackend>(
     plain: &DragonModel<B::InnerBackend>,
-    context: LayerLocalPredictionContext<B::InnerBackend>,
+    context: LocalPredictiveCodingContext<B::InnerBackend>,
     config: &LocalPredictiveCodingConfig,
     started: Instant,
     profile: &LocalPredictiveCodingProfile,
@@ -1933,16 +1958,17 @@ where
     B::Device: 'static,
     B::FloatTensorPrimitive: 'static,
 {
-    let LayerLocalPredictionContext {
+    let LocalPredictiveCodingContext {
         parameter_ids,
         inputs,
-        targets,
-        loss_mask,
+        criterion,
         activities,
         traces,
         neuron_mask,
         activity_mask,
         terminal_state,
+        factors: _,
+        scale: _,
     } = context;
     let layers = traces.len();
     let [batch, streams, time, dim] = activities[0].shape().dims::<4>();
@@ -1953,6 +1979,13 @@ where
 
     // Depth is folded into the batch axis. The head and shared Dragon factor
     // therefore each launch one large VJP instead of one serial VJP per layer.
+    let terminal_hidden = plain.predictive_coding_hidden_from_activity(
+        activities
+            .last()
+            .expect("layer-local terminal activity")
+            .clone(),
+    );
+    let terminal = criterion.activity_factor(plain, terminal_hidden);
     let hidden = Tensor::cat(
         activities
             .iter()
@@ -1961,20 +1994,9 @@ where
             .collect(),
         0,
     );
-    let repeated_targets = targets.repeat_dim(0, layers);
-    let repeated_mask = loss_mask.map(|mask| mask.repeat_dim(0, layers));
-    let local_head = plain.predictive_coding_head_vjp(hidden, repeated_targets, repeated_mask);
-    let supervised_tokens = local_head
-        .supervised_tokens
-        .clone()
-        .div_scalar(layers as f32);
-    let terminal_loss = local_head
-        .masked_token_losses
-        .clone()
-        .slice([(layers - 1) * batch..layers * batch, 0..time])
-        .sum()
-        .div(supervised_tokens.clone().clamp_min(1.0))
-        .reshape([1]);
+    let local_head = criterion
+        .repeat_batch(layers)
+        .parameter_factor(plain, hidden);
     // The batched head normalizes over `layers * supervised_tokens`. Restore
     // one full local error per shared body use, since Dragon's body parameters
     // occur once at every depth. Keep the auxiliary head derivative averaged
@@ -2028,7 +2050,14 @@ where
         parameter_ids.norm_shift,
         batched_vjp.grad_norm_shift + initial_vjp.grad_norm_shift,
     );
-    grads.register(parameter_ids.lm_head, local_head.grad_lm_head);
+    register_terminal_head_derivatives(
+        &mut grads,
+        &parameter_ids,
+        local_head.grad_lm_head,
+        local_head.grad_sequence_score_head,
+        1.0,
+        None,
+    );
 
     let report = LocalPredictiveCodingStepReport {
         solver: LocalPredictiveCodingSolver::LayerLocalPrediction,
@@ -2060,8 +2089,8 @@ where
     profile.record(report);
     LocalPredictiveCodingDerivatives {
         grads,
-        loss: Tensor::<B, 1>::from_inner(terminal_loss),
-        supervised_tokens: Tensor::<B, 1>::from_inner(supervised_tokens),
+        loss: Tensor::<B, 1>::from_inner(terminal.loss),
+        supervised_tokens: Tensor::<B, 1>::from_inner(terminal.normalization),
         terminal_state: ModelState::<B>::from_inner_cloned(terminal_state),
         initial_rho_adjoints: Vec::new(),
         dkp_feedback: None,
@@ -2519,11 +2548,16 @@ where
     B::Device: 'static,
     B::FloatTensorPrimitive: 'static,
 {
+    let routed_config = config.for_next_token();
+    let config = &routed_config;
     let started = Instant::now();
     if matches!(
         config.solver,
-        LocalPredictiveCodingSolver::ErrorEquilibrium
+        LocalPredictiveCodingSolver::SynchronousEquilibrium
+            | LocalPredictiveCodingSolver::ReverseGaussSeidel
+            | LocalPredictiveCodingSolver::ErrorEquilibrium
             | LocalPredictiveCodingSolver::FixedPrediction
+            | LocalPredictiveCodingSolver::LayerLocalPrediction
             | LocalPredictiveCodingSolver::AugmentedLagrangian
     ) {
         let criterion = LocalPcTerminalCriterion::next_token(
@@ -2540,6 +2574,10 @@ where
             config,
         );
         return match config.solver {
+            LocalPredictiveCodingSolver::SynchronousEquilibrium
+            | LocalPredictiveCodingSolver::ReverseGaussSeidel => {
+                equilibrium::train_step::<B>(&plain, context, config, started, profile)
+            }
             LocalPredictiveCodingSolver::ErrorEquilibrium => {
                 error_equilibrium_train_step::<B>(&plain, context, config, started, profile)
             }
@@ -2555,397 +2593,16 @@ where
                 config,
                 profile,
             ),
+            LocalPredictiveCodingSolver::LayerLocalPrediction => {
+                layer_local_prediction_train_step::<B>(&plain, context, config, started, profile)
+            }
             LocalPredictiveCodingSolver::AugmentedLagrangian => {
                 alm::augmented_lagrangian_train_step::<B>(&plain, context, config, started, profile)
             }
             _ => unreachable!(),
         };
     }
-    let parameter_ids = model
-        .predictive_coding_parameter_ids()
-        .expect("validated local predictive-coding model");
-    let plain = model.valid();
-    plain
-        .predictive_coding_support()
-        .expect("validated plain local predictive-coding model");
-    let mut terminal_state = initial_state
-        .map(|state| state.inner_cloned())
-        .unwrap_or_else(|| plain.init_state_ephemeral());
-    assert_eq!(
-        terminal_state.layers.len(),
-        plain.predictive_coding_layer_count(),
-        "local PC recurrent-state layer count must match the model"
-    );
-    let block_time = inputs.shape().dims::<2>()[1];
-    let inputs = inputs.inner();
-    let targets = targets.inner();
-    let loss_mask = loss_mask.map(Tensor::inner);
-    let neuron_mask = context_masks.neuron.map(Tensor::inner);
-    let activity_mask = context_masks.activity.map(Tensor::inner);
-    let initial = match activity_mask.as_ref() {
-        Some(mask) => plain
-            .predictive_coding_initial_activity_with_activity_mask(inputs.clone(), mask.clone()),
-        None => plain.predictive_coding_initial_activity(inputs.clone()),
-    };
-    let layers = plain.predictive_coding_layer_count();
-    let graph = dragon_predictive_coding_graph(layers);
-    debug_assert!(graph.validate().is_ok());
-    let factors = layers + 1;
-    let scale = factor_scale(config, factors);
-
-    let mut activities = Vec::with_capacity(layers + 1);
-    let mut feedforward_traces = Vec::with_capacity(layers);
-    activities.push(initial);
-    for layer in 0..layers {
-        let mut trace = plain
-            .predictive_coding_forward_layer_with_recurrent_state(
-                activities[layer].clone(),
-                layer,
-                terminal_state.layers[layer].rho.clone(),
-                neuron_mask.clone(),
-                activity_mask.clone(),
-            )
-            .expect("validated recurrent local PC layer factor");
-        terminal_state.layers[layer].rho = Some(plain.predictive_coding_terminal_rho(&trace));
-        terminal_state.layers[layer].rho_norm = None;
-        terminal_state.layers[layer].sequence_aux = None;
-        trace.next = apply_activity_mask(trace.next, activity_mask.as_ref());
-        activities.push(trace.next.clone().detach());
-        feedforward_traces.push(trace);
-    }
-    terminal_state.position = terminal_state.position.saturating_add(block_time);
-    terminal_state.detach_in_place();
-
-    if matches!(
-        config.solver,
-        LocalPredictiveCodingSolver::LayerLocalPrediction
-    ) {
-        return layer_local_prediction_train_step::<B>(
-            &plain,
-            LayerLocalPredictionContext {
-                parameter_ids,
-                inputs,
-                targets,
-                loss_mask,
-                activities,
-                traces: feedforward_traces,
-                neuron_mask,
-                activity_mask,
-                terminal_state,
-            },
-            config,
-            started,
-            profile,
-        );
-    }
-    let factor_initial_rhos = feedforward_traces
-        .iter()
-        .map(|trace| trace.initial_rho.clone())
-        .collect::<Vec<_>>();
-    let energy_before = config.sync_diagnostics.then(|| {
-        burn_pc::diagnostic_scalar_f32(total_energy(
-            &plain,
-            &activities,
-            &factor_initial_rhos,
-            targets.clone(),
-            loss_mask.clone(),
-            config,
-            (neuron_mask.as_ref(), activity_mask.as_ref()),
-        )) as f64
-    });
-
-    let mut local_vjp_calls = 0usize;
-    let mut feedforward_loss = None;
-    let mut feedforward_trace = Some(concatenate_traces(&feedforward_traces));
-    drop(feedforward_traces);
-    match config.solver {
-        LocalPredictiveCodingSolver::SynchronousEquilibrium => {
-            for _ in 0..config.inference.steps {
-                let trace = feedforward_trace.take().unwrap_or_else(|| {
-                    forward_trace_batch(
-                        &plain,
-                        &activities,
-                        &factor_initial_rhos,
-                        neuron_mask.as_ref(),
-                        activity_mask.as_ref(),
-                    )
-                });
-                let terminal_hidden = plain.predictive_coding_hidden_from_activity(
-                    activities.last().expect("terminal PC activity").clone(),
-                );
-                let terminal = plain.predictive_coding_head_activity_vjp(
-                    terminal_hidden,
-                    targets.clone(),
-                    loss_mask.clone(),
-                );
-                if feedforward_loss.is_none() {
-                    feedforward_loss = Some(terminal.loss.clone());
-                }
-                local_vjp_calls = local_vjp_calls.saturating_add(1);
-                let terminal_grad = (terminal.grad_hidden
-                    * terminal.normalization.reshape([1, 1, 1]))
-                .reshape(activities.last().expect("terminal PC activity").shape());
-                let [batch, streams, time, dim] = activities[0].shape().dims::<4>();
-                let inferred = Tensor::cat(activities.iter().skip(1).cloned().collect(), 0);
-                let errors = prediction_error(
-                    trace.next.clone(),
-                    inferred,
-                    config.prediction_precision,
-                    scale,
-                );
-                let internal_child_grads = (layers > 1).then(|| {
-                    layer_activity_vjp(
-                        &plain,
-                        0,
-                        &slice_trace_batch(&trace, batch, layers * batch),
-                        slice_batch(errors.clone(), batch, layers * batch),
-                        neuron_mask.as_ref(),
-                        activity_mask.as_ref(),
-                    )
-                });
-                local_vjp_calls = local_vjp_calls.saturating_add(layers.saturating_sub(1));
-
-                let mut updates = Vec::with_capacity(layers);
-                for (activity_index, activity) in
-                    activities.iter().enumerate().take(layers + 1).skip(1)
-                {
-                    let own_offset = (activity_index - 1) * batch;
-                    let own = slice_batch(errors.clone(), own_offset, own_offset + batch)
-                        .mul_scalar(-1.0);
-                    let child = if activity_index == layers {
-                        terminal_grad.clone().mul_scalar(scale)
-                    } else {
-                        let offset = (activity_index - 1) * batch;
-                        internal_child_grads
-                            .as_ref()
-                            .expect("non-terminal PC activity has a child factor")
-                            .clone()
-                            .slice([offset..offset + batch, 0..streams, 0..time, 0..dim])
-                    };
-                    updates.push(burn_pc::pc_sgd_update(
-                        activity.clone(),
-                        own + child,
-                        &config.inference,
-                    ));
-                }
-                for (activity, update) in activities.iter_mut().skip(1).zip(updates) {
-                    *activity = apply_activity_mask(update, activity_mask.as_ref()).detach();
-                }
-            }
-        }
-        LocalPredictiveCodingSolver::ReverseGaussSeidel => {
-            for _ in 0..config.inference.steps {
-                // Predictions are held fixed within one reverse sweep. Since
-                // each factor's parent has not yet been updated, this is a
-                // block Gauss-Seidel solve rather than a stale approximation.
-                let trace = feedforward_trace.take().unwrap_or_else(|| {
-                    forward_trace_batch(
-                        &plain,
-                        &activities,
-                        &factor_initial_rhos,
-                        neuron_mask.as_ref(),
-                        activity_mask.as_ref(),
-                    )
-                });
-                let terminal_hidden = plain.predictive_coding_hidden_from_activity(
-                    activities.last().expect("terminal PC activity").clone(),
-                );
-                let terminal = plain.predictive_coding_head_activity_vjp(
-                    terminal_hidden,
-                    targets.clone(),
-                    loss_mask.clone(),
-                );
-                if feedforward_loss.is_none() {
-                    feedforward_loss = Some(terminal.loss.clone());
-                }
-                local_vjp_calls = local_vjp_calls.saturating_add(1);
-                let terminal_grad = (terminal.grad_hidden
-                    * terminal.normalization.reshape([1, 1, 1]))
-                .reshape(activities.last().expect("terminal PC activity").shape());
-                let [batch, _, _, _] = activities[0].shape().dims::<4>();
-
-                for activity_index in (1..=layers).rev() {
-                    let own_offset = (activity_index - 1) * batch;
-                    let own = prediction_error(
-                        slice_batch(trace.next.clone(), own_offset, own_offset + batch),
-                        activities[activity_index].clone(),
-                        config.prediction_precision,
-                        scale,
-                    )
-                    .mul_scalar(-1.0);
-                    let child = if activity_index == layers {
-                        terminal_grad.clone().mul_scalar(scale)
-                    } else {
-                        let child_offset = activity_index * batch;
-                        let child_error = prediction_error(
-                            slice_batch(trace.next.clone(), child_offset, child_offset + batch),
-                            activities[activity_index + 1].clone(),
-                            config.prediction_precision,
-                            scale,
-                        );
-                        local_vjp_calls = local_vjp_calls.saturating_add(1);
-                        layer_activity_vjp(
-                            &plain,
-                            activity_index,
-                            &slice_trace_batch(&trace, child_offset, child_offset + batch),
-                            child_error,
-                            neuron_mask.as_ref(),
-                            activity_mask.as_ref(),
-                        )
-                    };
-                    activities[activity_index] = apply_activity_mask(
-                        burn_pc::pc_sgd_update(
-                            activities[activity_index].clone(),
-                            own + child,
-                            &config.inference,
-                        ),
-                        activity_mask.as_ref(),
-                    )
-                    .detach();
-                }
-            }
-        }
-        LocalPredictiveCodingSolver::ErrorEquilibrium => {
-            unreachable!("error-equilibrium solver returns before state activity inference")
-        }
-        LocalPredictiveCodingSolver::FixedPrediction => {
-            unreachable!("fixed-prediction solver returns before activity inference")
-        }
-        LocalPredictiveCodingSolver::AugmentedLagrangian => {
-            unreachable!("PC-ALM solver returns before penalty-PC activity inference")
-        }
-        LocalPredictiveCodingSolver::LayerLocalPrediction => {
-            unreachable!("layer-local solver returns before activity inference")
-        }
-        LocalPredictiveCodingSolver::DirectKolenPollack => {
-            unreachable!("DKP uses the optimizer-owned two-phase schedule")
-        }
-        LocalPredictiveCodingSolver::AmortizedAdjoint => {
-            unreachable!("amortized adjoint uses its run-scoped feedback schedule")
-        }
-        LocalPredictiveCodingSolver::FirstOrderAdjoint => {
-            unreachable!("first-order adjoint uses its parallel residual schedule")
-        }
-    }
-
-    let energy_after = config.sync_diagnostics.then(|| {
-        burn_pc::diagnostic_scalar_f32(total_energy(
-            &plain,
-            &activities,
-            &factor_initial_rhos,
-            targets.clone(),
-            loss_mask.clone(),
-            config,
-            (neuron_mask.as_ref(), activity_mask.as_ref()),
-        )) as f64
-    });
-
-    let trace = forward_trace_batch(
-        &plain,
-        &activities,
-        &factor_initial_rhos,
-        neuron_mask.as_ref(),
-        activity_mask.as_ref(),
-    );
-    let terminal_hidden = plain.predictive_coding_hidden_from_activity(
-        activities.last().expect("terminal PC activity").clone(),
-    );
-    let terminal = plain.predictive_coding_head_vjp(terminal_hidden, targets, loss_mask.clone());
-    let normalization = terminal.supervised_tokens.clone().clamp_min(1.0);
-    let errors = prediction_error_gradient(
-        trace.next.clone(),
-        Tensor::cat(activities.iter().skip(1).cloned().collect(), 0),
-        config.prediction_precision,
-        scale,
-        normalization,
-    );
-    let batched_vjp = layer_parameter_vjp(
-        &plain,
-        0,
-        &trace,
-        errors,
-        neuron_mask.as_ref(),
-        activity_mask.as_ref(),
-    );
-    local_vjp_calls = local_vjp_calls.saturating_add(layers);
-    let [batch, streams, time, dim] = activities[0].shape().dims::<4>();
-    let initial_grad = apply_activity_mask(
-        batched_vjp
-            .grad_input
-            .slice([0..batch, 0..streams, 0..time, 0..dim]),
-        activity_mask.as_ref(),
-    );
-    let initial_vjp = match activity_mask.as_ref() {
-        Some(mask) => plain.predictive_coding_initial_vjp_with_activity_mask(
-            inputs,
-            initial_grad,
-            mask.clone(),
-        ),
-        None => plain.predictive_coding_initial_vjp(inputs, initial_grad),
-    };
-    local_vjp_calls = local_vjp_calls.saturating_add(1);
-    let grad_norm_gamma = batched_vjp.grad_norm_gamma + initial_vjp.grad_norm_gamma;
-    let grad_norm_beta = batched_vjp.grad_norm_beta + initial_vjp.grad_norm_beta;
-    let grad_norm_alpha = batched_vjp.grad_norm_alpha + initial_vjp.grad_norm_alpha;
-    let grad_norm_shift = batched_vjp.grad_norm_shift + initial_vjp.grad_norm_shift;
-    // Report the ordinary feed-forward CE from the initialized activities.
-    // The settled terminal CE is an inference diagnostic and is not directly
-    // comparable with the backpropagation baseline's train metric.
-    let loss = Tensor::<B, 1>::from_inner(
-        feedforward_loss.expect("validated local PC runs at least one inference step"),
-    );
-    let mut grads = GradientsParams::new();
-    grads.register(parameter_ids.embedding, initial_vjp.grad_embedding);
-    grads.register(parameter_ids.encoder, batched_vjp.grad_encoder);
-    grads.register(parameter_ids.encoder_v, batched_vjp.grad_encoder_v);
-    grads.register(parameter_ids.decoder, batched_vjp.grad_decoder);
-    grads.register(parameter_ids.norm_gamma, grad_norm_gamma);
-    grads.register(parameter_ids.norm_beta, grad_norm_beta);
-    grads.register(parameter_ids.norm_alpha, grad_norm_alpha);
-    grads.register(parameter_ids.norm_shift, grad_norm_shift);
-    grads.register(
-        parameter_ids.lm_head,
-        terminal.grad_lm_head.mul_scalar(scale),
-    );
-    local_vjp_calls = local_vjp_calls.saturating_add(1);
-
-    let report = LocalPredictiveCodingStepReport {
-        solver: config.solver,
-        inference_steps: config.inference.steps,
-        dual_steps: 0,
-        factors,
-        local_vjp_calls,
-        temporal_state_vjp_calls: 0,
-        fused_temporal_vjp_calls: 0,
-        global_backward_calls: 0,
-        gradient_tensors: grads.len(),
-        direct_forward_updates: 0,
-        feedback_parameter_updates: 0,
-        adjoint_teacher_updates: 0,
-        adjoint_local_updates: 0,
-        parameter_updates: 1,
-        energy_before,
-        energy_after,
-        grad_norm_mean: None,
-        grad_norm_max: None,
-        delta_rms_mean: None,
-        clip_fraction_mean: None,
-        constraint_rms: None,
-        dual_rms: None,
-        composite_signal_rms: None,
-        elapsed_ns: started.elapsed().as_nanos(),
-    };
-    validate_step_execution_contract(config, &report);
-    profile.record(report);
-    LocalPredictiveCodingDerivatives {
-        grads,
-        loss,
-        supervised_tokens: Tensor::<B, 1>::from_inner(terminal.supervised_tokens),
-        terminal_state: ModelState::<B>::from_inner_cloned(terminal_state),
-        initial_rho_adjoints: Vec::new(),
-        dkp_feedback: None,
-        report,
-    }
+    unreachable!("all other local PC solvers return through typed solver contexts")
 }
 
 /// Produce one canonical Dragon predictive-coding derivative step without a
@@ -3797,6 +3454,7 @@ mod tests {
             support_action_mask: support.clone(),
             valid_action_mask: valid.clone(),
             row_weights: weights.clone(),
+            propagate_hidden_gradient: true,
             eps: 1.0e-12,
         };
         let reference_loss = reference_criterion
@@ -3814,6 +3472,7 @@ mod tests {
                     support_action_mask: support.inner(),
                     valid_action_mask: valid.inner(),
                     row_weights: weights.inner(),
+                    propagate_hidden_gradient: true,
                     eps: 1.0e-12,
                 },
                 semantic_states: 2,
@@ -4359,6 +4018,37 @@ mod tests {
     }
 
     #[test]
+    fn objective_routing_uses_fixed_prediction_for_next_token_factors() {
+        let device = Default::default();
+        TestBackend::seed(&device, 20260811);
+        let model = model(&device);
+        let (inputs, targets) = batch(&device);
+        let step = local_predictive_coding_train_step(
+            &model,
+            inputs,
+            targets,
+            None,
+            &LocalPredictiveCodingConfig {
+                solver: LocalPredictiveCodingSolver::ErrorEquilibrium,
+                objective_routing: crate::config::LocalPredictiveCodingObjectiveRoutingConfig {
+                    next_token_solver: Some(LocalPredictiveCodingSolver::FixedPrediction),
+                },
+                terminal_criterion:
+                    crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSetJoint,
+                ..LocalPredictiveCodingConfig::default()
+            },
+            &LocalPredictiveCodingProfile::default(),
+        );
+
+        assert_eq!(
+            step.report.solver,
+            LocalPredictiveCodingSolver::FixedPrediction
+        );
+        assert_eq!(step.report.global_backward_calls, 0);
+        assert_eq!(step.report.parameter_updates, 1);
+    }
+
+    #[test]
     fn derivative_api_rejects_mu_pc_on_non_error_solver() {
         let device = Default::default();
         let model = model(&device);
@@ -4551,6 +4241,24 @@ mod tests {
             .expect("verifier-terminal predictive-coding program");
         assert_eq!(manifest.graph_digest, verifier_terminal.graph_digest);
         assert_ne!(manifest.program_digest, verifier_terminal.program_digest);
+
+        let joint_verifier_terminal = LocalPredictiveCodingConfig {
+            terminal_criterion:
+                crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSetJoint,
+            ..LocalPredictiveCodingConfig::default()
+        };
+        let joint_verifier_terminal =
+            dragon_predictive_coding_checkpoint_manifest(3, &joint_verifier_terminal)
+                .expect("joint-verifier-terminal predictive-coding program");
+        assert_eq!(manifest.graph_digest, joint_verifier_terminal.graph_digest);
+        assert_ne!(
+            manifest.program_digest,
+            joint_verifier_terminal.program_digest
+        );
+        assert_ne!(
+            verifier_terminal.program_digest,
+            joint_verifier_terminal.program_digest
+        );
 
         let calibrated_adjoint = LocalPredictiveCodingConfig {
             solver: LocalPredictiveCodingSolver::DirectKolenPollack,

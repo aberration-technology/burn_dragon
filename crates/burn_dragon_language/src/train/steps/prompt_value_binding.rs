@@ -3,6 +3,9 @@
 use super::*;
 use crate::train::local_predictive_coding;
 
+#[cfg(test)]
+mod tests;
+
 pub(super) struct RuliadPromptValueBindingStepInput<B: Backend> {
     pub policy_batch: Option<Arc<crate::dataset::RuliadPolicyBatch>>,
     pub stream_inputs: Tensor<B, 2, Int>,
@@ -32,13 +35,24 @@ impl<B: AutodiffBackend> LanguageTrainModel<B> {
                 policy_batch,
                 &stream_inputs.device(),
                 block_size,
+                schedule_step_index,
             )
         });
         let Some(prepared) = prepared else {
             self.write_ruliad_prompt_value_binding_telemetry(RuliadPromptValueBindingTelemetry {
-                version: 1,
+                version: 2,
                 step_index: schedule_step_index,
                 algorithm: self.ruliad_prompt_value_binding_algorithm(),
+                prompt_context: self
+                    .ruliad_supervision
+                    .prompt_value_binding
+                    .context
+                    .as_str(),
+                objective: self
+                    .ruliad_supervision
+                    .prompt_value_binding
+                    .objective
+                    .as_str(),
                 skip_reason: Some("missing_or_empty_policy_batch"),
                 sample_groups: 0,
                 rows: 0,
@@ -46,6 +60,13 @@ impl<B: AutodiffBackend> LanguageTrainModel<B> {
                 padded_tokens: 0,
                 global_backward_calls: 0,
             });
+            assert!(
+                !self
+                    .ruliad_supervision
+                    .prompt_value_binding
+                    .require_scheduled_update,
+                "required Ruliad prompt-value binding update missing at step {schedule_step_index}: missing_or_empty_policy_batch"
+            );
             return None;
         };
         let PreparedRuliadPromptValueBindingBatch {
@@ -70,9 +91,19 @@ impl<B: AutodiffBackend> LanguageTrainModel<B> {
             );
             debug_assert_eq!(step.report.global_backward_calls, 0);
             self.write_ruliad_prompt_value_binding_telemetry(RuliadPromptValueBindingTelemetry {
-                version: 1,
+                version: 2,
                 step_index: schedule_step_index,
                 algorithm: "predictive_coding",
+                prompt_context: self
+                    .ruliad_supervision
+                    .prompt_value_binding
+                    .context
+                    .as_str(),
+                objective: self
+                    .ruliad_supervision
+                    .prompt_value_binding
+                    .objective
+                    .as_str(),
                 skip_reason: None,
                 sample_groups,
                 rows,
@@ -111,9 +142,19 @@ impl<B: AutodiffBackend> LanguageTrainModel<B> {
             .map(|started| started.elapsed().as_nanos())
             .unwrap_or_default();
         self.write_ruliad_prompt_value_binding_telemetry(RuliadPromptValueBindingTelemetry {
-            version: 1,
+            version: 2,
             step_index: schedule_step_index,
             algorithm: "backpropagation",
+            prompt_context: self
+                .ruliad_supervision
+                .prompt_value_binding
+                .context
+                .as_str(),
+            objective: self
+                .ruliad_supervision
+                .prompt_value_binding
+                .objective
+                .as_str(),
             skip_reason: None,
             sample_groups,
             rows,
@@ -175,6 +216,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         policy_batch: &crate::dataset::RuliadPolicyBatch,
         device: &B::Device,
         block_size: usize,
+        schedule_step_index: usize,
     ) -> Option<PreparedRuliadPromptValueBindingBatch<B>> {
         let config = self.ruliad_supervision.prompt_value_binding;
         if !config.enabled || policy_batch.samples.is_empty() || block_size < 4 {
@@ -193,19 +235,36 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             .samples
             .iter()
             .filter_map(|sample| {
-                if sample.prompt_tokens.is_empty() || sample.item.expected_answer.trim().is_empty()
-                {
-                    return None;
-                }
-                let rows = Self::ruliad_prompt_schema_value_completion_rows(
+                let (prompt_tokens, expected_answer) = self.ruliad_prompt_value_binding_target(
+                    sample,
                     &tokenizer,
-                    &sample.prompt_tokens,
-                    &sample.item.expected_answer,
-                    sample.item.document_close_marker(),
-                    completion_budget,
-                    block_size,
-                    config.max_rows_per_step,
-                );
+                    schedule_step_index,
+                )?;
+                let rows = match config.objective {
+                    crate::config::RuliadPromptValueBindingObjective::SchemaValues => {
+                        Self::ruliad_prompt_schema_value_completion_rows(
+                            &tokenizer,
+                            &prompt_tokens,
+                            &expected_answer,
+                            sample.item.document_close_marker(),
+                            completion_budget,
+                            block_size,
+                            config.max_rows_per_step,
+                        )
+                    }
+                    crate::config::RuliadPromptValueBindingObjective::FullCompletion => {
+                        Self::ruliad_prompt_full_completion_row(
+                            &tokenizer,
+                            &prompt_tokens,
+                            &expected_answer,
+                            sample.item.document_close_marker(),
+                            completion_budget,
+                            block_size,
+                        )
+                        .into_iter()
+                        .collect()
+                    }
+                };
                 (!rows.is_empty()).then_some(rows)
             })
             .collect::<Vec<_>>();
@@ -256,6 +315,111 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                 .saturating_mul(max_len)
                 .saturating_sub(populated_tokens),
         })
+    }
+
+    pub(super) fn ruliad_prompt_value_binding_target(
+        &self,
+        sample: &crate::dataset::RuliadPolicySample,
+        tokenizer: &burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer,
+        _schedule_step_index: usize,
+    ) -> Option<(Vec<i64>, String)> {
+        match self.ruliad_supervision.prompt_value_binding.context {
+            crate::config::RuliadPromptValueBindingContext::DatasetPrompt => {
+                (!sample.prompt_tokens.is_empty() && !sample.item.expected_answer.trim().is_empty())
+                    .then(|| {
+                        (
+                            sample.prompt_tokens.clone(),
+                            sample.item.expected_answer.clone(),
+                        )
+                    })
+            }
+            crate::config::RuliadPromptValueBindingContext::ProofPolicy => {
+                let burn_dragon_universality::RuliadSampleSpec::FormalProof {
+                    problem,
+                    certificate,
+                    proof_step_index,
+                    action_answer_contract,
+                    task: burn_dragon_universality::ruliad::RuliadTaskKind::SelectProofAction,
+                    ..
+                } = sample.item.spec.as_ref()?
+                else {
+                    return None;
+                };
+                // Bind the deployed policy contract, not the temporary factor selected by the
+                // alternating proof-policy optimizer schedule at this unrelated phase residue.
+                let policy = self.ruliad_supervision.proof_policy;
+                let actions = burn_dragon_universality::ruliad::oracle_proof_action_set(
+                    problem,
+                    certificate,
+                    proof_step_index.unwrap_or_default(),
+                    policy.candidates,
+                )
+                .ok()?;
+                let prompt = crate::train::ruliad_policy::ruliad_proof_policy_prompt(
+                    policy.prompt_context,
+                    problem,
+                    &actions,
+                )
+                .ok()?;
+                let answer_contract = match policy.scoring {
+                    crate::config::RuliadProofPolicyScoring::CompletionLikelihood => {
+                        *action_answer_contract
+                    }
+                    crate::config::RuliadProofPolicyScoring::SemanticEnergy
+                    | crate::config::RuliadProofPolicyScoring::ResidualEnergy => {
+                        burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::SemanticStep
+                    }
+                };
+                let answer = burn_dragon_universality::ruliad::proof_action_answer(
+                    &actions,
+                    actions.selected_index,
+                    answer_contract,
+                )
+                .ok()?;
+                let prompt_tokens = tokenizer
+                    .encode_payload(&prompt)
+                    .into_iter()
+                    .map(i64::from)
+                    .collect::<Vec<_>>();
+                (!prompt_tokens.is_empty() && !answer.is_empty()).then_some((prompt_tokens, answer))
+            }
+        }
+    }
+
+    pub(super) fn ruliad_prompt_full_completion_row(
+        tokenizer: &burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer,
+        base_prompt: &[i64],
+        answer: &str,
+        close_marker: &str,
+        completion_budget: usize,
+        block_size: usize,
+    ) -> Option<RuliadPromptSchemaValueRow> {
+        if base_prompt.is_empty()
+            || answer.trim().is_empty()
+            || completion_budget == 0
+            || block_size < 4
+        {
+            return None;
+        }
+        let mut completion = tokenizer
+            .encode_payload(&format!("{}\n{close_marker}", answer.trim()))
+            .into_iter()
+            .map(i64::from)
+            .collect::<Vec<_>>();
+        completion.truncate(completion_budget.min(block_size.saturating_sub(1)));
+        if completion.is_empty() {
+            return None;
+        }
+        let prompt_budget = block_size.saturating_sub(completion.len()).max(1);
+        let prompt = if base_prompt.len() > prompt_budget {
+            base_prompt[base_prompt.len() - prompt_budget..].to_vec()
+        } else {
+            base_prompt.to_vec()
+        };
+        let (inputs, targets, mask) =
+            Self::ruliad_policy_row_from_completion(&prompt, &completion)?;
+        let active_tokens = mask.iter().filter(|value| **value > f32::EPSILON).count();
+        (active_tokens > 0).then_some((inputs, targets, mask, active_tokens))
     }
 
     pub(super) fn write_ruliad_prompt_value_binding_telemetry(

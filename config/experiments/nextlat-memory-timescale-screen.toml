@@ -1,0 +1,50 @@
+version = 1
+output = "target/experiments/nextlat-memory-timescale-screen"
+repositories = [".", "../burn_pc", "../burn_ecs", "../burn_eggroll", "../burn_p2p"]
+
+[limits]
+system_fraction = 0.90
+headroom_mib = 4096
+poll_seconds = 0.25
+gpu_sample_seconds = 2.0
+shared_gpu_memory = true
+
+[[cases]]
+id = "reference-alibi-smoke"
+gpu = true
+expected_peak_mib = 32768
+timeout_seconds = 600
+argv = ["target/release/examples/train_language", "--backend", "cuda", "--config", "config/language/experiments/next_latent/capacity-base.toml", "--config", "config/language/experiments/next_latent/alibi-reference.overlay.toml", "--batch-size", "8", "--max-iters", "64", "--checkpoint-interval-iters", "64"]
+inputs = ["config/language/experiments/next_latent/base.toml", "config/language/experiments/next_latent/corpus.toml", "config/language/experiments/next_latent/in-distribution.corpus.toml", "config/language/experiments/next_latent/credit-base.toml", "config/language/experiments/next_latent/capacity-base.toml", "config/language/experiments/next_latent/alibi-reference.overlay.toml"]
+
+[[cases]]
+id = "fast-decay-conditional"
+gpu = true
+expected_peak_mib = 32768
+timeout_seconds = 1200
+argv = ["target/release/examples/train_language", "--backend", "cuda", "--config", "config/language/experiments/next_latent/capacity-base.toml", "--config", "config/language/experiments/next_latent/conditional-answer.overlay.toml", "--batch-size", "8", "--max-iters", "2048", "--checkpoint-interval-iters", "512"]
+inputs = ["config/language/experiments/next_latent/base.toml", "config/language/experiments/next_latent/corpus.toml", "config/language/experiments/next_latent/in-distribution.corpus.toml", "config/language/experiments/next_latent/credit-base.toml", "config/language/experiments/next_latent/capacity-base.toml", "config/language/experiments/next_latent/conditional-answer.overlay.toml"]
+
+[[cases]]
+id = "reference-decay-conditional"
+gpu = true
+expected_peak_mib = 32768
+timeout_seconds = 1200
+argv = ["target/release/examples/train_language", "--backend", "cuda", "--config", "config/language/experiments/next_latent/capacity-base.toml", "--config", "config/language/experiments/next_latent/conditional-answer.overlay.toml", "--config", "config/language/experiments/next_latent/alibi-reference.overlay.toml", "--batch-size", "8", "--max-iters", "2048", "--checkpoint-interval-iters", "512"]
+inputs = ["config/language/experiments/next_latent/base.toml", "config/language/experiments/next_latent/corpus.toml", "config/language/experiments/next_latent/in-distribution.corpus.toml", "config/language/experiments/next_latent/credit-base.toml", "config/language/experiments/next_latent/capacity-base.toml", "config/language/experiments/next_latent/conditional-answer.overlay.toml", "config/language/experiments/next_latent/alibi-reference.overlay.toml"]
+
+[[cases]]
+id = "reference-decay-joint"
+gpu = true
+expected_peak_mib = 32768
+timeout_seconds = 1200
+argv = ["target/release/examples/train_language", "--backend", "cuda", "--config", "config/language/experiments/next_latent/capacity-base.toml", "--config", "config/language/experiments/next_latent/alibi-reference.overlay.toml", "--batch-size", "8", "--max-iters", "2048", "--checkpoint-interval-iters", "512"]
+inputs = ["config/language/experiments/next_latent/base.toml", "config/language/experiments/next_latent/corpus.toml", "config/language/experiments/next_latent/in-distribution.corpus.toml", "config/language/experiments/next_latent/credit-base.toml", "config/language/experiments/next_latent/capacity-base.toml", "config/language/experiments/next_latent/alibi-reference.overlay.toml"]
+
+[[cases]]
+id = "fast-decay-joint"
+gpu = true
+expected_peak_mib = 32768
+timeout_seconds = 1200
+argv = ["target/release/examples/train_language", "--backend", "cuda", "--config", "config/language/experiments/next_latent/capacity-base.toml", "--batch-size", "8", "--max-iters", "2048", "--checkpoint-interval-iters", "512"]
+inputs = ["config/language/experiments/next_latent/base.toml", "config/language/experiments/next_latent/corpus.toml", "config/language/experiments/next_latent/in-distribution.corpus.toml", "config/language/experiments/next_latent/credit-base.toml", "config/language/experiments/next_latent/capacity-base.toml"]

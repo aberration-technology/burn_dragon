@@ -1,0 +1,6 @@
+extends = ["structural-eval.corpus.toml"]
+
+# Match the confirmatory seed while retaining the new-law/structural split.
+seed = 8817301
+name = "nextlat-memory-confirmatory-structural"
+validation_samples = 512

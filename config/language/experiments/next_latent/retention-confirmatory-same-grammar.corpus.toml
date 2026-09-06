@@ -1,0 +1,6 @@
+extends = ["in-distribution.corpus.toml"]
+
+# Unused generator seed, reserved until both retention arms completed.
+seed = 8817303
+name = "nextlat-retention-confirmatory-same-grammar"
+validation_samples = 1024

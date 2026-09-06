@@ -24,11 +24,53 @@ pub struct RuliadPolicySample {
     pub prompt_tokens: Vec<i64>,
 }
 
+/// Authoritative source coordinate used to materialize a structured policy batch.
+///
+/// This metadata is deliberately excluded from [`RuliadPolicyBatch::fingerprint`]:
+/// the fingerprint establishes content identity, while this sidecar establishes
+/// how that content was selected. Keeping both lets paired runs prove both stream
+/// parity and curriculum behavior without conflating a replay with new content.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuliadPolicySamplingMetadata {
+    pub logical_epoch_index: usize,
+    pub logical_selection_step: usize,
+    pub generation_epoch_index: usize,
+    pub generation_step: usize,
+    pub released_unique_steps: usize,
+    pub novel: bool,
+    pub consolidation_enabled: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct RuliadPolicyBatch {
     pub samples: Vec<RuliadPolicySample>,
     pub tokenization: burn_dragon_universality::RuliadTokenizationConfig,
     pub stop_token_id: Option<i64>,
+    pub sampling_metadata: Option<RuliadPolicySamplingMetadata>,
+}
+
+impl RuliadPolicyBatch {
+    /// Stable host-side identity for paired optimizer and peer-conformance
+    /// experiments. This is deliberately absent from the loader hot path
+    /// unless structured proof-policy supervision is requested.
+    pub fn fingerprint(&self) -> u64 {
+        let mut state = fnv1a_u64(FNV1A_OFFSET_BASIS, self.samples.len() as u64);
+        for sample in &self.samples {
+            for byte in sample.item.oracle_hash.bytes() {
+                state = fnv1a_u64(state, u64::from(byte));
+            }
+            state = fnv1a_u64(state, sample.item.sample_index as u64);
+            state = fnv1a_u64(
+                state,
+                sample.item.difficulty_level.unwrap_or(usize::MAX) as u64,
+            );
+            state = fnv1a_u64(state, sample.prompt_tokens.len() as u64);
+            for token in &sample.prompt_tokens {
+                state = fnv1a_u64(state, *token as u64);
+            }
+        }
+        fnv1a_u64(state, self.stop_token_id.unwrap_or(-1) as u64)
+    }
 }
 
 /// Concrete source-selected windows and supervision aligned to their shifted targets.
@@ -588,7 +630,11 @@ impl RuliadPolicyBatchSchedule {
     }
 }
 
-fn sample_host_batch_with_shape<T>(dataset: &T, request: HostBatchRequest) -> HostSequenceBatch
+fn sample_host_batch_with_shape<T>(
+    dataset: &T,
+    ruliad_policy_dataset: Option<&dyn TokenSequenceDataset>,
+    request: HostBatchRequest,
+) -> HostSequenceBatch
 where
     T: TokenSequenceDataset + ?Sized,
 {
@@ -848,21 +894,33 @@ where
     }
 
     if source_selection_enabled && include_ruliad_policy_batch && ruliad_policy_batch.is_none() {
-        ruliad_policy_batch = dataset
-            .source_selected_ruliad_policy_batch(
+        ruliad_policy_batch = match ruliad_policy_dataset {
+            Some(policy_dataset) => policy_dataset.source_selected_ruliad_policy_batch(
                 split,
                 epoch_index,
                 absolute_step,
                 batch_size,
                 ruliad_policy_stratified_difficulty_levels,
-            )
-            .map(Arc::new);
+            ),
+            None => dataset.source_selected_ruliad_policy_batch(
+                split,
+                epoch_index,
+                absolute_step,
+                batch_size,
+                ruliad_policy_stratified_difficulty_levels,
+            ),
+        }
+        .map(Arc::new);
     }
 
+    let supervised_token_count = loss_mask
+        .as_ref()
+        .map(|mask| mask.iter().filter(|value| **value != 0).count());
     HostSequenceBatch {
         inputs,
         targets,
         loss_mask,
+        supervised_token_count,
         ruliad_policy_batch,
         absolute_step,
         dataloader_cpu_ns: cpu_start
@@ -886,6 +944,7 @@ pub fn sample_batch_with_shape<B: Backend, T: TokenSequenceDataset + ?Sized>(
     let seed = thread_rng().next_u64();
     let host = sample_host_batch_with_shape(
         dataset,
+        None,
         HostBatchRequest {
             split,
             batch_size,
@@ -916,6 +975,10 @@ pub struct SequenceBatch<B: Backend> {
     pub inputs: Tensor<B, 2, Int>,
     pub targets: Tensor<B, 2, Int>,
     pub loss_mask: Option<Tensor<B, 2, Int>>,
+    /// Host-derived count when supervision is explicitly masked. `Some(0)`
+    /// lets streaming runtimes advance recurrent state without presenting
+    /// zero-gradient tensors to a decoupled-weight-decay optimizer.
+    pub supervised_token_count: Option<usize>,
     pub summary_event_mask: Option<Tensor<B, 2, Int>>,
     pub ruliad_policy_batch: Option<Arc<RuliadPolicyBatch>>,
     /// Authoritative consumed-batch clock used by scheduled training objectives.
@@ -930,6 +993,7 @@ struct HostSequenceBatch {
     inputs: Vec<i64>,
     targets: Vec<i64>,
     loss_mask: Option<Vec<i64>>,
+    supervised_token_count: Option<usize>,
     ruliad_policy_batch: Option<Arc<RuliadPolicyBatch>>,
     absolute_step: usize,
     dataloader_cpu_ns: u128,
@@ -947,6 +1011,7 @@ impl RandomPrefetch {
     #[allow(clippy::too_many_arguments)]
     fn spawn(
         dataset: Arc<dyn TokenSequenceDataset>,
+        ruliad_policy_dataset: Option<Arc<dyn TokenSequenceDataset>>,
         split: DatasetSplit,
         batch_size: usize,
         block_size: usize,
@@ -976,6 +1041,7 @@ impl RandomPrefetch {
         for _ in 0..worker_count {
             let sender = sender.clone();
             let dataset = Arc::clone(&dataset);
+            let ruliad_policy_dataset = ruliad_policy_dataset.as_ref().map(Arc::clone);
             let next_task = Arc::clone(&next_task);
             handles.push(thread::spawn(move || {
                 loop {
@@ -991,6 +1057,7 @@ impl RandomPrefetch {
                     }
                     let batch = sample_host_batch_with_shape(
                         dataset.as_ref(),
+                        ruliad_policy_dataset.as_deref(),
                         HostBatchRequest {
                             split,
                             batch_size,
@@ -1087,6 +1154,7 @@ impl<B: Backend> SequenceBatch<B> {
             inputs,
             targets,
             loss_mask: None,
+            supervised_token_count: None,
             summary_event_mask,
             ruliad_policy_batch: None,
             absolute_step: None,
@@ -1096,6 +1164,11 @@ impl<B: Backend> SequenceBatch<B> {
 
     pub fn with_loss_mask(mut self, loss_mask: Option<Tensor<B, 2, Int>>) -> Self {
         self.loss_mask = loss_mask;
+        self
+    }
+
+    pub fn with_supervised_token_count(mut self, supervised_token_count: Option<usize>) -> Self {
+        self.supervised_token_count = supervised_token_count;
         self
     }
 
@@ -1165,6 +1238,7 @@ fn finalize_host_batch_on_device<B: Backend>(
         inputs,
         targets,
         loss_mask,
+        supervised_token_count,
         ruliad_policy_batch,
         absolute_step,
         dataloader_cpu_ns,
@@ -1201,6 +1275,7 @@ fn finalize_host_batch_on_device<B: Backend>(
 
     SequenceBatch::new(inputs_tensor, targets_tensor, summary_event_mask)
         .with_loss_mask(loss_mask_tensor)
+        .with_supervised_token_count(supervised_token_count)
         .with_ruliad_policy_batch(ruliad_policy_batch)
         .with_absolute_step(absolute_step)
         .with_reset_stream_state(reset_stream_state)
@@ -1209,6 +1284,7 @@ fn finalize_host_batch_on_device<B: Backend>(
 /// Data loader that produces random sequences from any `TokenSequenceDataset`.
 pub struct RandomDataLoader<B: Backend> {
     dataset: Arc<dyn TokenSequenceDataset>,
+    ruliad_policy_dataset: Option<Arc<dyn TokenSequenceDataset>>,
     split: DatasetSplit,
     device: B::Device,
     batch_size: usize,
@@ -1226,6 +1302,7 @@ pub struct RandomDataLoader<B: Backend> {
 
 pub struct StreamingDataLoader<B: Backend> {
     dataset: Arc<dyn TokenSequenceDataset>,
+    ruliad_policy_dataset: Option<Arc<dyn TokenSequenceDataset>>,
     split: DatasetSplit,
     device: B::Device,
     batch_size: usize,
@@ -1245,6 +1322,7 @@ impl<B: Backend> Clone for RandomDataLoader<B> {
     fn clone(&self) -> Self {
         Self {
             dataset: Arc::clone(&self.dataset),
+            ruliad_policy_dataset: self.ruliad_policy_dataset.as_ref().map(Arc::clone),
             split: self.split,
             device: self.device.clone(),
             batch_size: self.batch_size,
@@ -1267,6 +1345,7 @@ impl<B: Backend> Clone for StreamingDataLoader<B> {
     fn clone(&self) -> Self {
         Self {
             dataset: Arc::clone(&self.dataset),
+            ruliad_policy_dataset: self.ruliad_policy_dataset.as_ref().map(Arc::clone),
             split: self.split,
             device: self.device.clone(),
             batch_size: self.batch_size,
@@ -1305,6 +1384,7 @@ impl<B: Backend> RandomDataLoader<B> {
 
         Self {
             dataset,
+            ruliad_policy_dataset: None,
             split,
             device: device.clone(),
             batch_size,
@@ -1353,6 +1433,19 @@ impl<B: Backend> RandomDataLoader<B> {
         } else {
             RuliadPolicyBatchSchedule::default()
         };
+        self.prefetch = Arc::new(Mutex::new(None));
+        self
+    }
+
+    /// Uses a separately materialized source for structured Ruliad supervision.
+    ///
+    /// This permits the token curriculum to adapt locally while keeping the
+    /// signed proof-policy objective deterministic and replayable across peers.
+    pub fn with_ruliad_policy_dataset<T>(mut self, dataset: Arc<T>) -> Self
+    where
+        T: TokenSequenceDataset + 'static,
+    {
+        self.ruliad_policy_dataset = Some(dataset);
         self.prefetch = Arc::new(Mutex::new(None));
         self
     }
@@ -1460,6 +1553,7 @@ impl<B: Backend> StreamingDataLoader<B> {
 
         Self {
             dataset,
+            ruliad_policy_dataset: None,
             split,
             device: device.clone(),
             batch_size,
@@ -1500,6 +1594,15 @@ impl<B: Backend> StreamingDataLoader<B> {
         } else {
             RuliadPolicyBatchSchedule::default()
         };
+        self
+    }
+
+    /// Uses a separately materialized source for structured Ruliad supervision.
+    pub fn with_ruliad_policy_dataset<T>(mut self, dataset: Arc<T>) -> Self
+    where
+        T: TokenSequenceDataset + 'static,
+    {
+        self.ruliad_policy_dataset = Some(dataset);
         self
     }
 
@@ -1571,6 +1674,7 @@ where
             if slot.is_none() {
                 *slot = Some(RandomPrefetch::spawn(
                     Arc::clone(&self.dataset),
+                    self.ruliad_policy_dataset.as_ref().map(Arc::clone),
                     self.split,
                     self.batch_size,
                     self.block_size,
@@ -1591,6 +1695,7 @@ where
 
         Box::new(RandomIterator {
             dataset: Arc::clone(&self.dataset),
+            ruliad_policy_dataset: self.ruliad_policy_dataset.as_ref().map(Arc::clone),
             split: self.split,
             device: self.device.clone(),
             batch_size: self.batch_size,
@@ -1621,6 +1726,7 @@ where
     fn to_device(&self, device: &B::Device) -> Arc<dyn DataLoader<B, SequenceBatch<B>>> {
         Arc::new(Self {
             dataset: Arc::clone(&self.dataset),
+            ruliad_policy_dataset: self.ruliad_policy_dataset.as_ref().map(Arc::clone),
             split: self.split,
             device: device.clone(),
             batch_size: self.batch_size,
@@ -1647,6 +1753,7 @@ where
 
         Arc::new(Self {
             dataset: Arc::clone(&self.dataset),
+            ruliad_policy_dataset: self.ruliad_policy_dataset.as_ref().map(Arc::clone),
             split: self.split,
             device: self.device.clone(),
             batch_size: self.batch_size,
@@ -1667,6 +1774,7 @@ where
 
 struct StreamingIterator<B: Backend> {
     dataset: Arc<dyn TokenSequenceDataset>,
+    ruliad_policy_dataset: Option<Arc<dyn TokenSequenceDataset>>,
     split: DatasetSplit,
     device: B::Device,
     batch_size: usize,
@@ -1899,7 +2007,9 @@ impl<B: Backend> Iterator for StreamingIterator<B> {
             // metadata remains aligned with the logical source document.
             let selection_step =
                 absolute_step.saturating_sub(self.chunk_index_in_document.min(absolute_step));
-            self.dataset
+            self.ruliad_policy_dataset
+                .as_deref()
+                .unwrap_or_else(|| self.dataset.as_ref())
                 .source_selected_ruliad_policy_batch(
                     self.split,
                     self.epoch_index,
@@ -1911,6 +2021,9 @@ impl<B: Backend> Iterator for StreamingIterator<B> {
         } else {
             None
         };
+        let supervised_token_count = loss_mask
+            .as_ref()
+            .map(|mask| mask.iter().filter(|value| **value != 0).count());
 
         let tensor_copy_start = prof_enabled.then(Instant::now);
         let summary_event_mask = summary_event_mask_tensor::<B>(
@@ -1959,6 +2072,7 @@ impl<B: Backend> Iterator for StreamingIterator<B> {
         Some(
             SequenceBatch::new(inputs_tensor, targets_tensor, summary_event_mask)
                 .with_loss_mask(loss_mask_tensor)
+                .with_supervised_token_count(supervised_token_count)
                 .with_ruliad_policy_batch(ruliad_policy_batch)
                 .with_absolute_step(absolute_step)
                 .with_reset_stream_state(reset_stream_state),
@@ -2020,6 +2134,7 @@ where
 
         Box::new(StreamingIterator {
             dataset: Arc::clone(&self.dataset),
+            ruliad_policy_dataset: self.ruliad_policy_dataset.as_ref().map(Arc::clone),
             split: self.split,
             device: self.device.clone(),
             batch_size: self.batch_size,
@@ -2052,6 +2167,7 @@ where
     fn to_device(&self, device: &B::Device) -> Arc<dyn DataLoader<B, SequenceBatch<B>>> {
         Arc::new(Self {
             dataset: Arc::clone(&self.dataset),
+            ruliad_policy_dataset: self.ruliad_policy_dataset.as_ref().map(Arc::clone),
             split: self.split,
             device: device.clone(),
             batch_size: self.batch_size,
@@ -2078,6 +2194,7 @@ where
 
         Arc::new(Self {
             dataset: Arc::clone(&self.dataset),
+            ruliad_policy_dataset: self.ruliad_policy_dataset.as_ref().map(Arc::clone),
             split: self.split,
             device: self.device.clone(),
             batch_size: self.batch_size,
@@ -2428,6 +2545,7 @@ mod streaming_tests {
         for absolute_step in 0..16 {
             let host = sample_host_batch_with_shape(
                 &dataset,
+                None,
                 HostBatchRequest {
                     split: DatasetSplit::Train,
                     batch_size: dataset.batch_size,
@@ -2567,6 +2685,7 @@ mod streaming_tests {
 
 struct RandomIterator<B: Backend> {
     dataset: Arc<dyn TokenSequenceDataset>,
+    ruliad_policy_dataset: Option<Arc<dyn TokenSequenceDataset>>,
     split: DatasetSplit,
     device: B::Device,
     batch_size: usize,
@@ -2611,6 +2730,7 @@ impl<B: Backend> Iterator for RandomIterator<B> {
                 .unwrap_or(self.step);
             let host = sample_host_batch_with_shape(
                 &*self.dataset,
+                self.ruliad_policy_dataset.as_deref(),
                 HostBatchRequest {
                     split: self.split,
                     batch_size: self.batch_size,
@@ -2839,6 +2959,15 @@ mod random_loader_tests {
                         eos_id: Some(511),
                     },
                 stop_token_id: Some(511),
+                sampling_metadata: Some(RuliadPolicySamplingMetadata {
+                    logical_epoch_index: 0,
+                    logical_selection_step: absolute_step,
+                    generation_epoch_index: 0,
+                    generation_step: absolute_step,
+                    released_unique_steps: absolute_step.saturating_add(1),
+                    novel: true,
+                    consolidation_enabled: false,
+                }),
             })
         }
 
@@ -3122,6 +3251,47 @@ mod random_loader_tests {
     }
 
     #[test]
+    fn random_loader_uses_separate_ruliad_policy_dataset() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let main_policy_steps = Arc::new(Mutex::new(Vec::new()));
+        let sidecar_policy_steps = Arc::new(Mutex::new(Vec::new()));
+        let dataset = Arc::new(LivePrefetchDataset {
+            block_size: 4,
+            batch_size: 1,
+            tokenizer: tiny_pretokenized_tokenizer(),
+            selected_steps: Arc::new(Mutex::new(Vec::new())),
+            policy_steps: Some(Arc::clone(&main_policy_steps)),
+        });
+        let policy_dataset = Arc::new(LivePrefetchDataset {
+            block_size: 4,
+            batch_size: 1,
+            tokenizer: tiny_pretokenized_tokenizer(),
+            selected_steps: Arc::new(Mutex::new(Vec::new())),
+            policy_steps: Some(Arc::clone(&sidecar_policy_steps)),
+        });
+
+        let batch =
+            RandomDataLoader::<TestBackend>::new(dataset, DatasetSplit::Train, &device, 1, Some(1))
+                .with_ruliad_policy_dataset(policy_dataset)
+                .with_ruliad_policy_batch(true)
+                .iter()
+                .next()
+                .expect("batch");
+
+        assert!(batch.ruliad_policy_batch.is_some());
+        assert!(
+            main_policy_steps
+                .lock()
+                .expect("main policy lock")
+                .is_empty()
+        );
+        assert_eq!(
+            *sidecar_policy_steps.lock().expect("sidecar policy lock"),
+            vec![0]
+        );
+    }
+
+    #[test]
     fn loaders_materialize_policy_metadata_only_on_scheduled_training_steps() {
         let device = burn::tensor::Device::<TestBackend>::default();
         let mut supervision = crate::config::RuliadSupervisionConfig::default();
@@ -3238,6 +3408,54 @@ mod random_loader_tests {
     }
 
     #[test]
+    fn streaming_loader_uses_separate_ruliad_policy_dataset() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        let main_policy_steps = Arc::new(Mutex::new(Vec::new()));
+        let sidecar_policy_steps = Arc::new(Mutex::new(Vec::new()));
+        let dataset = Arc::new(LivePrefetchDataset {
+            block_size: 4,
+            batch_size: 1,
+            tokenizer: tiny_pretokenized_tokenizer(),
+            selected_steps: Arc::new(Mutex::new(Vec::new())),
+            policy_steps: Some(Arc::clone(&main_policy_steps)),
+        });
+        let policy_dataset = Arc::new(LivePrefetchDataset {
+            block_size: 4,
+            batch_size: 1,
+            tokenizer: tiny_pretokenized_tokenizer(),
+            selected_steps: Arc::new(Mutex::new(Vec::new())),
+            policy_steps: Some(Arc::clone(&sidecar_policy_steps)),
+        });
+
+        let batch = StreamingDataLoader::<TestBackend>::new(
+            dataset,
+            DatasetSplit::Train,
+            &device,
+            1,
+            Some(1),
+            Some(4),
+            1337,
+        )
+        .with_ruliad_policy_dataset(policy_dataset)
+        .with_ruliad_policy_batch(true)
+        .iter()
+        .next()
+        .expect("streaming batch");
+
+        assert!(batch.ruliad_policy_batch.is_some());
+        assert!(
+            main_policy_steps
+                .lock()
+                .expect("main policy lock")
+                .is_empty()
+        );
+        assert_eq!(
+            *sidecar_policy_steps.lock().expect("sidecar policy lock"),
+            vec![0]
+        );
+    }
+
+    #[test]
     fn streaming_loader_reuses_document_selection_step_for_tbptt_policy_batch() {
         let device = burn::tensor::Device::<TestBackend>::default();
         let policy_steps = Arc::new(Mutex::new(Vec::new()));
@@ -3260,14 +3478,25 @@ mod random_loader_tests {
         )
         .with_ruliad_policy_batch(true);
         let mut iterator = loader.iter();
-        let _ = iterator.next().expect("first stream chunk");
-        let _ = iterator.next().expect("second stream chunk");
+        let first = iterator.next().expect("first stream chunk");
+        let second = iterator.next().expect("second stream chunk");
 
         assert_eq!(
             *policy_steps.lock().expect("policy steps lock"),
             vec![0, 0],
             "all chunks from one streamed logical document should use the same source-selection policy step"
         );
+        for batch in [first, second] {
+            let metadata = batch
+                .ruliad_policy_batch
+                .expect("policy sidecar")
+                .sampling_metadata
+                .expect("authoritative sampling metadata");
+            assert_eq!(metadata.logical_selection_step, 0);
+            assert_eq!(metadata.logical_epoch_index, 0);
+            assert_eq!(metadata.generation_epoch_index, 0);
+            assert_eq!(metadata.generation_step, 0);
+        }
     }
 
     #[test]
@@ -3296,5 +3525,42 @@ mod random_loader_tests {
             ..complete.clone()
         };
         assert_ne!(complete.fingerprint(), incomplete.fingerprint());
+    }
+
+    #[test]
+    fn ruliad_policy_fingerprint_covers_semantic_identity_and_prompt_tokens() {
+        let batch = RuliadPolicyBatch {
+            samples: vec![RuliadPolicySample {
+                item: burn_dragon_universality::RuliadEvalItem {
+                    oracle_hash: "formal-state-a".to_string(),
+                    sample_index: 7,
+                    split: burn_dragon_universality::SampleSplit::Train,
+                    family: "formal_proof".to_string(),
+                    task_kind: "select_proof_action".to_string(),
+                    math_domains: vec!["formal_proof".to_string()],
+                    reasoning_modes: vec!["proof_construction".to_string()],
+                    prompt: "?:select\n!:".to_string(),
+                    expected_answer: "g0|a:r0|f|-".to_string(),
+                    difficulty_level: Some(3),
+                    spec: None,
+                },
+                prompt_tokens: vec![1, 2, 3],
+            }],
+            tokenization: burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+                vocab_size: 512,
+                eos_id: Some(511),
+            },
+            stop_token_id: Some(511),
+            sampling_metadata: None,
+        };
+        assert_eq!(batch.fingerprint(), batch.clone().fingerprint());
+
+        let mut changed_prompt = batch.clone();
+        changed_prompt.samples[0].prompt_tokens[2] = 4;
+        assert_ne!(batch.fingerprint(), changed_prompt.fingerprint());
+
+        let mut changed_state = batch.clone();
+        changed_state.samples[0].item.oracle_hash = "formal-state-b".to_string();
+        assert_ne!(batch.fingerprint(), changed_state.fingerprint());
     }
 }

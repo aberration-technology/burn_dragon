@@ -50,6 +50,7 @@ const HOLDOUT_SPLIT_SEED: u64 = 0x6c69_6665_5f76_616c;
 enum LearningRule {
     Backpropagation,
     FixedPrediction,
+    ErrorEquilibrium,
     ReverseGaussSeidel,
     LayerLocalPrediction,
 }
@@ -60,6 +61,7 @@ impl LearningRule {
         match self {
             Self::Backpropagation => None,
             Self::FixedPrediction => Some(LocalPredictiveCodingSolver::FixedPrediction),
+            Self::ErrorEquilibrium => Some(LocalPredictiveCodingSolver::ErrorEquilibrium),
             Self::ReverseGaussSeidel => Some(LocalPredictiveCodingSolver::ReverseGaussSeidel),
             Self::LayerLocalPrediction => Some(LocalPredictiveCodingSolver::LayerLocalPrediction),
         }
@@ -340,6 +342,7 @@ fn parse_args() -> Result<Args> {
                     .map(|part| match part {
                         "backpropagation" | "adamw" => Ok(LearningRule::Backpropagation),
                         "fixed_prediction" => Ok(LearningRule::FixedPrediction),
+                        "error_equilibrium" | "epc" => Ok(LearningRule::ErrorEquilibrium),
                         "reverse_gauss_seidel" => Ok(LearningRule::ReverseGaussSeidel),
                         "layer_local_prediction" => Ok(LearningRule::LayerLocalPrediction),
                         _ => Err(anyhow!("unsupported learning rule {part:?}")),
@@ -480,7 +483,7 @@ fn parse_args() -> Result<Args> {
             }
             "--help" | "-h" => {
                 println!(
-                    "pc_lifelong_stream: --backend cpu|cuda --rules backpropagation,fixed_prediction,reverse_gauss_seidel,layer_local_prediction --topologies dense_shared,selected_sparse_context_scoped --selector predictive_evidence|recurrence_descriptor_control --seeds 17,29,43 [model, PC, selector, and output options]"
+                    "pc_lifelong_stream: --backend cpu|cuda --rules backpropagation,fixed_prediction,error_equilibrium,reverse_gauss_seidel,layer_local_prediction --topologies dense_shared,selected_sparse_context_scoped --selector predictive_evidence|recurrence_descriptor_control --seeds 17,29,43 [model, PC, selector, and output options]"
                 );
                 std::process::exit(0);
             }
@@ -1562,6 +1565,34 @@ fn main() -> Result<()> {
         println!("{json}");
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "train"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_equilibrium_rule_uses_the_shared_non_equilibrium_contract() {
+        let args = Args {
+            pc_inference_steps: 1,
+            pc_step_size: 0.1,
+            pc_prediction_precision: 10.0,
+            pc_max_grad_norm: Some(1_000_000.0),
+            ..Args::default()
+        };
+        let config = pc_config(LearningRule::ErrorEquilibrium, &args, true)
+            .expect("ePC is a local predictive-coding rule");
+        assert_eq!(config.solver, LocalPredictiveCodingSolver::ErrorEquilibrium);
+        assert_eq!(config.inference.steps, 1);
+        assert_eq!(config.inference.step_size, 0.1);
+        assert_eq!(config.inference.max_grad_norm, Some(1_000_000.0));
+        assert_eq!(config.prediction_precision, 10.0);
+        assert!(config.sync_diagnostics);
+        config
+            .inference
+            .validate("pc_lifelong_stream.local_predictive_coding.inference")
+            .expect("ePC lifelong configuration should validate");
+    }
 }
 
 #[cfg(not(feature = "train"))]

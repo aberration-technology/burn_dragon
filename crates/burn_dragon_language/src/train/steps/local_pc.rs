@@ -8,19 +8,144 @@ pub(crate) struct PredictiveContextTrainStep<B: AutodiffBackend> {
     pub terminal_state: Option<ModelState<B>>,
 }
 
+pub(super) struct PrimaryLocalPredictiveCodingStep<B: AutodiffBackend> {
+    pub grads: GradientsParams,
+    pub loss: Tensor<B, 1>,
+}
+
 impl<B: AutodiffBackend> LanguageTrainModel<B> {
+    /// Execute the ordinary next-token local-PC factor while preserving the
+    /// streaming state contract. The returned gradients are intentionally not
+    /// schedule-scaled so callers can combine them with a verifier terminal
+    /// before applying one optimizer update.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn primary_local_predictive_coding_step(
+        &self,
+        inputs: Tensor<B, 2, Int>,
+        targets: Tensor<B, 2, Int>,
+        loss_mask: Option<Tensor<B, 2, Int>>,
+        supervised_token_count: Option<usize>,
+        summary_event_mask: Option<Tensor<B, 2, Int>>,
+        reset_stream_state: bool,
+        block_size: usize,
+    ) -> PrimaryLocalPredictiveCodingStep<B>
+    where
+        B::Device: 'static,
+        B::FloatTensorPrimitive: 'static,
+    {
+        if supervised_token_count == Some(0) {
+            let started = crate::train::profile::enabled().then(Instant::now);
+            let device = inputs.device();
+            self.advance_stream_state_without_update(
+                inputs,
+                summary_event_mask,
+                reset_stream_state,
+            );
+            if let Some(started) = started {
+                crate::train::profile::record_stream_advance(started.elapsed().as_nanos());
+            }
+            return PrimaryLocalPredictiveCodingStep {
+                grads: GradientsParams::new(),
+                loss: Tensor::zeros([1], &device),
+            };
+        }
+
+        let prof_enabled = crate::train::profile::enabled();
+        let chunk_size = self.effective_tbptt_chunk_size(block_size);
+        if chunk_size.is_none() && !self.tbptt_persist_across_steps {
+            let step = local_predictive_coding::local_predictive_coding_train_step(
+                &self.model,
+                inputs,
+                targets,
+                loss_mask,
+                &self.local_predictive_coding,
+                &self.local_predictive_coding_profile,
+            );
+            debug_assert_eq!(step.report.global_backward_calls, 0);
+            if prof_enabled {
+                crate::train::profile::record_local_learning_step(step.report.elapsed_ns);
+            }
+            return PrimaryLocalPredictiveCodingStep {
+                grads: step.grads,
+                loss: step.loss,
+            };
+        }
+
+        let [batch_size, _] = inputs.shape().dims::<2>();
+        let mut state = self.load_step_state(reset_stream_state, block_size);
+        let mut accumulator = GradientsAccumulator::new();
+        let mut total_loss: Option<Tensor<B, 1>> = None;
+        let mut total_supervised_tokens: Option<Tensor<B, 1>> = None;
+        let mut total_elapsed_ns = 0u128;
+        let chunk_size = chunk_size.unwrap_or(block_size);
+        for start in (0..block_size).step_by(chunk_size) {
+            let end = (start + chunk_size).min(block_size);
+            let chunk_inputs = Self::slice_tokens(inputs.clone(), batch_size, start, end);
+            let chunk_targets = Self::slice_tokens(targets.clone(), batch_size, start, end);
+            let chunk_loss_mask = loss_mask
+                .clone()
+                .map(|mask| Self::slice_tokens(mask, batch_size, start, end));
+            let mut step = local_predictive_coding::local_predictive_coding_train_step_with_state(
+                &self.model,
+                chunk_inputs,
+                chunk_targets,
+                chunk_loss_mask,
+                state,
+                &self.local_predictive_coding,
+                &self.local_predictive_coding_profile,
+            );
+            debug_assert_eq!(step.report.global_backward_calls, 0);
+            state = step.terminal_state;
+            let supervised_tokens = step.supervised_tokens;
+            rescale_gradients_by_device_scalar::<B, _>(
+                self,
+                &mut step.grads,
+                supervised_tokens.clone().inner(),
+                false,
+            );
+            accumulator.accumulate(self, step.grads);
+            let weighted_loss = step.loss * supervised_tokens.clone();
+            total_loss = Some(match total_loss {
+                Some(accumulated) => accumulated + weighted_loss,
+                None => weighted_loss,
+            });
+            total_supervised_tokens = Some(match total_supervised_tokens {
+                Some(accumulated) => accumulated + supervised_tokens,
+                None => supervised_tokens,
+            });
+            total_elapsed_ns = total_elapsed_ns.saturating_add(step.report.elapsed_ns);
+        }
+        self.store_step_state(state);
+        if prof_enabled {
+            crate::train::profile::record_local_learning_step(total_elapsed_ns);
+        }
+        let supervised_tokens = total_supervised_tokens
+            .expect("local PC TBPTT requires at least one chunk")
+            .clamp_min(1.0);
+        let mut grads = accumulator.grads();
+        rescale_gradients_by_device_scalar::<B, _>(
+            self,
+            &mut grads,
+            supervised_tokens.clone().inner(),
+            true,
+        );
+        let loss =
+            total_loss.expect("local PC TBPTT requires at least one chunk") / supervised_tokens;
+        PrimaryLocalPredictiveCodingStep { grads, loss }
+    }
+
     /// Execute fixed-prediction local PC over bounded exact recurrent-credit
     /// windows. Each window retains at most `window_chunks` plain-backend
     /// traces, reverses them once, and explicitly detaches its oldest state.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn exact_window_predictive_coding_step(
+    pub(super) fn primary_exact_window_predictive_coding_step(
         &self,
         inputs: Tensor<B, 2, Int>,
         targets: Tensor<B, 2, Int>,
         loss_mask: Option<Tensor<B, 2, Int>>,
         reset_stream_state: bool,
         chunk_size: usize,
-    ) -> TrainOutput<LanguageModelTrainItem<B>>
+    ) -> PrimaryLocalPredictiveCodingStep<B>
     where
         B::Device: 'static,
         B::FloatTensorPrimitive: 'static,
@@ -104,10 +229,7 @@ impl<B: AutodiffBackend> LanguageTrainModel<B> {
         );
         let loss = total_loss.expect("exact-window local PC requires at least one chunk")
             / supervised_tokens;
-        TrainOutput {
-            grads: self.apply_gradient_scale_schedule(grads),
-            item: LanguageModelTrainItem::new(loss),
-        }
+        PrimaryLocalPredictiveCodingStep { grads, loss }
     }
 
     pub(super) fn stage_incremental_predictive_coding_step(

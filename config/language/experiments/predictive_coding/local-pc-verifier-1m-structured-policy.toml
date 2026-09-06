@@ -1,0 +1,46 @@
+extends = "local-pc-verifier-1m-semantic-policy.toml"
+
+# Verifier-native deployment objective. Every update alternates between:
+#   0: full-menu residual-energy validity;
+#   1: matched counterfactual-target discrimination.
+# The autoregressive decoder remains an independently measured capability and
+# is not trained as a proxy for the finite formal action policy.
+[model.sequence_score_head]
+enabled = true
+projection_dim = 64
+
+[training.ruliad_supervision.prompt_value_binding]
+enabled = false
+
+[training.ruliad_supervision.proof_policy]
+enabled = true
+require_scheduled_update = true
+mode = "static_then_paired_dagger"
+scoring = "residual_energy"
+decoder_calibration_steps = 0
+prompt_context = "local_action_state"
+target = "expert_set"
+gradient_scope = "policy_path"
+normalization = "candidate_conditional"
+candidate_symmetry = "balanced_rotation"
+presentation_risk = "mean"
+weight = 1.0
+every_steps = 1
+start_after_steps = 0
+dagger_start_after_steps = 192
+stratified_difficulty_levels = 4
+rollout_steps = 4
+max_rows_per_update = 32
+max_presentation_rows_per_update = 32
+counterfactual_targets_per_state = 1
+counterfactual_objective = "target_group_joint"
+candidates = 4
+max_completion_tokens = 128
+
+# Sixteen immutable holdout examples per requested difficulty stratum.
+[training.ruliad_policy_probe]
+items = 64
+
+[training.local_predictive_coding]
+solver = "fixed_prediction"
+terminal_criterion = "ruliad_verifier_set"

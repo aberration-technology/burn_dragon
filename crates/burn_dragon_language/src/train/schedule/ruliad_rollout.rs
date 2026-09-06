@@ -2,6 +2,27 @@
 
 use super::*;
 
+const RULIAD_POLICY_CERTIFICATE_BUDGET_MULTIPLIER: usize = 4;
+
+fn ruliad_policy_rollout_limit(
+    configured_max_steps: usize,
+    certificate_steps: usize,
+) -> Result<usize> {
+    let oracle_steps = certificate_steps.max(1);
+    let automatic_limit = oracle_steps
+        .saturating_mul(RULIAD_POLICY_CERTIFICATE_BUDGET_MULTIPLIER)
+        .max(1);
+    if configured_max_steps == 0 {
+        return Ok(automatic_limit);
+    }
+    if configured_max_steps < oracle_steps {
+        return Err(anyhow!(
+            "Ruliad policy probe max_steps={configured_max_steps} is shorter than the verifier certificate ({oracle_steps} steps); use max_steps=0 for an automatic proof-relative budget"
+        ));
+    }
+    Ok(configured_max_steps.min(automatic_limit))
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct RuliadPolicyPromotionGateStatus {
     pub(super) passed: bool,
@@ -68,6 +89,78 @@ pub(super) fn ruliad_policy_promotion_gate_status(
         reasons.push(format!(
             "backtrack_rate={backtrack_rate:.3}>{}",
             gate.maximum_backtrack_rate
+        ));
+    }
+    RuliadPolicyPromotionGateStatus {
+        passed: reasons.is_empty(),
+        reasons,
+    }
+}
+
+pub(super) fn ruliad_policy_context_binding_gate_status(
+    constrained: Option<&RuliadCorrectnessConstrainedPolicyResult>,
+    gate: crate::config::RuliadPolicyPromotionGateConfig,
+) -> RuliadPolicyPromotionGateStatus {
+    if !gate.enabled || !gate.require_context_binding {
+        return RuliadPolicyPromotionGateStatus {
+            passed: true,
+            reasons: Vec::new(),
+        };
+    }
+    let Some(constrained) = constrained else {
+        return RuliadPolicyPromotionGateStatus {
+            passed: false,
+            reasons: vec!["context_binding_probe=missing".to_string()],
+        };
+    };
+    let summary = &constrained.summary;
+    let context_change_rate = ratio_usize(
+        summary.context_swap_top1_changes,
+        summary.context_swap_items,
+    );
+    let context_probability_drop = summary.context_swap_equivalent_probability_drop_sum
+        / summary.context_swap_items.max(1) as f64;
+    let target_change_rate = ratio_usize(
+        summary.counterfactual_target_top1_changes,
+        summary.counterfactual_target_items,
+    );
+    let target_probability_gain = summary.counterfactual_target_equivalent_probability_gain_sum
+        / summary.counterfactual_target_items.max(1) as f64;
+    let mut reasons = Vec::new();
+    if summary.context_swap_items < gate.minimum_conditioning_items {
+        reasons.push(format!(
+            "context_swap_items={}<{}",
+            summary.context_swap_items, gate.minimum_conditioning_items
+        ));
+    }
+    if summary.counterfactual_target_items < gate.minimum_conditioning_items {
+        reasons.push(format!(
+            "counterfactual_target_items={}<{}",
+            summary.counterfactual_target_items, gate.minimum_conditioning_items
+        ));
+    }
+    if context_change_rate < gate.minimum_context_swap_top1_change_rate {
+        reasons.push(format!(
+            "context_swap_top1_change_rate={context_change_rate:.3}<{}",
+            gate.minimum_context_swap_top1_change_rate
+        ));
+    }
+    if context_probability_drop < gate.minimum_context_swap_equivalent_probability_drop {
+        reasons.push(format!(
+            "context_swap_equivalent_probability_drop={context_probability_drop:.6}<{}",
+            gate.minimum_context_swap_equivalent_probability_drop
+        ));
+    }
+    if target_change_rate < gate.minimum_counterfactual_target_top1_change_rate {
+        reasons.push(format!(
+            "counterfactual_target_top1_change_rate={target_change_rate:.3}<{}",
+            gate.minimum_counterfactual_target_top1_change_rate
+        ));
+    }
+    if target_probability_gain < gate.minimum_counterfactual_target_equivalent_probability_gain {
+        reasons.push(format!(
+            "counterfactual_target_equivalent_probability_gain={target_probability_gain:.6}<{}",
+            gate.minimum_counterfactual_target_equivalent_probability_gain
         ));
     }
     RuliadPolicyPromotionGateStatus {
@@ -182,7 +275,11 @@ where
     eprintln!(
         "ruliad policy probe start run={run_name} epoch={epoch} requested_items={} max_steps={} beam_width={} scoring={:?} scoring_batch_rows={} scoring_pipeline_depth={}",
         config.items,
-        config.max_steps,
+        if config.max_steps == 0 {
+            "auto(certificate_x4)".to_string()
+        } else {
+            config.max_steps.to_string()
+        },
         config.beam_width,
         config.scoring,
         config.scoring_batch_rows,
@@ -222,9 +319,8 @@ where
         };
         let mut best_state_scores = BTreeMap::<String, f32>::new();
         best_state_scores.insert(initial_node.state.canonical_state_key(problem)?, 0.0);
-        let rollout_limit = config
-            .max_steps
-            .min(certificate.step_count().saturating_mul(4).max(1));
+        let rollout_limit =
+            ruliad_policy_rollout_limit(config.max_steps, certificate.step_count())?;
         let item_summary = RuliadPolicyRolloutProbeSummary {
             items: 1,
             total_goals: initial_node.state.total_goals(),
@@ -508,6 +604,33 @@ where
         difficulty_summaries,
         source_summaries,
     })
+}
+
+#[cfg(test)]
+mod rollout_budget_tests {
+    use super::ruliad_policy_rollout_limit;
+
+    #[test]
+    fn automatic_budget_tracks_finite_certificate_work() {
+        assert_eq!(ruliad_policy_rollout_limit(0, 13).unwrap(), 52);
+        assert_eq!(ruliad_policy_rollout_limit(0, 0).unwrap(), 4);
+    }
+
+    #[test]
+    fn fixed_budget_retains_a_recovery_ceiling() {
+        assert_eq!(ruliad_policy_rollout_limit(32, 13).unwrap(), 32);
+        assert_eq!(ruliad_policy_rollout_limit(128, 13).unwrap(), 52);
+    }
+
+    #[test]
+    fn impossible_fixed_budget_fails_closed() {
+        let error = ruliad_policy_rollout_limit(12, 13).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("shorter than the verifier certificate")
+        );
+    }
 }
 
 pub(super) fn emit_ruliad_policy_rollout_metrics(

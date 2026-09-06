@@ -1,0 +1,40 @@
+# Fixed difficulty is an experimental control, not a production curriculum cap.
+output_dir = "target/datasets/nextlat-stateful-v2"
+seed = 1337
+name = "nextlat-stateful-v2"
+train_samples = 512
+validation_samples = 64
+chunk_token_capacity = 1048576
+formal_generalization = "structural_holdout_v1"
+
+[serialization]
+document_tokens = 6145
+preview_samples = 8
+document_mode = "single_sample"
+document_chunks = { min = 1, max = 1 }
+
+[tokenization]
+type = "structured_symbolic"
+vocab_size = 272
+eos_id = 271
+
+[source_selection]
+enabled = true
+feedback_updates_enabled = false
+difficulty_levels = { min = 0, max = 0 }
+
+[source_selection.frontier_extension]
+enabled = false
+
+[source_selection.formal_task_mix]
+select_proof_action_weight = 1
+advance_proof_weight = 0
+construct_proof_weight = 0
+check_proof_weight = 0
+proof_action_answer_contract = "semantic_step"
+
+[[families]]
+kind = "formal_proof"
+weight = 1
+width = { min = 2, max = 4 }
+steps = { min = 2, max = 4 }

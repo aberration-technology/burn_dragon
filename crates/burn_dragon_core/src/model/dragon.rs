@@ -5,6 +5,8 @@ mod diagnostics;
 #[cfg(any(feature = "probe", test))]
 mod interpretability;
 mod language_head;
+#[cfg(test)]
+mod next_latent_tests;
 mod language_pipeline;
 mod predictive_coding;
 mod sequence_dispatch;

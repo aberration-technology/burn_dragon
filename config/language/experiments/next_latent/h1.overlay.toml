@@ -1,0 +1,5 @@
+[training.latent_reasoning]
+enabled = true
+
+[training.latent_reasoning.next_latent]
+horizon = 1

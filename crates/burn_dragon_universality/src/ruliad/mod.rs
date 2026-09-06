@@ -94,14 +94,15 @@ pub use oracles::{
     RULIAD_V3_DOCUMENT_CLOSE_MARKER, RULIAD_VERIFIER_VERSION, RuliadCategoricalPresentation,
     RuliadSampleSpec, load_proof_tasks, ruliad_answer_contract, ruliad_answer_values,
     ruliad_categorical_presentation, ruliad_document_close_marker, ruliad_expected_answer,
-    ruliad_prompt_prefix, ruliad_proof_action_prompt, ruliad_proof_action_query,
-    ruliad_sample_math_domains, ruliad_sample_reasoning_modes,
+    ruliad_prompt_prefix, ruliad_proof_action_local_prompt, ruliad_proof_action_prompt,
+    ruliad_proof_action_query, ruliad_sample_math_domains, ruliad_sample_reasoning_modes,
 };
 pub use policy::{
     DEFAULT_PROOF_ACTION_CANDIDATES, RuliadProofActionCandidate, RuliadProofActionSet,
     RuliadProofPolicyState, RuliadProofRolloutReport, counterfactual_proof_action_target,
     oracle_proof_action_set, parse_proof_action_index, proof_action_answer,
-    resolve_proof_action_answer, rollout_proof_policy, ruliad_term_distance,
+    proof_action_answer_for_semantic_index, resolve_proof_action_answer, rollout_proof_policy,
+    ruliad_term_distance,
 };
 pub use runtime::{
     OnlineRuliadCorpus, RULIAD_SUPERVISION_AUDIT_VERSION, RuliadFrontierFeasibilityReport,

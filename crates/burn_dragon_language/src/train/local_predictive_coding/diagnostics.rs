@@ -111,10 +111,14 @@ fn gradient_statistics<B: Backend, const D: usize>(
     id: ParamId,
     family: &str,
 ) -> Result<RawGradientStatistics, String> {
-    let pc = pc
-        .get::<B, D>(id)
-        .ok_or_else(|| format!("local PC did not emit the {family} derivative"))?;
+    let pc = pc.get::<B, D>(id);
     let reference = reference.get::<B, D>(id);
+    if pc.is_none() && reference.is_none() {
+        return Ok(RawGradientStatistics::default());
+    }
+    let pc = pc.ok_or_else(|| {
+        format!("local PC did not emit the {family} derivative required by global autodiff")
+    })?;
     let reference_gradient_present = reference.is_some();
     let reference = reference.unwrap_or_else(|| Tensor::zeros(pc.shape(), &pc.device()));
     if pc.shape() != reference.shape() {

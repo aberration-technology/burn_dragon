@@ -1,0 +1,5 @@
+extends = ["memory-retention.corpus.toml"]
+
+# Keep the identical bucket catalog; only delay release past the run horizon.
+[source_selection.cold_start]
+hold_steps = 16384

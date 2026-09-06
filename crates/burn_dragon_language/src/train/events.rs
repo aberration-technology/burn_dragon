@@ -129,6 +129,7 @@ struct LocalPredictiveCodingTelemetryConfig {
     profile: crate::train::local_predictive_coding::LocalPredictiveCodingProfile,
     training_algorithm: TrainingAlgorithm,
     solver: LocalPredictiveCodingSolver,
+    next_token_solver: LocalPredictiveCodingSolver,
     terminal_criterion: crate::config::LocalPredictiveCodingTerminalCriterion,
     learning_schedule: burn_pc::PcLearningSchedule,
     temporal_credit: burn_pc::PcTemporalCreditConfig,
@@ -193,6 +194,21 @@ fn local_predictive_coding_event_contract(
             "local_first_order_adjoint_v1",
             "parallel_residual_jacobian_adjoints",
         ),
+    }
+}
+
+fn local_predictive_coding_effective_event_contract(
+    solver: LocalPredictiveCodingSolver,
+    next_token_solver: LocalPredictiveCodingSolver,
+    learning_schedule: burn_pc::PcLearningSchedule,
+) -> (&'static str, &'static str) {
+    if next_token_solver != solver {
+        (
+            "objective_routed_local_factor_vjp_v1",
+            "fixed_prediction_next_token_with_inferred_verifier_terminal",
+        )
+    } else {
+        local_predictive_coding_event_contract(solver, learning_schedule)
     }
 }
 
@@ -273,6 +289,7 @@ pub fn build_training_event_handles_with_local_predictive_coding(
                 || matches!(
                     training.local_predictive_coding.terminal_criterion,
                     crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSet
+                        | crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSetJoint
                 )
         })
         .map(|profile| {
@@ -286,6 +303,7 @@ pub fn build_training_event_handles_with_local_predictive_coding(
                 profile,
                 training_algorithm: training.algorithm,
                 solver: training.local_predictive_coding.solver,
+                next_token_solver: training.local_predictive_coding.next_token_solver(),
                 terminal_criterion: training.local_predictive_coding.terminal_criterion,
                 learning_schedule: training.local_predictive_coding.learning_schedule,
                 temporal_credit,
@@ -485,7 +503,11 @@ fn record_local_predictive_coding_from_loss(
                 "verifier_terminal_global_autodiff",
             )
         } else {
-            local_predictive_coding_event_contract(config.solver, config.learning_schedule)
+            local_predictive_coding_effective_event_contract(
+                config.solver,
+                config.next_token_solver,
+                config.learning_schedule,
+            )
         };
         output.write(PredictiveCodingSample {
             run_id: sample.run_id.clone(),
@@ -546,6 +568,9 @@ fn record_local_predictive_coding_from_loss(
                 }
                 crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSet => {
                     "alternating_next_token_ruliad_verifier_set".to_string()
+                }
+                crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSetJoint => {
+                    "joint_next_token_ruliad_verifier_set".to_string()
                 }
             },
             structured_terminal_steps: snapshot.structured_terminal_steps as usize,
@@ -618,6 +643,9 @@ fn record_ruliad_source_selection_from_loss(
         source_selection_events.write(source_selection_sample_from_snapshot(
             sample.run_id.clone(),
             sample.absolute_step,
+            source_selection
+                .dataset
+                .source_selection_feedback_updates_enabled(),
             loss,
             &snapshot,
         ));
@@ -627,6 +655,7 @@ fn record_ruliad_source_selection_from_loss(
 pub(crate) fn source_selection_sample_from_snapshot(
     run_id: impl Into<TrainingRunId>,
     absolute_step: usize,
+    feedback_updates_enabled: Option<bool>,
     loss: Option<f32>,
     snapshot: &burn_dragon_universality::RuliadMetricSnapshot,
 ) -> SourceSelectionSample {
@@ -634,6 +663,7 @@ pub(crate) fn source_selection_sample_from_snapshot(
     SourceSelectionSample {
         run_id,
         absolute_step,
+        feedback_updates_enabled,
         loss,
         entropy_bits: snapshot.sampler_entropy_bits as f64,
         active_candidate_count: snapshot.active_candidate_count,
@@ -781,6 +811,17 @@ mod tests {
 
     #[test]
     fn local_pc_event_contract_distinguishes_error_solvers() {
+        assert_eq!(
+            local_predictive_coding_effective_event_contract(
+                LocalPredictiveCodingSolver::ErrorEquilibrium,
+                LocalPredictiveCodingSolver::FixedPrediction,
+                burn_pc::PcLearningSchedule::Equilibrium,
+            ),
+            (
+                "objective_routed_local_factor_vjp_v1",
+                "fixed_prediction_next_token_with_inferred_verifier_terminal"
+            )
+        );
         assert_eq!(
             local_predictive_coding_event_contract(
                 LocalPredictiveCodingSolver::SynchronousEquilibrium,

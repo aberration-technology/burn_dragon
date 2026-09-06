@@ -156,6 +156,27 @@ mod tests {
     }
 
     #[test]
+    fn training_grammar_control_has_a_distinct_semantic_contract() {
+        use crate::ruliad::config::RuliadFormalGeneralizationContract;
+        let mut config = test_config();
+        let mut identities = std::collections::HashSet::new();
+        for contract in [
+            RuliadFormalGeneralizationContract::SeedDisjointV1,
+            RuliadFormalGeneralizationContract::StructuralHoldoutV1,
+            RuliadFormalGeneralizationContract::StructuralTrainSeedDisjointV1,
+        ] {
+            config.formal_generalization = contract;
+            identities.insert(
+                RuliadSemanticContract::from_config(&config, None)
+                    .unwrap()
+                    .canonical_hash()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(identities.len(), 3);
+    }
+
+    #[test]
     fn proof_action_answer_contract_is_bound_into_semantic_identity() {
         let left = test_config();
         let mut right = left.clone();

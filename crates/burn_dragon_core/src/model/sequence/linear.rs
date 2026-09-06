@@ -4,6 +4,9 @@ use burn::tensor::{Int, Tensor};
 use crate::model::attention::DenseScoreDecayCache;
 use crate::model::backend_float_dtype;
 
+#[cfg(test)]
+mod retention_tests;
+
 pub fn expand_attention_values_to_heads<B: Backend>(
     value: Tensor<B, 4>,
     heads: usize,

@@ -23,6 +23,33 @@ const PROCESS_GROUP_RUN_DIR_ENV: &str = "BURN_DRAGON_PROCESS_GROUP_RUN_DIR";
 const PROCESS_GROUP_RUN_NAME_ENV: &str = "BURN_DRAGON_PROCESS_GROUP_RUN_NAME";
 const CUDA_LINEAR_DENSE_SCORE_AUTO_BLOCK_LIMIT: usize = 2048;
 
+fn fingerprint_initial_model<B: BackendTrait>(
+    model: &DragonModel<B>,
+    provenance: crate::config::TrainingProvenanceConfig,
+    launch_mode: burn_dragon_train::train::pipeline::TrainingLaunchMode,
+    primary: bool,
+) -> Result<Option<String>> {
+    if !provenance.initial_model_fingerprint
+        || !primary
+        || !matches!(
+            launch_mode,
+            burn_dragon_train::train::pipeline::TrainingLaunchMode::Fresh
+                | burn_dragon_train::train::pipeline::TrainingLaunchMode::InitFromCheckpoint
+        )
+    {
+        return Ok(None);
+    }
+    let started = Instant::now();
+    let fingerprint = crate::train::model_identity::model_tensor_fingerprint::<B, _>(model)?;
+    info!(
+        "initial model tensor fingerprint: schema={} sha256={} elapsed_ms={}",
+        crate::train::model_identity::MODEL_TENSOR_FINGERPRINT_SCHEMA,
+        fingerprint,
+        started.elapsed().as_millis(),
+    );
+    Ok(Some(fingerprint))
+}
+
 fn cuda_mamba_training_geometry_summary(
     model_config: &DragonConfig,
     micro_batch_size: usize,
@@ -346,6 +373,110 @@ fn use_event_scheduler_for_training(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evaluation_contract_pilot_profiles_are_matched_and_explicit() {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/language/experiments/predictive_coding");
+        let pc = crate::load_training_config(&[directory.join("evaluation-contract-pilot.toml")])
+            .unwrap();
+        let mut adamw =
+            crate::load_training_config(&[directory.join("evaluation-contract-pilot-adamw.toml")])
+                .unwrap();
+        assert_eq!(
+            pc.training.algorithm,
+            crate::config::TrainingAlgorithm::PredictiveCoding
+        );
+        assert_eq!(
+            adamw.training.algorithm,
+            crate::config::TrainingAlgorithm::Backpropagation
+        );
+        adamw.training.algorithm = pc.training.algorithm;
+        assert_eq!(adamw.training, pc.training);
+        assert_eq!(adamw.model, pc.model);
+        assert_eq!(adamw.dataset, pc.dataset);
+        assert!(pc.training.provenance.initial_model_fingerprint);
+        assert_eq!(
+            pc.training.ruliad_policy_probe.scoring,
+            crate::config::RuliadProofPolicyScoring::ResidualEnergy
+        );
+        assert_eq!(
+            pc.training.ruliad_policy_probe.normalization,
+            crate::config::RuliadProofPolicyNormalization::CandidateConditional
+        );
+        assert_eq!(pc.training.tbptt_chunk_size, Some(64));
+        assert!(pc.training.tbptt_persist_across_steps);
+        assert_eq!(pc.training.max_iters, 512);
+        assert!(
+            pc.training
+                .ruliad_supervision
+                .prompt_value_binding
+                .require_scheduled_update
+        );
+        let mut no_stream = crate::load_training_config(&[
+            directory.join("evaluation-contract-pilot.toml"),
+            directory.join("evaluation-contract-no-stream.overlay.toml"),
+        ])
+        .unwrap();
+        assert!(!no_stream.training.tbptt_persist_across_steps);
+        no_stream.training.tbptt_persist_across_steps = true;
+        assert_eq!(no_stream.training, pc.training);
+        assert_eq!(no_stream.dataset, pc.dataset);
+    }
+
+    #[test]
+    fn initial_fingerprint_uses_typed_config_and_launch_ownership() {
+        use burn_dragon_train::train::pipeline::TrainingLaunchMode;
+        type B = burn_ndarray::NdArray<f32>;
+        let device = Default::default();
+        let model = DragonModel::<B>::new(
+            DragonConfig {
+                n_embd: 8,
+                n_head: 1,
+                n_layer: 1,
+                mlp_internal_dim_multiplier: 2,
+                vocab_size: 16,
+                ..Default::default()
+            },
+            &device,
+        );
+        let enabled = crate::config::TrainingProvenanceConfig::default();
+        let first =
+            fingerprint_initial_model(&model, enabled, TrainingLaunchMode::Fresh, true).unwrap();
+        assert_eq!(first.as_ref().unwrap().len(), 64);
+        assert_eq!(
+            first,
+            fingerprint_initial_model(
+                &model,
+                enabled,
+                TrainingLaunchMode::InitFromCheckpoint,
+                true
+            )
+            .unwrap()
+        );
+        assert!(
+            fingerprint_initial_model(&model, enabled, TrainingLaunchMode::Fresh, false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fingerprint_initial_model(&model, enabled, TrainingLaunchMode::ResumeExactRun, true)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fingerprint_initial_model(
+                &model,
+                crate::config::TrainingProvenanceConfig {
+                    initial_model_fingerprint: false
+                },
+                TrainingLaunchMode::Fresh,
+                true
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
 
     fn load_profile(file_name: &str) -> TrainingConfig {
         let profile_path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -951,8 +1082,11 @@ where
     };
 
     let val_steps_per_epoch = datasets.valid.steps_per_epoch(DatasetSplit::Val);
-    let valid_steps =
-        resolve_valid_steps_per_epoch(steps_per_epoch, training.log_frequency, val_steps_per_epoch);
+    let valid_steps = training.validation.resolve_steps_per_epoch(
+        steps_per_epoch,
+        training.log_frequency,
+        val_steps_per_epoch,
+    );
     info!(
         "validation schedule: steps_per_epoch={valid_steps} logical_train_steps_per_epoch={steps_per_epoch} sampling={:?} seed={}",
         training.validation.sampling, training.validation.seed,
@@ -970,13 +1104,23 @@ where
         .with_summary_event_token_ids(summary_event_token_ids.clone()),
     );
 
+    // Dataset and runtime setup may consume backend randomness. Re-establish the
+    // model initialization boundary so a seed denotes one exact starting model.
+    B::seed(&device, training.seed);
     let mut base_model = DragonModel::<B>::new(model_config.clone(), &device);
+    crate::train::model_identity::materialize_model_parameters::<B, _>(&base_model);
     initialize_model_from_checkpoint(
         &resolved_config,
         training,
         &mut base_model,
         &device,
         backend_name,
+    )?;
+    let initial_model_sha256 = fingerprint_initial_model(
+        &base_model,
+        training.provenance,
+        training.launch_mode,
+        parallel_runtime.is_primary(),
     )?;
     ensure_random_scaffold_run_manifest(&base_model, &run_dir, parallel_runtime.is_primary())?;
     if let Some(report) = base_model.random_scaffold_report() {
@@ -1058,6 +1202,7 @@ where
         });
     let prepared_model = LanguageTrainModel::new(base_model)
         .with_training_objectives(training)
+        .with_next_latent_tokenizer(tokenizer.as_ref())
         .with_ruliad_policy_telemetry_path(ruliad_policy_telemetry_path)
         .with_ruliad_structured_recovery_telemetry_path(ruliad_structured_recovery_telemetry_path)
         .with_ruliad_answer_contract_telemetry_path(ruliad_answer_contract_telemetry_path)
@@ -1121,11 +1266,13 @@ where
         write_run_config(
             &resolved_config,
             &model_config,
+            datasets.train.as_ref(),
             &run_dir,
             &run_name,
             backend_name,
             effective_training_sequence_kernel_override,
             startup_autotune.as_ref(),
+            initial_model_sha256.as_deref(),
         )?;
         write_training_snapshot(&resolved_config, &run_dir, dataset.tokenizer().as_ref())?;
     }
@@ -1593,8 +1740,11 @@ where
     };
 
     let val_steps_per_epoch = datasets.valid.steps_per_epoch(DatasetSplit::Val);
-    let valid_steps =
-        resolve_valid_steps_per_epoch(steps_per_epoch, training.log_frequency, val_steps_per_epoch);
+    let valid_steps = training.validation.resolve_steps_per_epoch(
+        steps_per_epoch,
+        training.log_frequency,
+        val_steps_per_epoch,
+    );
     info!(
         "validation schedule: steps_per_epoch={valid_steps} logical_train_steps_per_epoch={steps_per_epoch} sampling={:?} seed={}",
         training.validation.sampling, training.validation.seed,
@@ -1617,7 +1767,10 @@ where
             .with_summary_event_token_ids(summary_event_token_ids.clone()),
         );
 
+    // Keep initialization independent from setup-time backend RNG consumption.
+    B::seed(&device, training.seed);
     let mut base_model = DragonModel::<B>::new(model_config.clone(), &device);
+    crate::train::model_identity::materialize_model_parameters::<B, _>(&base_model);
     let fresh_model = base_model.clone();
     initialize_model_from_checkpoint(
         &resolved_config,
@@ -1625,6 +1778,12 @@ where
         &mut base_model,
         &device,
         backend_name,
+    )?;
+    let initial_model_sha256 = fingerprint_initial_model(
+        &base_model,
+        training.provenance,
+        training.launch_mode,
+        parallel_runtime.is_primary(),
     )?;
     ensure_random_scaffold_run_manifest(&base_model, &run_dir, parallel_runtime.is_primary())?;
     if let Some(report) = base_model.random_scaffold_report() {
@@ -1730,6 +1889,7 @@ where
         });
     let prepared_model = LanguageTrainModel::new(base_model)
         .with_training_configuration(training, total_steps)
+        .with_next_latent_tokenizer(tokenizer.as_ref())
         .with_ruliad_policy_telemetry_path(ruliad_policy_telemetry_path)
         .with_ruliad_structured_recovery_telemetry_path(ruliad_structured_recovery_telemetry_path)
         .with_ruliad_answer_contract_telemetry_path(ruliad_answer_contract_telemetry_path)
@@ -1756,11 +1916,13 @@ where
         write_run_config(
             &resolved_config,
             &model_config,
+            datasets.train.as_ref(),
             &run_dir,
             &run_name,
             backend_name,
             effective_training_sequence_kernel_override,
             startup_autotune.as_ref(),
+            initial_model_sha256.as_deref(),
         )?;
         write_training_snapshot(&resolved_config, &run_dir, dataset.tokenizer().as_ref())?;
     }

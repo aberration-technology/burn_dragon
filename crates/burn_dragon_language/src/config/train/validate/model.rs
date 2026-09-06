@@ -99,6 +99,27 @@ impl TrainingConfig {
         if let Some(n_head) = self.model.n_head {
             resolved_model.n_head = n_head;
         }
+        if let Some(slopes) = &self.model.alibi_slopes {
+            let rotary = self
+                .model
+                .rotary_embedding
+                .unwrap_or(resolved_model.fused_kernels.rotary_embedding);
+            let memory = self
+                .model
+                .sequence_kernel
+                .unwrap_or(resolved_model.sequence_kernel)
+                .memory_system;
+            if rotary != RotaryEmbedding::Alibi || memory != SequenceMemorySystem::LinearAttention {
+                return Err(anyhow!(
+                    "model.alibi_slopes requires ALiBi linear attention"
+                ));
+            }
+            burn_dragon_core::kernel::linear_attention::validate_alibi_slopes(
+                slopes,
+                resolved_model.n_head,
+            )
+            .map_err(|error| anyhow!("model.{error}"))?;
+        }
         if let Some(multiplier) = self.model.mlp_internal_dim_multiplier
             && multiplier == 0
         {

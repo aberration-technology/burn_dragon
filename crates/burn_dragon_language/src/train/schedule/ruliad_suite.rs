@@ -72,9 +72,26 @@ pub struct RuliadPolicyRolloutEvaluation {
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct RuliadEvaluationSuiteReport {
     pub version: u32,
+    /// Full floating-point tensor identity, checked again after all probes.
+    pub model_tensor_fingerprint_sha256: String,
     pub panel_fingerprint_sha256: String,
+    /// Free generation from the canonical transfer prompt, which is not copied
+    /// verbatim from the training serialization.
     pub free_run: RuliadModelEvaluation,
+    /// Free generation from the exact training-document answer slot. Comparing
+    /// this with `free_run` separates decoder learning from schema transfer.
+    pub training_serialization_free_run: RuliadModelEvaluation,
+    /// Free generation from the same verifier-derived prompt contract used by
+    /// the constrained proof policy. This isolates action rendering from
+    /// document-prompt transfer.
+    pub policy_context_free_run: RuliadModelEvaluation,
+    /// Verifier-enumerated action selection followed by deterministic rendering.
+    /// This is a typed deployment path, not unconstrained autoregressive generation.
+    pub structured_policy_decode: RuliadStructuredPolicyEvaluation,
+    pub policy_controls: RuliadPolicyControlEvaluation,
     pub constrained_policy: RuliadConstrainedPolicyEvaluation,
+    pub constrained_policy_by_difficulty: BTreeMap<usize, RuliadConstrainedPolicyEvaluation>,
+    pub constrained_policy_by_source: BTreeMap<String, RuliadConstrainedPolicyEvaluation>,
     pub closed_loop_rollout: Option<RuliadPolicyRolloutEvaluation>,
     pub rollout_by_difficulty: BTreeMap<usize, RuliadPolicyRolloutEvaluation>,
     pub rollout_by_source: BTreeMap<String, RuliadPolicyRolloutEvaluation>,
@@ -155,11 +172,67 @@ fn rollout_evaluation(summary: RuliadPolicyRolloutProbeSummary) -> RuliadPolicyR
 
 fn panel_fingerprint(
     base_items: &[crate::dataset::RuliadValidationProbeItem],
+    training_serialization_items: &[crate::dataset::RuliadValidationProbeItem],
     policy_items: &[crate::dataset::RuliadValidationProbeItem],
+    policy_context_items: &[crate::dataset::RuliadValidationProbeItem],
 ) -> Result<String> {
-    let bytes = serde_json::to_vec(&(base_items, policy_items))
-        .context("serialize checkpoint-evaluation Ruliad panel")?;
+    let bytes = serde_json::to_vec(&(
+        base_items,
+        training_serialization_items,
+        policy_items,
+        policy_context_items,
+    ))
+    .context("serialize checkpoint-evaluation Ruliad panel")?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_free_run_panel<B>(
+    dataset: &Dataset,
+    model: &LanguageTrainModel<B>,
+    training: &TrainingHyperparameters,
+    options: &RuliadEvaluationSuiteOptions,
+    items: &[crate::dataset::RuliadValidationProbeItem],
+    dataset_name: &str,
+    device: &B::Device,
+) -> Result<RuliadModelEvaluation>
+where
+    B: BackendTrait + Clone + 'static,
+    B::Device: Clone,
+{
+    let evaluation = evaluate_ruliad_correctness_validation_for_items_core(
+        None,
+        None,
+        dataset,
+        model,
+        options.epoch,
+        options.absolute_step,
+        device,
+        training,
+        items,
+        options.training_batch_size.max(1),
+        dataset_name,
+        None,
+        None,
+        None,
+        None,
+        RuliadProbeDecodeMode::FreeRun,
+        None,
+    )?;
+    Ok(RuliadModelEvaluation {
+        report: evaluation.report,
+        item_count: evaluation.item_count,
+        teacher_forced: evaluation.teacher_forced,
+        mean_generated_model_tokens: evaluation.mean_generated_model_tokens,
+        elapsed_ms: evaluation.elapsed_ms,
+        generation_mean_batch_rows: evaluation.generation_stats.mean_batch_rows,
+        generation_maximum_batch_rows: evaluation.generation_stats.maximum_batch_rows,
+        generation_maximum_in_flight_rows: evaluation.generation_stats.maximum_in_flight_rows,
+        generation_batched_row_fraction: ratio(
+            evaluation.generation_stats.batched_rows,
+            evaluation.item_count,
+        ),
+    })
 }
 
 pub fn evaluate_ruliad_model_suite<B>(
@@ -173,6 +246,13 @@ where
     B: BackendTrait + Clone + 'static,
     B::Device: Clone,
 {
+    let started = burn_dragon_time::Instant::now();
+    let stage = |name: &str| {
+        eprintln!(
+            "ruliad checkpoint evaluation stage={name} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+    };
     if options.free_run_items == 0 {
         return Err(anyhow!("Ruliad evaluation requires free_run_items > 0"));
     }
@@ -182,6 +262,9 @@ where
     if options.difficulty_levels == 0 {
         return Err(anyhow!("Ruliad evaluation requires difficulty_levels > 0"));
     }
+    stage("panel_and_identity");
+    let model_tensor_fingerprint_sha256 =
+        crate::train::model_identity::model_tensor_fingerprint::<B, _>(&model.model)?;
 
     let base_items = dataset.sample_ruliad_validation_probe_items_stratified_fixed(
         options.panel_seed,
@@ -189,9 +272,15 @@ where
         options.difficulty_levels,
         crate::dataset::RuliadValidationPromptMode::CanonicalTransfer,
     );
-    let policy_items = dataset.sample_ruliad_validation_probe_items_stratified(
-        0,
-        0,
+    let training_serialization_items = dataset
+        .sample_ruliad_validation_probe_items_stratified_fixed(
+            options.panel_seed,
+            options.free_run_items,
+            options.difficulty_levels,
+            crate::dataset::RuliadValidationPromptMode::TrainingSerialization,
+        );
+    let policy_items = dataset.sample_ruliad_task_probe_items_fixed(
+        options.panel_seed,
         options.policy_items,
         burn_dragon_universality::RuliadTaskKind::SelectProofAction.label(),
         options.difficulty_levels,
@@ -203,6 +292,13 @@ where
             options.free_run_items
         ));
     }
+    if training_serialization_items.len() != options.free_run_items {
+        return Err(anyhow!(
+            "Ruliad evaluation materialized {} training-serialization items, expected {}",
+            training_serialization_items.len(),
+            options.free_run_items
+        ));
+    }
     if policy_items.len() != options.policy_items {
         return Err(anyhow!(
             "Ruliad evaluation materialized {} policy items, expected {}",
@@ -210,39 +306,61 @@ where
             options.policy_items
         ));
     }
-    let panel_fingerprint_sha256 = panel_fingerprint(&base_items, &policy_items)?;
+    for (canonical, matched) in base_items.iter().zip(&training_serialization_items) {
+        if canonical.item.oracle_hash != matched.item.oracle_hash
+            || canonical.item.expected_answer != matched.item.expected_answer
+        {
+            return Err(anyhow!(
+                "canonical and training-serialization panels are not item-aligned"
+            ));
+        }
+    }
+    let policy_context_items =
+        ruliad_policy_context_probe_items(dataset, &policy_items, &training.ruliad_policy_probe)?;
+    if policy_context_items.len() != options.policy_items {
+        return Err(anyhow!(
+            "Ruliad evaluation materialized {} policy-context items, expected {}",
+            policy_context_items.len(),
+            options.policy_items
+        ));
+    }
+    let panel_fingerprint_sha256 = panel_fingerprint(
+        &base_items,
+        &training_serialization_items,
+        &policy_items,
+        &policy_context_items,
+    )?;
 
-    let free_run = evaluate_ruliad_correctness_validation_for_items_core(
-        None,
-        None,
+    stage("canonical_free_run");
+    let free_run = evaluate_free_run_panel(
         dataset,
         model,
-        options.epoch,
-        options.absolute_step,
-        device,
         training,
+        options,
         &base_items,
-        options.training_batch_size.max(1),
         &options.dataset_name,
-        None,
-        None,
-        None,
-        None,
-        RuliadProbeDecodeMode::FreeRun,
-        None,
+        device,
     )?;
-    let free_run = RuliadModelEvaluation {
-        report: free_run.report,
-        item_count: free_run.item_count,
-        elapsed_ms: free_run.elapsed_ms,
-        generation_mean_batch_rows: free_run.generation_stats.mean_batch_rows,
-        generation_maximum_batch_rows: free_run.generation_stats.maximum_batch_rows,
-        generation_maximum_in_flight_rows: free_run.generation_stats.maximum_in_flight_rows,
-        generation_batched_row_fraction: ratio(
-            free_run.generation_stats.batched_rows,
-            free_run.item_count,
-        ),
-    };
+    stage("training_serialization_free_run");
+    let training_serialization_free_run = evaluate_free_run_panel(
+        dataset,
+        model,
+        training,
+        options,
+        &training_serialization_items,
+        &format!("{}_training_serialization", options.dataset_name),
+        device,
+    )?;
+    stage("policy_context_free_run");
+    let policy_context_free_run = evaluate_free_run_panel(
+        dataset,
+        model,
+        training,
+        options,
+        &policy_context_items,
+        &format!("{}_policy_context", options.dataset_name),
+        device,
+    )?;
 
     let mut evaluation_training = training.clone();
     evaluation_training.ruliad_policy_probe.enabled = true;
@@ -261,6 +379,7 @@ where
         None,
     )?;
     let bus = handles.metric_logger.bus();
+    stage("constrained_policy");
     let constrained_policy = run_ruliad_correctness_constrained_policy_probe(
         "ruliad-checkpoint-evaluation",
         dataset,
@@ -271,10 +390,12 @@ where
         &evaluation_training,
         &policy_items,
         &bus,
+        RuliadPolicyControlMode::Checkpoint,
     )?;
     let rollout = options
         .include_closed_loop_rollout
         .then(|| {
+            stage("closed_loop_rollout");
             run_ruliad_policy_rollout_probe(
                 "ruliad-checkpoint-evaluation",
                 dataset,
@@ -289,6 +410,21 @@ where
         })
         .transpose()?;
     handles.metric_logger.finish();
+
+    let constrained_policy_by_difficulty = constrained_policy
+        .difficulty_summaries
+        .iter()
+        .map(|(difficulty, summary)| (*difficulty, constrained_evaluation(*summary)))
+        .collect();
+    let constrained_policy_by_source = constrained_policy
+        .source_summaries
+        .iter()
+        .map(|(source, summary)| (source.clone(), constrained_evaluation(*summary)))
+        .collect();
+    let structured_policy_decode = constrained_policy
+        .structured_decode
+        .clone()
+        .ok_or_else(|| anyhow!("Ruliad structured-policy decode was not evaluated"))?;
 
     let (closed_loop_rollout, rollout_by_difficulty, rollout_by_source) = match rollout {
         Some(result) => (
@@ -307,11 +443,26 @@ where
         None => (None, BTreeMap::new(), BTreeMap::new()),
     };
 
+    stage("verify_final_identity");
+    anyhow::ensure!(
+        model_tensor_fingerprint_sha256
+            == crate::train::model_identity::model_tensor_fingerprint::<B, _>(&model.model)?,
+        "checkpoint evaluation mutated model parameters"
+    );
     Ok(RuliadEvaluationSuiteReport {
-        version: 1,
+        version: 8,
+        model_tensor_fingerprint_sha256,
         panel_fingerprint_sha256,
         free_run,
-        constrained_policy: constrained_evaluation(constrained_policy),
+        training_serialization_free_run,
+        policy_context_free_run,
+        structured_policy_decode,
+        policy_controls: constrained_policy
+            .controls
+            .ok_or_else(|| anyhow!("Ruliad checkpoint policy controls were not evaluated"))?,
+        constrained_policy: constrained_evaluation(constrained_policy.summary),
+        constrained_policy_by_difficulty,
+        constrained_policy_by_source,
         closed_loop_rollout,
         rollout_by_difficulty,
         rollout_by_source,

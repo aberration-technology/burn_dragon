@@ -1,0 +1,6 @@
+[training]
+max_iters = 128
+checkpoint_interval_iters = 128
+
+[training.events]
+ruliad_correctness_probe_items = 16

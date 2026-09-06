@@ -1,0 +1,13 @@
+extends = ["base.toml"]
+
+# Match 8,192 scheduled tokens/update to the preceding 32x256 experiment.
+[training]
+block_size = 1024
+tbptt_chunk_size = 256
+tbptt_credit_window_chunks = 1
+batch_size = 8
+max_iters = 2048
+checkpoint_interval_iters = 512
+
+[training.events]
+ruliad_correctness_probe_items = 64

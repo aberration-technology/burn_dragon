@@ -1,0 +1,26 @@
+version = 1
+output = "target/experiments/nextlat-capacity-smoke"
+repositories = [".", "../burn_pc", "../burn_ecs", "../burn_eggroll", "../burn_p2p"]
+
+[limits]
+system_fraction = 0.90
+headroom_mib = 4096
+poll_seconds = 0.25
+gpu_sample_seconds = 2.0
+shared_gpu_memory = true
+
+[[cases]]
+id = "wide-batch2"
+gpu = true
+expected_peak_mib = 49152
+timeout_seconds = 600
+argv = ["target/release/examples/train_language", "--backend", "cuda", "--config", "config/language/experiments/next_latent/capacity-base.toml", "--config", "config/language/experiments/next_latent/model-13m.overlay.toml", "--batch-size", "2", "--max-iters", "128", "--checkpoint-interval-iters", "128"]
+inputs = ["config/language/experiments/next_latent/base.toml", "config/language/experiments/next_latent/corpus.toml", "config/language/experiments/next_latent/in-distribution.corpus.toml", "config/language/experiments/next_latent/credit-base.toml", "config/language/experiments/next_latent/capacity-base.toml", "config/language/experiments/next_latent/model-13m.overlay.toml"]
+
+[[cases]]
+id = "wide-batch4"
+gpu = true
+expected_peak_mib = 73728
+timeout_seconds = 600
+argv = ["target/release/examples/train_language", "--backend", "cuda", "--config", "config/language/experiments/next_latent/capacity-base.toml", "--config", "config/language/experiments/next_latent/model-13m.overlay.toml", "--batch-size", "4", "--max-iters", "128", "--checkpoint-interval-iters", "128"]
+inputs = ["config/language/experiments/next_latent/base.toml", "config/language/experiments/next_latent/corpus.toml", "config/language/experiments/next_latent/in-distribution.corpus.toml", "config/language/experiments/next_latent/credit-base.toml", "config/language/experiments/next_latent/capacity-base.toml", "config/language/experiments/next_latent/model-13m.overlay.toml"]

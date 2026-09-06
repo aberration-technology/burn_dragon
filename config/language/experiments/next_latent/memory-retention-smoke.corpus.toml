@@ -1,0 +1,4 @@
+extends = ["memory-retention.corpus.toml"]
+
+[source_selection.cold_start]
+hold_steps = 47

@@ -28,6 +28,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             dkp_predictive_coding_runtime: PipelineRuntimeCell::default(),
             dkp_feedback_bank: PipelineRuntimeCell::default(),
             latent_reasoning: LatentReasoningTrainingConfig::default(),
+            next_latent_token_layout: None,
             ruliad_supervision: RuliadSupervisionConfig::default(),
             latent_reasoning_capability_gate_open: Arc::new(AtomicBool::new(false)),
             greedy_rollout_recovery_active: Arc::new(AtomicBool::new(false)),
@@ -55,6 +56,15 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
 
     pub fn with_tbptt_chunk_size(mut self, tbptt_chunk_size: Option<usize>) -> Self {
         self.tbptt_chunk_size = tbptt_chunk_size;
+        self
+    }
+
+    pub fn with_next_latent_tokenizer(
+        mut self,
+        tokenizer: &dyn crate::tokenizer::Tokenizer,
+    ) -> Self {
+        self.next_latent_token_layout =
+            Some(super::super::next_latent::NextLatentTokenLayout::from_tokenizer(tokenizer));
         self
     }
 
@@ -371,6 +381,15 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
     where
         B: AutodiffBackend,
     {
+        if matches!(self.training_algorithm, TrainingAlgorithm::PredictiveCoding) {
+            for parameter_id in self
+                .model
+                .predictive_coding_structurally_inactive_parameter_ids()
+                .expect("validated predictive-coding model")
+            {
+                let _ = grads.remove::<B::InnerBackend, 1>(parameter_id);
+            }
+        }
         let step = self.gradient_scale_step.fetch_add(1, Ordering::Relaxed) + 1;
         let step_index = step.saturating_sub(1);
         let extra_scale = self

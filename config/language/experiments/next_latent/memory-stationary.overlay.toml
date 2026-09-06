@@ -1,0 +1,2 @@
+[dataset]
+config = "config/language/experiments/next_latent/memory-stationary.corpus.toml"

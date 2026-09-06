@@ -1,5 +1,10 @@
 extends = ["ruliad-r1.adamw-fixed-ablation.toml"]
 
+# NextLat v2 predicts same-pass clean-input targets. Historical corruption arms
+# need a separately specified two-view objective, not an implicit target change.
+[training.input_corruption]
+enabled = false
+
 [model.next_latent_transition]
 enabled = true
 hidden_multiplier = 2

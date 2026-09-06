@@ -1,0 +1,5 @@
+[model]
+fused_kernels = true
+fused_projection_executor = "both"
+fused_recurrent_kernel = false
+fused_rollout_kernel = false

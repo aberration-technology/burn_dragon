@@ -3,6 +3,42 @@
 use super::*;
 
 impl OnTheFlyStorage {
+    fn consolidation_coordinate(
+        &self,
+        split: burn_dragon_universality::SampleSplit,
+        absolute_step: usize,
+    ) -> RuliadConsolidationCoordinate {
+        match split {
+            burn_dragon_universality::SampleSplit::Train => {
+                let absolute_step = self
+                    .source_selection
+                    .as_ref()
+                    .and_then(|state| state.effective_absolute_step(Some(absolute_step)))
+                    .unwrap_or(absolute_step);
+                self.consolidation.coordinate(absolute_step)
+            }
+            burn_dragon_universality::SampleSplit::Validation => RuliadConsolidationCoordinate {
+                generation_step: absolute_step,
+                released_unique_steps: absolute_step.saturating_add(1),
+                novel: true,
+            },
+        }
+    }
+
+    fn consolidation_generation_epoch(
+        &self,
+        split: burn_dragon_universality::SampleSplit,
+        logical_epoch_index: usize,
+    ) -> usize {
+        if split == burn_dragon_universality::SampleSplit::Train && self.consolidation.enabled {
+            // Absolute generation steps already provide unbounded uniqueness.
+            // A fixed epoch keeps a replay byte-identical after epoch rollover.
+            0
+        } else {
+            logical_epoch_index
+        }
+    }
+
     pub(super) fn copy_into(&self, start: usize, train_len: usize, dst: &mut [u32]) {
         self.copy_into_with_epoch(DatasetSplit::Train, 0, start, train_len, dst);
     }
@@ -108,7 +144,7 @@ impl OnTheFlyStorage {
         let mut rng = StdRng::seed_from_u64(source_selection_step_seed(
             epoch_index,
             absolute_step,
-            source_label_seed(&bucket_label) as usize,
+            source_label_seed(&bucket_label),
         ));
         Some(
             (0..batch_size)
@@ -119,7 +155,7 @@ impl OnTheFlyStorage {
 
     pub(super) fn source_selected_token_windows(
         &self,
-        request: RuliadWindowRequest,
+        mut request: RuliadWindowRequest,
     ) -> Option<Vec<Vec<u32>>> {
         let RuliadWindowRequest {
             split,
@@ -129,21 +165,33 @@ impl OnTheFlyStorage {
             ..
         } = request;
         let source_selection = self.source_selection.as_ref()?;
+        let consolidation = self.consolidation_coordinate(split, absolute_step);
+        let generation_epoch_index = self.consolidation_generation_epoch(split, epoch_index);
         let bucket_label = match split {
+            burn_dragon_universality::SampleSplit::Train if self.consolidation.enabled => {
+                source_selection.choose_consolidated_bucket_label(
+                    generation_epoch_index,
+                    consolidation.generation_step,
+                    absolute_step,
+                )?
+            }
             burn_dragon_universality::SampleSplit::Train => {
                 source_selection.choose_bucket_label_for_step(epoch_index, absolute_step)?
             }
             burn_dragon_universality::SampleSplit::Validation => source_selection
                 .choose_bucket_label_for_validation_step(epoch_index, absolute_step)?,
         };
-        let document_count = live_source_selection_documents_per_step(batch_size);
+        let document_count =
+            live_source_selection_documents_per_step(batch_size, self.live_documents_per_step);
         let documents = self.generate_source_bucket_documents(
             split,
-            epoch_index,
-            absolute_step,
+            generation_epoch_index,
+            consolidation.generation_step,
             &bucket_label,
             document_count,
         );
+        request.epoch_index = generation_epoch_index;
+        request.absolute_step = consolidation.generation_step;
         Some(source_selected_windows_from_documents(
             &documents,
             self.corpus.eos_id(),
@@ -161,7 +209,10 @@ impl OnTheFlyStorage {
             .choose_bucket_label_for_fixed_validation_step(request.absolute_step)?;
         request.split = burn_dragon_universality::SampleSplit::Validation;
         request.epoch_index = 0;
-        let document_count = live_source_selection_documents_per_step(request.batch_size);
+        let document_count = live_source_selection_documents_per_step(
+            request.batch_size,
+            self.live_documents_per_step,
+        );
         let documents = self.generate_source_bucket_documents(
             burn_dragon_universality::SampleSplit::Validation,
             0,
@@ -187,7 +238,16 @@ impl OnTheFlyStorage {
     ) -> Option<RuliadPolicyBatch> {
         let source_selection = self.source_selection.as_ref()?;
         let tokenization = self.corpus.ruliad_config()?.tokenization.clone();
+        let consolidation = self.consolidation_coordinate(split, absolute_step);
+        let generation_epoch_index = self.consolidation_generation_epoch(split, epoch_index);
         let selected_bucket_label = match split {
+            burn_dragon_universality::SampleSplit::Train if self.consolidation.enabled => {
+                source_selection.choose_consolidated_bucket_label(
+                    generation_epoch_index,
+                    consolidation.generation_step,
+                    absolute_step,
+                )?
+            }
             burn_dragon_universality::SampleSplit::Train => {
                 source_selection.choose_bucket_label_for_step(epoch_index, absolute_step)?
             }
@@ -201,37 +261,27 @@ impl OnTheFlyStorage {
         .max(1);
         let stratified_bucket_labels = (stratified_difficulty_levels > 0)
             .then(|| {
-                let mut labels = source_selection
-                    .sampler
-                    .lock()
-                    .expect("ruliad source sampler lock poisoned")
-                    .candidates()
-                    .iter()
-                    .filter(|candidate| {
-                        candidate.task_kind == "select_proof_action"
-                            && candidate.difficulty_level < stratified_difficulty_levels
-                    })
-                    .map(|candidate| (candidate.difficulty_level, candidate.oracle_hash.clone()))
-                    .collect::<Vec<_>>();
-                labels.sort();
-                labels.dedup();
-                labels
-                    .into_iter()
-                    .map(|(_, label)| label)
-                    .collect::<Vec<_>>()
+                source_selection.proof_policy_stratified_bucket_labels(stratified_difficulty_levels)
             })
             .filter(|labels| !labels.is_empty())
             .unwrap_or_default();
         let mut samples = Vec::with_capacity(batch_size.max(1));
         for sample_rank in 0..batch_size.max(1) {
-            let bucket_label = stratified_bucket_labels
-                .get(sample_rank % stratified_bucket_labels.len().max(1))
-                .unwrap_or(&selected_bucket_label);
-            let sample_index = live_source_selection_sample_index(
+            let bucket_label = if stratified_bucket_labels.is_empty() {
+                &selected_bucket_label
+            } else {
+                let stratum_index = sample_rank % stratified_bucket_labels.len();
+                let labels = &stratified_bucket_labels[stratum_index];
+                &labels[consolidation
+                    .generation_step
+                    .saturating_add(sample_rank / stratified_bucket_labels.len())
+                    % labels.len()]
+            };
+            let coordinate = live_source_selection_sample_coordinate(
                 sample_count,
                 split,
-                epoch_index,
-                absolute_step,
+                generation_epoch_index,
+                consolidation.generation_step,
                 bucket_label,
                 sample_rank,
             );
@@ -239,13 +289,15 @@ impl OnTheFlyStorage {
                 .corpus
                 .generate_ruliad_eval_item_for_source_bucket(
                     split,
-                    epoch_index,
-                    sample_index,
+                    coordinate.epoch_index,
+                    coordinate.sample_index,
                     bucket_label,
                 )
                 .unwrap_or_else(|error| {
                     panic!(
-                        "failed to generate live source-selected ruliad policy item split={split:?} epoch_index={epoch_index} absolute_step={absolute_step} sample_index={sample_index} bucket={bucket_label}: {error:#}"
+                        "failed to generate live source-selected ruliad policy item split={split:?} epoch_index={} absolute_step={absolute_step} sample_index={} bucket={bucket_label}: {error:#}",
+                        coordinate.epoch_index,
+                        coordinate.sample_index,
                     )
                 })?;
             let prompt_tokens = self
@@ -263,12 +315,22 @@ impl OnTheFlyStorage {
             samples,
             tokenization,
             stop_token_id: self.corpus.ruliad_document_end_token_id().map(i64::from),
+            sampling_metadata: Some(crate::dataset::RuliadPolicySamplingMetadata {
+                logical_epoch_index: epoch_index,
+                logical_selection_step: absolute_step,
+                generation_epoch_index,
+                generation_step: consolidation.generation_step,
+                released_unique_steps: consolidation.released_unique_steps,
+                novel: consolidation.novel,
+                consolidation_enabled: split == burn_dragon_universality::SampleSplit::Train
+                    && self.consolidation.enabled,
+            }),
         })
     }
 
     pub(super) fn source_selected_stream_token_windows(
         &self,
-        request: RuliadStreamWindowRequest,
+        mut request: RuliadStreamWindowRequest,
     ) -> Option<Vec<Vec<u32>>> {
         let RuliadStreamWindowRequest {
             window:
@@ -284,7 +346,16 @@ impl OnTheFlyStorage {
         let source_selection = self.source_selection.as_ref()?;
         let selection_step =
             absolute_step.saturating_sub(chunk_index_in_document.min(absolute_step));
+        let consolidation = self.consolidation_coordinate(split, selection_step);
+        let generation_epoch_index = self.consolidation_generation_epoch(split, epoch_index);
         let bucket_label = match split {
+            burn_dragon_universality::SampleSplit::Train if self.consolidation.enabled => {
+                source_selection.choose_consolidated_bucket_label(
+                    generation_epoch_index,
+                    consolidation.generation_step,
+                    absolute_step,
+                )?
+            }
             burn_dragon_universality::SampleSplit::Train => source_selection
                 .choose_bucket_label_for_stream_step(epoch_index, selection_step, absolute_step)?,
             burn_dragon_universality::SampleSplit::Validation => source_selection
@@ -292,11 +363,15 @@ impl OnTheFlyStorage {
         };
         let documents = self.generate_source_bucket_documents(
             split,
-            epoch_index,
-            selection_step,
+            generation_epoch_index,
+            consolidation.generation_step,
             &bucket_label,
             batch_size.max(1),
         );
+        request.window.absolute_step = consolidation
+            .generation_step
+            .saturating_add(chunk_index_in_document);
+        request.window.epoch_index = generation_epoch_index;
         Some(source_selected_stream_windows_from_documents(
             &documents,
             self.corpus.eos_id(),
@@ -309,7 +384,7 @@ impl OnTheFlyStorage {
         request: RuliadSupervisedStreamRequest,
     ) -> Option<SourceSelectedStreamBatch> {
         let RuliadSupervisedStreamRequest {
-            stream,
+            mut stream,
             supervision,
             emit_loss_masks,
         } = request;
@@ -328,7 +403,16 @@ impl OnTheFlyStorage {
         let source_selection = self.source_selection.as_ref()?;
         let selection_step =
             absolute_step.saturating_sub(chunk_index_in_document.min(absolute_step));
+        let consolidation = self.consolidation_coordinate(split, selection_step);
+        let generation_epoch_index = self.consolidation_generation_epoch(split, epoch_index);
         let bucket_label = match split {
+            burn_dragon_universality::SampleSplit::Train if self.consolidation.enabled => {
+                source_selection.choose_consolidated_bucket_label(
+                    generation_epoch_index,
+                    consolidation.generation_step,
+                    absolute_step,
+                )?
+            }
             burn_dragon_universality::SampleSplit::Train => source_selection
                 .choose_bucket_label_for_stream_step(epoch_index, selection_step, absolute_step)?,
             burn_dragon_universality::SampleSplit::Validation => source_selection
@@ -336,11 +420,15 @@ impl OnTheFlyStorage {
         };
         let documents = self.generate_source_bucket_documents(
             split,
-            epoch_index,
-            selection_step,
+            generation_epoch_index,
+            consolidation.generation_step,
             &bucket_label,
             batch_size.max(1),
         );
+        stream.window.absolute_step = consolidation
+            .generation_step
+            .saturating_add(chunk_index_in_document);
+        stream.window.epoch_index = generation_epoch_index;
         let windows =
             source_selected_stream_windows_from_documents(&documents, self.corpus.eos_id(), stream);
         let masks = emit_loss_masks.then(|| {
@@ -598,7 +686,7 @@ impl OnTheFlyStorage {
         (0..document_count)
             .into_par_iter()
             .map(|document_rank| {
-                let sample_index = live_source_selection_sample_index(
+                let coordinate = live_source_selection_sample_coordinate(
                     sample_count,
                     split,
                     epoch_index,
@@ -610,13 +698,15 @@ impl OnTheFlyStorage {
                     self.corpus
                         .generate_compact_document_tokens_for_source_bucket(
                             split,
-                            epoch_index,
-                            sample_index,
+                            coordinate.epoch_index,
+                            coordinate.sample_index,
                             bucket_label,
                         )
                         .unwrap_or_else(|error| {
                             panic!(
-                                "failed to generate live source-selected universality sample split={split:?} epoch_index={epoch_index} absolute_step={absolute_step} sample_index={sample_index} bucket={bucket_label}: {error:#}"
+                                "failed to generate live source-selected universality sample split={split:?} epoch_index={} absolute_step={absolute_step} sample_index={} bucket={bucket_label}: {error:#}",
+                                coordinate.epoch_index,
+                                coordinate.sample_index,
                             )
                         }),
                 )

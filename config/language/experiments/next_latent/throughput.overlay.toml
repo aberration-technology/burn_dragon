@@ -1,0 +1,14 @@
+# Timing-only calibration. These checkpoints are not evaluated or promoted.
+[training]
+max_iters = 512
+checkpoint_interval_iters = 512
+
+[training.validation]
+execution = "external_evaluator"
+
+[training.events]
+ruliad_correctness_probe_items = 0
+source_weighted_validation_batches = 0
+
+[training.ruliad_policy_probe]
+enabled = false

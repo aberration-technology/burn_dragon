@@ -1,0 +1,5 @@
+extends = ["structural-eval.corpus.toml"]
+
+seed = 8817302
+name = "nextlat-memory-long-confirmatory-structural"
+validation_samples = 512

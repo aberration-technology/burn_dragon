@@ -1109,6 +1109,8 @@ pub struct LanguageTrainModel<B: BackendTrait> {
     #[module(skip)]
     latent_reasoning: LatentReasoningTrainingConfig,
     #[module(skip)]
+    next_latent_token_layout: Option<super::next_latent::NextLatentTokenLayout>,
+    #[module(skip)]
     ruliad_supervision: RuliadSupervisionConfig,
     #[module(skip)]
     latent_reasoning_capability_gate_open: Arc<AtomicBool>,
@@ -1262,6 +1264,8 @@ struct RuliadPromptValueBindingTelemetry {
     version: u32,
     step_index: usize,
     algorithm: &'static str,
+    prompt_context: &'static str,
+    objective: &'static str,
     skip_reason: Option<&'static str>,
     sample_groups: usize,
     rows: usize,
@@ -1612,19 +1616,85 @@ struct RuliadVerifierRolloutImitationTelemetry {
     max_completion_tokens: usize,
 }
 
-const RULIAD_PROOF_POLICY_TELEMETRY_VERSION: u32 = 21;
+const RULIAD_PROOF_POLICY_TELEMETRY_VERSION: u32 = 28;
+
+fn ruliad_proof_policy_objective_label(
+    config: &crate::config::RuliadProofPolicyTrainingConfig,
+) -> &'static str {
+    if config.counterfactual_objective.uses_target_group_support() {
+        return match config.scoring {
+            crate::config::RuliadProofPolicyScoring::CompletionLikelihood => {
+                "completion_target_group_conditional_v1"
+            }
+            crate::config::RuliadProofPolicyScoring::SemanticEnergy => {
+                "semantic_energy_target_group_conditional_v1"
+            }
+            crate::config::RuliadProofPolicyScoring::ResidualEnergy => {
+                "residual_energy_target_group_conditional_v1"
+            }
+        };
+    }
+    match config.scoring {
+        crate::config::RuliadProofPolicyScoring::SemanticEnergy => {
+            if config.counterfactual_targets_per_state > 0 {
+                "semantic_sequence_energy_counterfactual_v1"
+            } else {
+                "semantic_sequence_energy_v1"
+            }
+        }
+        crate::config::RuliadProofPolicyScoring::ResidualEnergy => {
+            if config.counterfactual_targets_per_state > 0 {
+                "autoregressive_residual_energy_counterfactual_v1"
+            } else {
+                "autoregressive_residual_energy_v1"
+            }
+        }
+        crate::config::RuliadProofPolicyScoring::CompletionLikelihood => {
+            match config.normalization {
+                crate::config::RuliadProofPolicyNormalization::CandidateConditional => {
+                    if config.counterfactual_targets_per_state > 0 {
+                        "candidate_normalized_counterfactual_v1"
+                    } else {
+                        "candidate_normalized_equivalent_v1"
+                    }
+                }
+                crate::config::RuliadProofPolicyNormalization::PrefixConditional => {
+                    if config.counterfactual_targets_per_state > 0 {
+                        "prefix_conditional_counterfactual_v1"
+                    } else {
+                        "prefix_conditional_equivalent_v1"
+                    }
+                }
+                crate::config::RuliadProofPolicyNormalization::VocabularyMarginal => {
+                    "vocabulary_marginal_equivalent_v1"
+                }
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default, Serialize)]
 struct RuliadProofPolicyDaggerTelemetry {
     version: u32,
     answer_contract: &'static str,
     objective: &'static str,
+    prompt_context: &'static str,
+    target: &'static str,
     gradient_scope: &'static str,
     presentation_risk: &'static str,
     configured_mode: &'static str,
     mode: &'static str,
     candidate_symmetry: &'static str,
     step_index: usize,
+    policy_batch_fingerprint: u64,
+    objective_panel_fingerprint: u64,
+    consolidation_logical_epoch_index: usize,
+    consolidation_logical_selection_step: usize,
+    consolidation_generation_epoch_index: usize,
+    consolidation_enabled: bool,
+    consolidation_generation_step: usize,
+    consolidation_released_unique_steps: usize,
+    consolidation_novel: bool,
     skip_reason: Option<String>,
     available_sample_groups: usize,
     sample_groups: usize,
@@ -1635,6 +1705,8 @@ struct RuliadProofPolicyDaggerTelemetry {
     base_semantic_state_rows: usize,
     counterfactual_semantic_state_rows: usize,
     counterfactual_target_shortfall: usize,
+    target_group_conditional_groups: usize,
+    target_group_conditional_rows: usize,
     expert_rows: usize,
     static_expert_rows: usize,
     dagger_expert_rows: usize,
@@ -1669,6 +1741,12 @@ struct RuliadProofPolicyDaggerTelemetry {
     prefix_branch_rows: usize,
     prefix_candidate_tokens: usize,
     prefix_equivalent_tokens: usize,
+    original_prompt_tokens: usize,
+    retained_prompt_tokens: usize,
+    maximum_original_prompt_tokens: usize,
+    maximum_retained_prompt_tokens: usize,
+    truncated_presentations: usize,
+    prompt_retention_fraction: f64,
     weight: f32,
     pub(crate) rollout_steps: usize,
     rollout_depth_reached: usize,
@@ -1677,14 +1755,99 @@ struct RuliadProofPolicyDaggerTelemetry {
     semantic_row_budget: usize,
     base_semantic_row_budget: usize,
     configured_counterfactual_targets_per_state: usize,
+    counterfactual_objective: &'static str,
     target_variants_per_state: usize,
     max_rows_per_update: usize,
     max_presentation_rows_per_update: usize,
 }
 
 impl RuliadProofPolicyDaggerTelemetry {
+    fn with_policy_sampling(
+        mut self,
+        policy_batch: Option<&crate::dataset::RuliadPolicyBatch>,
+    ) -> Self {
+        if let Some(metadata) = policy_batch.and_then(|batch| batch.sampling_metadata) {
+            self.consolidation_logical_epoch_index = metadata.logical_epoch_index;
+            self.consolidation_logical_selection_step = metadata.logical_selection_step;
+            self.consolidation_generation_epoch_index = metadata.generation_epoch_index;
+            self.consolidation_enabled = metadata.consolidation_enabled;
+            self.consolidation_generation_step = metadata.generation_step;
+            self.consolidation_released_unique_steps = metadata.released_unique_steps;
+            self.consolidation_novel = metadata.novel;
+        }
+        self
+    }
+
+    fn skipped(
+        policy_batch: Option<&crate::dataset::RuliadPolicyBatch>,
+        config: crate::config::RuliadProofPolicyTrainingConfig,
+        step_index: usize,
+        reason: impl Into<String>,
+    ) -> Self {
+        let effective_mode = config.effective_mode(step_index);
+        let plan = RuliadProofPolicyBatchPlan::new(
+            effective_mode,
+            config.base_semantic_rows_per_update(),
+            config.rollout_steps,
+            config.stratified_difficulty_levels,
+        );
+        Self {
+            version: RULIAD_PROOF_POLICY_TELEMETRY_VERSION,
+            objective: ruliad_proof_policy_objective_label(&config),
+            prompt_context: config.prompt_context.as_str(),
+            target: config.target.as_str(),
+            gradient_scope: config.gradient_scope.as_str(),
+            presentation_risk: match config.presentation_risk {
+                crate::config::RuliadProofPolicyPresentationRisk::Mean => "mean",
+                crate::config::RuliadProofPolicyPresentationRisk::Worst => "worst",
+            },
+            configured_mode: match config.mode {
+                crate::config::RuliadProofPolicyTrainingMode::StaticExpert => "static_expert",
+                crate::config::RuliadProofPolicyTrainingMode::Dagger => "dagger",
+                crate::config::RuliadProofPolicyTrainingMode::StaticThenPairedDagger => {
+                    "static_then_paired_dagger"
+                }
+            },
+            mode: match effective_mode {
+                crate::config::RuliadProofPolicyEffectiveMode::StaticExpert => "static_expert",
+                crate::config::RuliadProofPolicyEffectiveMode::Dagger => "dagger",
+                crate::config::RuliadProofPolicyEffectiveMode::PairedDagger => "paired_dagger",
+            },
+            candidate_symmetry: match config.candidate_symmetry {
+                crate::config::RuliadProofPolicyCandidateSymmetry::Canonical => "canonical",
+                crate::config::RuliadProofPolicyCandidateSymmetry::BalancedRotation => {
+                    "balanced_rotation"
+                }
+                crate::config::RuliadProofPolicyCandidateSymmetry::CyclicOrbitAverage => {
+                    "cyclic_orbit_average"
+                }
+            },
+            step_index,
+            policy_batch_fingerprint: policy_batch.map_or(0, |batch| batch.fingerprint()),
+            skip_reason: Some(reason.into()),
+            available_sample_groups: policy_batch.map_or(0, |batch| batch.samples.len()),
+            weight: config.weight,
+            rollout_steps: plan.rollout_steps_for_dagger_count(
+                plan.dagger_trajectories_for_samples(
+                    policy_batch.map_or(0, |batch| batch.samples.len()),
+                ),
+            ),
+            configured_rollout_steps: config.rollout_steps,
+            trajectory_budget: plan.trajectory_budget(),
+            semantic_row_budget: config.semantic_rows_per_update(),
+            base_semantic_row_budget: config.base_semantic_rows_per_update(),
+            configured_counterfactual_targets_per_state: config.counterfactual_targets_per_state,
+            counterfactual_objective: config.counterfactual_objective.as_str(),
+            target_variants_per_state: config.target_variants_per_state(),
+            max_rows_per_update: config.max_rows_per_update,
+            max_presentation_rows_per_update: config.max_presentation_rows_per_update,
+            ..Self::default()
+        }
+        .with_policy_sampling(policy_batch)
+    }
+
     fn from_verifier_panel(
-        stats: crate::train::local_predictive_coding::RuliadVerifierPanelStats,
+        stats: &crate::train::local_predictive_coding::RuliadVerifierPanelStats,
         config: crate::config::RuliadProofPolicyTrainingConfig,
         step_index: usize,
         decision_rows: usize,
@@ -1698,12 +1861,10 @@ impl RuliadProofPolicyDaggerTelemetry {
         Self {
             version: RULIAD_PROOF_POLICY_TELEMETRY_VERSION,
             answer_contract: stats.answer_contract,
-            objective: if config.counterfactual_targets_per_state > 0 {
-                "prefix_conditional_counterfactual_v1"
-            } else {
-                "prefix_conditional_equivalent_v1"
-            },
-            gradient_scope: "full_model",
+            objective: ruliad_proof_policy_objective_label(&config),
+            prompt_context: config.prompt_context.as_str(),
+            target: config.target.as_str(),
+            gradient_scope: config.gradient_scope.as_str(),
             presentation_risk: "mean",
             configured_mode: stats.configured_mode,
             mode: stats.effective_mode,
@@ -1717,6 +1878,8 @@ impl RuliadProofPolicyDaggerTelemetry {
                 }
             },
             step_index,
+            policy_batch_fingerprint: stats.policy_batch_fingerprint,
+            objective_panel_fingerprint: stats.objective_panel_fingerprint,
             available_sample_groups: stats.available_sample_groups,
             sample_groups: stats.sample_groups,
             nonzero_start_trajectories: stats.nonzero_start_trajectories,
@@ -1726,6 +1889,8 @@ impl RuliadProofPolicyDaggerTelemetry {
             base_semantic_state_rows: stats.base_semantic_states,
             counterfactual_semantic_state_rows: stats.counterfactual_semantic_states,
             counterfactual_target_shortfall: stats.counterfactual_target_shortfall,
+            target_group_conditional_groups: stats.target_group_conditional_groups,
+            target_group_conditional_rows: stats.target_group_conditional_rows,
             expert_rows: stats.semantic_states,
             static_expert_rows: stats.static_expert_states,
             dagger_expert_rows: stats.dagger_expert_states,
@@ -1741,13 +1906,39 @@ impl RuliadProofPolicyDaggerTelemetry {
             model_backtracks: stats.backtracks,
             solved_proofs: stats.solved_proofs,
             model_scoring_batches: stats.model_scoring_batches,
-            rollout_steps: plan.rollout_steps,
+            supervised_action_tokens: stats.supervised_action_tokens,
+            candidate_target_tokens: stats.candidate_target_tokens,
+            equivalent_target_tokens: stats.equivalent_target_tokens,
+            mean_candidate_targets_per_row: stats.candidate_target_tokens as f64
+                / decision_rows.max(1) as f64,
+            mean_equivalent_targets_per_row: stats.equivalent_target_tokens as f64
+                / decision_rows.max(1) as f64,
+            prefix_branch_rows: stats.prefix_branch_rows,
+            prefix_candidate_tokens: stats.prefix_candidate_tokens,
+            prefix_equivalent_tokens: stats.prefix_equivalent_tokens,
+            original_prompt_tokens: stats.original_prompt_tokens,
+            retained_prompt_tokens: stats.retained_prompt_tokens,
+            maximum_original_prompt_tokens: stats.maximum_original_prompt_tokens,
+            maximum_retained_prompt_tokens: stats.maximum_retained_prompt_tokens,
+            truncated_presentations: stats.truncated_presentations,
+            prompt_retention_fraction: stats.retained_prompt_tokens as f64
+                / stats.original_prompt_tokens.max(1) as f64,
+            difficulty_sample_groups: stats.difficulty_sample_groups.clone(),
+            difficulty_visited_states: stats.difficulty_visited_states.clone(),
+            difficulty_expert_rows: stats.difficulty_expert_rows.clone(),
+            expert_selected_index_histogram: stats.expert_selected_index_histogram.clone(),
+            expert_equivalent_index_histogram: stats.expert_equivalent_index_histogram.clone(),
+            model_selected_index_histogram: stats.model_selected_index_histogram.clone(),
+            rollout_steps: plan.rollout_steps_for_dagger_count(
+                plan.dagger_trajectories_for_samples(stats.available_sample_groups),
+            ),
             rollout_depth_reached: stats.rollout_depth_reached,
             configured_rollout_steps: config.rollout_steps,
             trajectory_budget: plan.trajectory_budget(),
             semantic_row_budget: config.semantic_rows_per_update(),
             base_semantic_row_budget: config.base_semantic_rows_per_update(),
             configured_counterfactual_targets_per_state: config.counterfactual_targets_per_state,
+            counterfactual_objective: config.counterfactual_objective.as_str(),
             target_variants_per_state: config.target_variants_per_state(),
             max_rows_per_update: config.max_rows_per_update,
             max_presentation_rows_per_update: config.max_presentation_rows_per_update,
@@ -1764,6 +1955,7 @@ pub(crate) struct RuliadProofPolicyBatchPlan {
     pub(crate) dagger_trajectory_budget: usize,
     dagger_base_depth: usize,
     dagger_depth_remainder: usize,
+    configured_rollout_steps: usize,
     pub(crate) rollout_steps: usize,
 }
 
@@ -1809,6 +2001,7 @@ impl RuliadProofPolicyBatchPlan {
             dagger_trajectory_budget,
             dagger_base_depth,
             dagger_depth_remainder,
+            configured_rollout_steps,
             rollout_steps,
         }
     }
@@ -1820,6 +2013,39 @@ impl RuliadProofPolicyBatchPlan {
 
     pub(crate) fn dagger_depth(self, trajectory_index: usize) -> usize {
         self.dagger_base_depth + usize::from(trajectory_index < self.dagger_depth_remainder)
+    }
+
+    /// Number of dynamic trajectories executable from the available source rows.
+    ///
+    /// Paired mode may reuse a source row once: one copy remains an expert row
+    /// and the other follows the current policy. This keeps dynamic supervision
+    /// executable for batch size one without inventing a second document.
+    pub(crate) fn dagger_trajectories_for_samples(self, available_samples: usize) -> usize {
+        self.dagger_trajectory_budget.min(available_samples)
+    }
+
+    pub(crate) fn dagger_depth_for_count(
+        self,
+        trajectory_index: usize,
+        trajectory_count: usize,
+    ) -> usize {
+        if trajectory_count == 0 || trajectory_index >= trajectory_count {
+            return 0;
+        }
+        let total_depth = self
+            .dagger_row_budget
+            .min(trajectory_count.saturating_mul(self.configured_rollout_steps));
+        let base = total_depth / trajectory_count;
+        let remainder = total_depth % trajectory_count;
+        base + usize::from(trajectory_index < remainder)
+    }
+
+    pub(crate) fn rollout_steps_for_dagger_count(self, trajectory_count: usize) -> usize {
+        if trajectory_count == 0 {
+            1
+        } else {
+            self.dagger_depth_for_count(0, trajectory_count).max(1)
+        }
     }
 }
 
@@ -1909,6 +2135,7 @@ fn sequence_logsumexp<B: Backend>(scores: Tensor<B, 2>) -> Tensor<B, 1> {
 fn verifier_equivalent_sequence_log_probabilities<B: Backend>(
     mean_log_scores: Tensor<B, 2>,
     sum_log_scores: Tensor<B, 2>,
+    support_mask: Tensor<B, 2>,
     equivalent_mask: Tensor<B, 2>,
     normalization: crate::config::RuliadProofPolicyNormalization,
 ) -> Tensor<B, 1> {
@@ -1916,12 +2143,14 @@ fn verifier_equivalent_sequence_log_probabilities<B: Backend>(
         crate::config::RuliadProofPolicyNormalization::CandidateConditional => {
             let equivalent_scores =
                 mean_log_scores.clone() + equivalent_mask.sub_scalar(1.0).mul_scalar(1.0e9);
-            sequence_logsumexp(equivalent_scores) - sequence_logsumexp(mean_log_scores)
+            let support_scores = mean_log_scores + support_mask.sub_scalar(1.0).mul_scalar(1.0e9);
+            sequence_logsumexp(equivalent_scores) - sequence_logsumexp(support_scores)
         }
         crate::config::RuliadProofPolicyNormalization::PrefixConditional => {
             let equivalent_scores =
                 mean_log_scores.clone() + equivalent_mask.sub_scalar(1.0).mul_scalar(1.0e9);
-            sequence_logsumexp(equivalent_scores) - sequence_logsumexp(mean_log_scores)
+            let support_scores = mean_log_scores + support_mask.sub_scalar(1.0).mul_scalar(1.0e9);
+            sequence_logsumexp(equivalent_scores) - sequence_logsumexp(support_scores)
         }
         crate::config::RuliadProofPolicyNormalization::VocabularyMarginal => {
             let equivalent_scores =
@@ -1942,6 +2171,7 @@ struct GroupedVerifierSequenceLossConfig {
 fn grouped_verifier_equivalent_sequence_loss<B: Backend>(
     mean_log_scores: Tensor<B, 2>,
     sum_log_scores: Tensor<B, 2>,
+    support_mask: Tensor<B, 2>,
     equivalent_mask: Tensor<B, 2>,
     row_weights: Tensor<B, 1>,
     config: GroupedVerifierSequenceLossConfig,
@@ -1949,11 +2179,34 @@ fn grouped_verifier_equivalent_sequence_loss<B: Backend>(
     let row_log_probabilities = verifier_equivalent_sequence_log_probabilities(
         mean_log_scores,
         sum_log_scores,
+        support_mask,
         equivalent_mask,
         config.normalization,
     );
     grouped_action_log_probability_loss(
         row_log_probabilities,
+        row_weights,
+        config.presentation_risk,
+        config.presentation_group_size,
+        config.weight,
+    )
+}
+
+fn grouped_verifier_progress_distribution_loss<B: Backend>(
+    mean_log_scores: Tensor<B, 2>,
+    support_mask: Tensor<B, 2>,
+    target_action_weights: Tensor<B, 2>,
+    row_weights: Tensor<B, 1>,
+    config: GroupedVerifierSequenceLossConfig,
+) -> Tensor<B, 1> {
+    let row_cross_entropy = burn_pc::categorical_conditional_distribution_cross_entropy_rows(
+        mean_log_scores,
+        support_mask,
+        target_action_weights,
+        1.0e-12,
+    );
+    grouped_action_log_probability_loss(
+        row_cross_entropy.mul_scalar(-1.0),
         row_weights,
         config.presentation_risk,
         config.presentation_group_size,
@@ -2438,8 +2691,11 @@ mod ruliad_contract;
 mod ruliad_training;
 mod train_step;
 mod validation;
+mod verifier_terminal;
 
 use degeneracy::*;
 
 #[cfg(test)]
 mod objective_step_tests;
+#[cfg(test)]
+mod next_latent_tests;

@@ -22,7 +22,7 @@ type = "standard_token_classification"
 [training]
 block_size = 512
 tbptt_chunk_size = 512
-tbptt_persist_across_steps = false
+tbptt_persist_across_steps = true
 sequence_batching = "streaming"
 batch_size = 32
 max_iters = 512

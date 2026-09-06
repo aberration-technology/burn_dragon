@@ -1,5 +1,5 @@
 use super::*;
-use burn::optim::SgdConfig;
+use burn::optim::{AdamWConfig, SgdConfig};
 use burn_autodiff::Autodiff;
 use burn_ndarray::NdArray;
 
@@ -155,6 +155,7 @@ fn feedforward_local_pc_solvers_carry_and_reset_tbptt_rho_state() {
             &device,
         ),
         loss_mask: None,
+        supervised_token_count: None,
         summary_event_mask: None,
         ruliad_policy_batch: None,
         absolute_step: None,
@@ -246,6 +247,7 @@ fn incremental_local_pc_interleaves_one_optimizer_update_per_inference_step() {
         inputs: Tensor::from_data(TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]), &device),
         targets: Tensor::from_data(TensorData::new(vec![2_i64, 3, 4, 5], [1, 4]), &device),
         loss_mask: None,
+        supervised_token_count: None,
         summary_event_mask: None,
         ruliad_policy_batch: None,
         absolute_step: None,
@@ -323,6 +325,7 @@ fn direct_kolen_pollack_owns_two_ordered_updates_and_persists_feedback() {
         inputs: Tensor::from_data(TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]), &device),
         targets: Tensor::from_data(TensorData::new(vec![2_i64, 3, 4, 5], [1, 4]), &device),
         loss_mask: None,
+        supervised_token_count: None,
         summary_event_mask: None,
         ruliad_policy_batch: None,
         absolute_step: None,
@@ -423,6 +426,7 @@ fn amortized_dkp_alternates_exact_local_teachers_with_cheap_feedback_updates() {
         inputs: Tensor::from_data(TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]), &device),
         targets: Tensor::from_data(TensorData::new(vec![2_i64, 3, 4, 5], [1, 4]), &device),
         loss_mask: None,
+        supervised_token_count: None,
         summary_event_mask: None,
         ruliad_policy_batch: None,
         absolute_step: None,
@@ -496,6 +500,7 @@ fn amortized_adjoint_emits_one_outer_update_and_persists_its_feedback_bank() {
         inputs: Tensor::from_data(TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]), &device),
         targets: Tensor::from_data(TensorData::new(vec![2_i64, 3, 4, 5], [1, 4]), &device),
         loss_mask: None,
+        supervised_token_count: None,
         summary_event_mask: None,
         ruliad_policy_batch: None,
         absolute_step: None,
@@ -562,6 +567,7 @@ fn first_order_adjoint_emits_one_update_without_feedback_state() {
             inputs: Tensor::from_data(TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]), &device),
             targets: Tensor::from_data(TensorData::new(vec![2_i64, 3, 4, 5], [1, 4]), &device),
             loss_mask: None,
+            supervised_token_count: None,
             summary_event_mask: None,
             ruliad_policy_batch: None,
             absolute_step: None,
@@ -610,6 +616,7 @@ fn empty_verifier_terminal_panel_falls_back_and_records_the_skip() {
             inputs: Tensor::from_data(TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]), &device),
             targets: Tensor::from_data(TensorData::new(vec![2_i64, 3, 4, 5], [1, 4]), &device),
             loss_mask: None,
+            supervised_token_count: None,
             summary_event_mask: None,
             ruliad_policy_batch: None,
             absolute_step: None,
@@ -621,6 +628,64 @@ fn empty_verifier_terminal_panel_falls_back_and_records_the_skip() {
     assert_eq!(snapshot.structured_terminal_steps, 0);
     assert_eq!(snapshot.structured_terminal_skipped_steps, 1);
     assert_eq!(snapshot.global_backward_calls, 0);
+}
+
+#[test]
+fn required_verifier_terminal_fails_after_recording_a_missing_batch() {
+    let device = burn::tensor::Device::<TestBackend>::default();
+    let directory = tempfile::tempdir().expect("telemetry directory");
+    let telemetry_path = directory.path().join("proof-policy.jsonl");
+    let mut model_config = tiny_model_config();
+    model_config.sequence_kernel =
+        burn_dragon_core::SequenceKernelConfig::dense_score_short_context();
+    model_config.fused_kernels.rotary_embedding = burn_dragon_core::RotaryEmbedding::Alibi;
+    let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(model_config, &device))
+        .with_training_algorithm(TrainingAlgorithm::PredictiveCoding)
+        .with_local_predictive_coding(LocalPredictiveCodingConfig {
+            solver: LocalPredictiveCodingSolver::FixedPrediction,
+            terminal_criterion:
+                crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSet,
+            ..LocalPredictiveCodingConfig::default()
+        })
+        .with_ruliad_supervision(RuliadSupervisionConfig {
+            proof_policy: crate::config::RuliadProofPolicyTrainingConfig {
+                enabled: true,
+                require_scheduled_update: true,
+                mode: crate::config::RuliadProofPolicyTrainingMode::StaticExpert,
+                every_steps: 1,
+                start_after_steps: 0,
+                stratified_difficulty_levels: 1,
+                ..crate::config::RuliadProofPolicyTrainingConfig::default()
+            },
+            ..RuliadSupervisionConfig::default()
+        })
+        .with_ruliad_proof_policy_telemetry_path(Some(telemetry_path.clone()));
+
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        burn_train::TrainStep::step(
+            &model,
+            SequenceBatch {
+                inputs: Tensor::from_data(TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]), &device),
+                targets: Tensor::from_data(TensorData::new(vec![2_i64, 3, 4, 5], [1, 4]), &device),
+                loss_mask: None,
+                supervised_token_count: None,
+                summary_event_mask: None,
+                ruliad_policy_batch: None,
+                absolute_step: Some(0),
+                reset_stream_state: true,
+            },
+        )
+    }));
+    assert!(failure.is_err(), "required objective must fail closed");
+    let event: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(telemetry_path)
+            .expect("skip telemetry")
+            .lines()
+            .next()
+            .expect("skip event"),
+    )
+    .expect("skip JSON");
+    assert_eq!(event["skip_reason"], "missing_policy_batch");
 }
 
 #[test]
@@ -715,6 +780,7 @@ fn model_visited_verifier_terminal_preserves_stream_state_for_backprop_and_local
             candidate: None,
             proof_step_index: Some(proof_step_index),
             action_presentation_rotation: Some(0),
+            action_candidate_count: Some(actions.candidates.len()),
             action_answer_contract: answer_contract,
             task: burn_dragon_universality::RuliadTaskKind::SelectProofAction,
         }),
@@ -729,6 +795,7 @@ fn model_visited_verifier_terminal_preserves_stream_state_for_backprop_and_local
             eos_id: Some(271),
         },
         stop_token_id: Some(271),
+        sampling_metadata: None,
     });
     let profile = model.local_predictive_coding_profile();
     model.gradient_scale_step.store(7, Ordering::Relaxed);
@@ -738,6 +805,7 @@ fn model_visited_verifier_terminal_preserves_stream_state_for_backprop_and_local
             inputs: Tensor::zeros([1, 512], &device),
             targets: Tensor::zeros([1, 512], &device),
             loss_mask: None,
+            supervised_token_count: None,
             summary_event_mask: None,
             ruliad_policy_batch: Some(policy_batch.clone()),
             absolute_step: Some(16),
@@ -785,6 +853,7 @@ fn model_visited_verifier_terminal_preserves_stream_state_for_backprop_and_local
             inputs: Tensor::zeros([1, 512], &device),
             targets: Tensor::zeros([1, 512], &device),
             loss_mask: None,
+            supervised_token_count: None,
             summary_event_mask: None,
             ruliad_policy_batch: Some(policy_batch),
             absolute_step: Some(16),
@@ -803,6 +872,77 @@ fn model_visited_verifier_terminal_preserves_stream_state_for_backprop_and_local
             .position,
         512
     );
+}
+
+#[test]
+fn local_pc_semantic_terminal_telemetry_reports_executed_scope() {
+    let config = crate::config::RuliadProofPolicyTrainingConfig {
+        enabled: true,
+        scoring: crate::config::RuliadProofPolicyScoring::SemanticEnergy,
+        target: crate::config::RuliadProofPolicyTarget::VerifiedProgressDistribution,
+        gradient_scope: crate::config::RuliadProofPolicyGradientScope::ScoreHeadOnly,
+        normalization: crate::config::RuliadProofPolicyNormalization::CandidateConditional,
+        counterfactual_targets_per_state: 1,
+        max_rows_per_update: 2,
+        max_presentation_rows_per_update: 8,
+        ..Default::default()
+    };
+    let stats = crate::train::local_predictive_coding::RuliadVerifierPanelStats {
+        policy_batch_fingerprint: 71,
+        objective_panel_fingerprint: 113,
+        answer_contract: "semantic_step",
+        configured_mode: "static_expert",
+        effective_mode: "static_expert",
+        semantic_states: 2,
+        base_semantic_states: 1,
+        counterfactual_semantic_states: 1,
+        supervised_action_tokens: 40,
+        candidate_target_tokens: 40,
+        equivalent_target_tokens: 10,
+        ..Default::default()
+    };
+
+    let consolidation = crate::config::RuliadConsolidationConfig {
+        enabled: true,
+        initial_unique_steps: 4,
+        hold_steps: 20,
+        novelty_interval_steps: 4,
+        seed: 19,
+    };
+    let mut policy_batch = prompt_value_binding_policy_batch();
+    let coordinate = consolidation.coordinate(16);
+    policy_batch.sampling_metadata = Some(crate::dataset::RuliadPolicySamplingMetadata {
+        logical_epoch_index: 3,
+        logical_selection_step: 16,
+        generation_epoch_index: 0,
+        generation_step: coordinate.generation_step,
+        released_unique_steps: coordinate.released_unique_steps,
+        novel: coordinate.novel,
+        consolidation_enabled: consolidation.enabled,
+    });
+    let telemetry = RuliadProofPolicyDaggerTelemetry::from_verifier_panel(&stats, config, 16, 2)
+        .with_policy_sampling(Some(&policy_batch));
+    assert_eq!(
+        telemetry.objective,
+        "semantic_sequence_energy_counterfactual_v1"
+    );
+    assert_eq!(telemetry.gradient_scope, "score_head_only");
+    assert_eq!(telemetry.target, "verified_progress_distribution");
+    assert_eq!(telemetry.supervised_action_tokens, 40);
+    assert_eq!(telemetry.candidate_target_tokens, 40);
+    assert_eq!(telemetry.equivalent_target_tokens, 10);
+    assert_eq!(telemetry.policy_batch_fingerprint, 71);
+    assert_eq!(telemetry.objective_panel_fingerprint, 113);
+    assert_eq!(telemetry.mean_candidate_targets_per_row, 20.0);
+    assert_eq!(telemetry.mean_equivalent_targets_per_row, 5.0);
+    assert_eq!(telemetry.prefix_branch_rows, 0);
+    assert!(telemetry.consolidation_enabled);
+    assert_eq!(telemetry.consolidation_logical_epoch_index, 3);
+    assert_eq!(telemetry.consolidation_logical_selection_step, 16);
+    assert_eq!(telemetry.consolidation_generation_epoch_index, 0);
+    assert!(!telemetry.consolidation_novel);
+    assert_eq!(telemetry.consolidation_released_unique_steps, 4);
+    assert!(telemetry.consolidation_generation_step < 4);
 }
 
 #[test]
@@ -834,6 +974,7 @@ fn incremental_local_pc_tbptt_updates_each_chunk_and_carries_rho() {
             TensorData::new(vec![1_i64, 0, 1, 1], [1, 4]),
             &device,
         )),
+        supervised_token_count: Some(3),
         summary_event_mask: None,
         ruliad_policy_batch: None,
         absolute_step: None,
@@ -899,6 +1040,7 @@ fn local_predictive_coding_tbptt_uses_supervised_token_loss_weighting() {
             TensorData::new(vec![1_i64, 0, 0, 0, 1, 1, 1, 1], [1, 8]),
             &device,
         )),
+        supervised_token_count: Some(5),
         summary_event_mask: None,
         ruliad_policy_batch: None,
         absolute_step: None,
@@ -968,6 +1110,7 @@ fn backprop_tbptt_matches_global_masked_objective_with_uneven_supervision() {
             TensorData::new(vec![1_i64, 0, 0, 0, 1, 1, 1, 1], [1, 8]),
             &device,
         )),
+        supervised_token_count: Some(5),
         summary_event_mask: None,
         ruliad_policy_batch: None,
         absolute_step: None,
@@ -1094,6 +1237,7 @@ fn exact_temporal_pc_windows_match_bounded_recurrent_backprop_with_uneven_masks(
             TensorData::new(vec![1_i64, 0, 0, 0, 1, 1, 1, 1], [1, 8]),
             &device,
         )),
+        supervised_token_count: Some(5),
         summary_event_mask: None,
         ruliad_policy_batch: None,
         absolute_step: None,
@@ -2484,6 +2628,7 @@ fn ruliad_structured_answer_recovery_loss_trains_oracle_after_wrong_prefix() {
             eos_id: None,
         },
         stop_token_id: None,
+        sampling_metadata: None,
     };
 
     model.gradient_scale_step.store(3, Ordering::Relaxed);
@@ -2561,6 +2706,7 @@ fn ruliad_structured_answer_recovery_loss_writes_activity_telemetry() {
             eos_id: None,
         },
         stop_token_id: None,
+        sampling_metadata: None,
     };
 
     let loss = model
@@ -2639,6 +2785,7 @@ fn ruliad_answer_contract_loss_trains_full_oracle_contract_and_respects_cadence(
             eos_id: None,
         },
         stop_token_id: None,
+        sampling_metadata: None,
     };
 
     model.gradient_scale_step.store(3, Ordering::Relaxed);
@@ -2725,6 +2872,7 @@ fn ruliad_answer_contract_loss_writes_activity_telemetry_and_caps_rows() {
             eos_id: Some(271),
         },
         stop_token_id: Some(265),
+        sampling_metadata: None,
     };
 
     let loss = model
@@ -2820,6 +2968,7 @@ fn ruliad_verifier_policy_loss_builds_from_policy_metadata() {
             eos_id: None,
         },
         stop_token_id: None,
+        sampling_metadata: None,
     };
     let loss = model
         .ruliad_verifier_policy_loss(&policy_batch, &device, 8)
@@ -3156,6 +3305,7 @@ fn ruliad_verifier_policy_loss_supports_vpo_mode() {
             eos_id: None,
         },
         stop_token_id: None,
+        sampling_metadata: None,
     };
     let loss = model
         .ruliad_verifier_policy_loss(&policy_batch, &device, 8)
@@ -3222,6 +3372,7 @@ fn ruliad_verifier_policy_loss_can_include_oracle_candidate() {
             eos_id: None,
         },
         stop_token_id: None,
+        sampling_metadata: None,
     };
     let loss = model
         .ruliad_verifier_policy_loss(&policy_batch, &device, 32)
@@ -3717,6 +3868,7 @@ fn prompt_value_binding_policy_batch() -> crate::dataset::RuliadPolicyBatch {
         }],
         tokenization,
         stop_token_id: None,
+        sampling_metadata: None,
     }
 }
 
@@ -3726,6 +3878,1090 @@ fn prompt_value_binding_model_config() -> DragonConfig {
     config.sequence_kernel = burn_dragon_core::SequenceKernelConfig::dense_score_short_context();
     config.fused_kernels.rotary_embedding = burn_dragon_core::RotaryEmbedding::Alibi;
     config
+}
+
+fn scheduled_ruliad_policy_batch() -> crate::dataset::RuliadPolicyBatch {
+    let tokenization = burn_dragon_universality::RuliadTokenizationConfig::StructuredSymbolic {
+        vocab_size: 272,
+        eos_id: Some(271),
+    };
+    let tokenizer =
+        burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(&tokenization)
+            .expect("tokenizer");
+    let bundle = burn_dragon_universality::ruliad::formal::generate_formal_bundle(
+        43,
+        burn_dragon_universality::ruliad::formal::RuliadFormalGeneratorConfig {
+            rewrite_depth: 2,
+            leaf_count: 3,
+            context_depth: 1,
+            distractor_axioms: 1,
+            ..Default::default()
+        },
+    )
+    .expect("formal bundle");
+    let proof_step_index = 1.min(bundle.certificate.step_count().saturating_sub(1));
+    let actions = burn_dragon_universality::ruliad::oracle_proof_action_set(
+        &bundle.problem,
+        &bundle.certificate,
+        proof_step_index,
+        4,
+    )
+    .expect("proof action set");
+    let answer_contract =
+        burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::SemanticStep;
+    let prompt =
+        burn_dragon_universality::ruliad::ruliad_proof_action_prompt(&bundle.problem, &actions)
+            .expect("proof prompt");
+    let expected_answer = burn_dragon_universality::ruliad::proof_action_answer(
+        &actions,
+        actions.selected_index,
+        answer_contract,
+    )
+    .expect("proof action answer");
+    let item = burn_dragon_universality::RuliadEvalItem {
+        oracle_hash: bundle.problem.canonical_hash().expect("problem hash"),
+        sample_index: 43,
+        split: burn_dragon_universality::SampleSplit::Train,
+        family: "formal_proof".to_string(),
+        task_kind: burn_dragon_universality::RuliadTaskKind::SelectProofAction
+            .label()
+            .to_string(),
+        math_domains: vec!["formal_proof".to_string()],
+        reasoning_modes: vec!["proof_construction".to_string()],
+        prompt: prompt.clone(),
+        expected_answer,
+        difficulty_level: Some(0),
+        spec: Some(burn_dragon_universality::RuliadSampleSpec::FormalProof {
+            problem: bundle.problem,
+            certificate: bundle.certificate,
+            candidate: None,
+            proof_step_index: Some(proof_step_index),
+            action_presentation_rotation: Some(0),
+            action_candidate_count: Some(actions.candidates.len()),
+            action_answer_contract: answer_contract,
+            task: burn_dragon_universality::RuliadTaskKind::SelectProofAction,
+        }),
+    };
+    crate::dataset::RuliadPolicyBatch {
+        samples: vec![crate::dataset::RuliadPolicySample {
+            prompt_tokens: tokenizer
+                .encode_payload(&prompt)
+                .into_iter()
+                .map(i64::from)
+                .collect(),
+            item,
+        }],
+        tokenization,
+        stop_token_id: Some(271),
+        sampling_metadata: None,
+    }
+}
+
+fn scheduled_ruliad_supervision() -> RuliadSupervisionConfig {
+    RuliadSupervisionConfig {
+        mode: RuliadSupervisionMode::AnswerCompletion,
+        prompt_value_binding: crate::config::RuliadPromptValueBindingConfig {
+            enabled: true,
+            every_steps: 2,
+            phase_steps: 1,
+            max_rows_per_step: 8,
+            ..Default::default()
+        },
+        proof_policy: crate::config::RuliadProofPolicyTrainingConfig {
+            enabled: true,
+            mode: crate::config::RuliadProofPolicyTrainingMode::StaticExpert,
+            scoring: crate::config::RuliadProofPolicyScoring::CompletionLikelihood,
+            gradient_scope: crate::config::RuliadProofPolicyGradientScope::FullModel,
+            normalization: crate::config::RuliadProofPolicyNormalization::PrefixConditional,
+            candidate_symmetry: crate::config::RuliadProofPolicyCandidateSymmetry::BalancedRotation,
+            presentation_risk: crate::config::RuliadProofPolicyPresentationRisk::Mean,
+            every_steps: 4,
+            start_after_steps: 0,
+            max_rows_per_update: 2,
+            max_presentation_rows_per_update: 8,
+            counterfactual_targets_per_state: 1,
+            candidates: 4,
+            max_completion_tokens: 32,
+            stratified_difficulty_levels: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn scheduled_ruliad_model_config() -> DragonConfig {
+    let mut config = prompt_value_binding_model_config();
+    config.n_layer = 2;
+    config.n_head = 2;
+    config.mlp_internal_dim_multiplier = 2;
+    config.vocab_size = 272;
+    config.fused_kernels.relu_threshold = -0.25;
+    config
+}
+
+fn scheduled_score_head_ruliad_supervision(
+    scoring: crate::config::RuliadProofPolicyScoring,
+    target: crate::config::RuliadProofPolicyTarget,
+) -> RuliadSupervisionConfig {
+    let mut supervision = scheduled_ruliad_supervision();
+    supervision.prompt_value_binding.enabled = false;
+    supervision.proof_policy.scoring = scoring;
+    supervision.proof_policy.target = target;
+    supervision.proof_policy.gradient_scope =
+        crate::config::RuliadProofPolicyGradientScope::ScoreHeadOnly;
+    supervision.proof_policy.normalization =
+        crate::config::RuliadProofPolicyNormalization::CandidateConditional;
+    supervision.proof_policy.counterfactual_objective =
+        crate::config::RuliadProofPolicyCounterfactualObjective::Independent;
+    supervision
+}
+
+fn scheduled_score_head_ruliad_model_config() -> DragonConfig {
+    let mut config = scheduled_ruliad_model_config();
+    config.sequence_score_head.enabled = true;
+    config.sequence_score_head.projection_dim = 8;
+    config
+}
+
+fn model_parameter_values(model: &LanguageTrainModel<TestBackend>) -> Vec<f32> {
+    #[derive(Default)]
+    struct ParameterCollector {
+        values: Vec<f32>,
+    }
+
+    impl burn::module::ModuleVisitor<TestBackend> for ParameterCollector {
+        fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<TestBackend, D>>) {
+            self.values.extend(
+                param
+                    .val()
+                    .to_data()
+                    .convert::<f32>()
+                    .into_vec::<f32>()
+                    .expect("parameter values"),
+            );
+        }
+    }
+
+    let mut collector = ParameterCollector::default();
+    model.visit(&mut collector);
+    collector.values
+}
+
+fn maximum_absolute_slice_difference(left: &[f32], right: &[f32]) -> f32 {
+    assert_eq!(left.len(), right.len());
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| (left - right).abs())
+        .fold(0.0, f32::max)
+}
+
+#[derive(Debug)]
+struct GradientComparison {
+    cosine: f64,
+    norm_ratio: f64,
+    relative_l2_error: f64,
+    parameter_tensors: usize,
+    presence_mismatches: usize,
+    presence_mismatch_ids: Vec<String>,
+}
+
+fn compare_model_gradients(
+    model: &LanguageTrainModel<TestBackend>,
+    candidate: &GradientsParams,
+    reference: &GradientsParams,
+) -> GradientComparison {
+    #[derive(Default)]
+    struct ComparisonVisitor<'a> {
+        candidate: Option<&'a GradientsParams>,
+        reference: Option<&'a GradientsParams>,
+        dot: f64,
+        candidate_squared_norm: f64,
+        reference_squared_norm: f64,
+        squared_error: f64,
+        parameter_tensors: usize,
+        presence_mismatches: usize,
+        presence_mismatch_ids: Vec<String>,
+    }
+
+    impl burn::module::ModuleVisitor<TestBackend> for ComparisonVisitor<'_> {
+        fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<TestBackend, D>>) {
+            let candidate = self
+                .candidate
+                .expect("candidate gradients")
+                .get::<TestInnerBackend, D>(param.id);
+            let reference = self
+                .reference
+                .expect("reference gradients")
+                .get::<TestInnerBackend, D>(param.id);
+            self.parameter_tensors = self.parameter_tensors.saturating_add(1);
+            self.presence_mismatches = self
+                .presence_mismatches
+                .saturating_add(usize::from(candidate.is_some() != reference.is_some()));
+            if candidate.is_some() != reference.is_some() {
+                self.presence_mismatch_ids.push(format!(
+                    "{:?}:candidate={}:reference={}",
+                    param.id,
+                    candidate.is_some(),
+                    reference.is_some()
+                ));
+            }
+
+            let shape = param.val().shape();
+            let device = param.val().device();
+            let candidate = candidate.unwrap_or_else(|| Tensor::zeros(shape.clone(), &device));
+            let reference = reference.unwrap_or_else(|| Tensor::zeros(shape, &device));
+            let summary = Tensor::cat(
+                vec![
+                    (candidate.clone() * reference.clone()).sum().reshape([1]),
+                    candidate.clone().square().sum().reshape([1]),
+                    reference.clone().square().sum().reshape([1]),
+                    (candidate - reference).square().sum().reshape([1]),
+                ],
+                0,
+            )
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("gradient comparison summary");
+            self.dot += f64::from(summary[0]);
+            self.candidate_squared_norm += f64::from(summary[1]);
+            self.reference_squared_norm += f64::from(summary[2]);
+            self.squared_error += f64::from(summary[3]);
+        }
+    }
+
+    let mut visitor = ComparisonVisitor {
+        candidate: Some(candidate),
+        reference: Some(reference),
+        ..ComparisonVisitor::default()
+    };
+    model.visit(&mut visitor);
+    let candidate_norm = visitor.candidate_squared_norm.max(0.0).sqrt();
+    let reference_norm = visitor.reference_squared_norm.max(0.0).sqrt();
+    GradientComparison {
+        cosine: visitor.dot / (candidate_norm * reference_norm).max(1.0e-30),
+        norm_ratio: candidate_norm / reference_norm.max(1.0e-30),
+        relative_l2_error: visitor.squared_error.max(0.0).sqrt() / reference_norm.max(1.0e-30),
+        parameter_tensors: visitor.parameter_tensors,
+        presence_mismatches: visitor.presence_mismatches,
+        presence_mismatch_ids: visitor.presence_mismatch_ids,
+    }
+}
+
+fn recurrent_rho_values(state: &ModelState<TestBackend>) -> Vec<f32> {
+    let mut values = Vec::new();
+    for layer in &state.layers {
+        values.extend(
+            layer
+                .rho
+                .as_ref()
+                .expect("linear-attention rho")
+                .to_data()
+                .convert::<f32>()
+                .into_vec::<f32>()
+                .expect("rho values"),
+        );
+        if let Some(rho_norm) = layer.rho_norm.as_ref() {
+            values.extend(
+                rho_norm
+                    .to_data()
+                    .convert::<f32>()
+                    .into_vec::<f32>()
+                    .expect("rho norm values"),
+            );
+        }
+    }
+    values
+}
+
+#[test]
+fn context_only_stream_chunks_advance_state_without_weight_decay_updates() {
+    let device = burn::tensor::Device::<TestBackend>::default();
+    TestBackend::seed(&device, 20260811);
+    let base =
+        crate::train::test_support::deterministic_matrix_parameters(
+            DragonModel::<TestBackend>::new(scheduled_ruliad_model_config(), &device),
+        );
+
+    for algorithm in [
+        TrainingAlgorithm::Backpropagation,
+        TrainingAlgorithm::PredictiveCoding,
+    ] {
+        let mut model = LanguageTrainModel::new(base.clone())
+            .with_training_algorithm(algorithm)
+            .with_local_predictive_coding(LocalPredictiveCodingConfig {
+                solver: LocalPredictiveCodingSolver::FixedPrediction,
+                ..Default::default()
+            })
+            .with_tbptt_chunk_size(Some(8))
+            .with_tbptt_persist_across_steps(true);
+        let before = model_parameter_values(&model);
+        let batch = SequenceBatch::new(
+            Tensor::from_data(
+                TensorData::new(vec![1_i64, 2, 3, 4, 5, 6, 7, 8], [1, 8]),
+                &device,
+            ),
+            Tensor::from_data(
+                TensorData::new(vec![2_i64, 3, 4, 5, 6, 7, 8, 9], [1, 8]),
+                &device,
+            ),
+            None,
+        )
+        .with_loss_mask(Some(Tensor::zeros([1, 8], &device)))
+        .with_supervised_token_count(Some(0))
+        .with_reset_stream_state(true);
+        let output = burn_train::TrainStep::step(&model, batch);
+        assert!(
+            output.grads.is_empty(),
+            "{algorithm:?} must not expose zero-gradient parameter tensors"
+        );
+        assert_eq!(
+            model
+                .peek_step_state_for_test()
+                .expect("context carry state")
+                .position,
+            8
+        );
+        let mut optimizer = AdamWConfig::new()
+            .with_weight_decay(0.5)
+            .init::<TestBackend, LanguageTrainModel<TestBackend>>();
+        model = burn_train::TrainStep::optimize::<TestBackend, _>(
+            model,
+            &mut optimizer,
+            3.0e-4,
+            output.grads,
+        );
+        assert_eq!(
+            maximum_absolute_slice_difference(&before, &model_parameter_values(&model)),
+            0.0,
+            "{algorithm:?} context-only chunks must not decay trained parameters"
+        );
+    }
+}
+
+#[test]
+fn fixed_prediction_matches_stateful_production_objective_schedule() {
+    let device = burn::tensor::Device::<TestBackend>::default();
+    TestBackend::seed(&device, 20260808);
+    let base =
+        crate::train::test_support::deterministic_matrix_parameters(
+            DragonModel::<TestBackend>::new(scheduled_ruliad_model_config(), &device),
+        );
+    let make_model = |model, algorithm| {
+        LanguageTrainModel::new(model)
+            .with_training_algorithm(algorithm)
+            .with_local_predictive_coding(LocalPredictiveCodingConfig {
+                solver: LocalPredictiveCodingSolver::FixedPrediction,
+                terminal_criterion:
+                    crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSet,
+                factor_reduction: PredictiveCodingFactorReduction::Sum,
+                ..Default::default()
+            })
+            .with_ruliad_supervision(scheduled_ruliad_supervision())
+            .with_tbptt_chunk_size(Some(16))
+            .with_tbptt_persist_across_steps(true)
+            .with_stochastic_seed(20260808)
+    };
+    let mut backprop = make_model(base.clone(), TrainingAlgorithm::Backpropagation);
+    let mut fixed = make_model(base, TrainingAlgorithm::PredictiveCoding);
+    let fixed_profile = fixed.local_predictive_coding_profile();
+    let mut backprop_optimizer =
+        AdamWConfig::new().init::<TestBackend, LanguageTrainModel<TestBackend>>();
+    let mut fixed_optimizer =
+        AdamWConfig::new().init::<TestBackend, LanguageTrainModel<TestBackend>>();
+    let policy_batch = Arc::new(scheduled_ruliad_policy_batch());
+    let learning_rate = 3.0e-4;
+    let block_size = 128;
+
+    for step_index in 0..8 {
+        let values = (0..block_size)
+            .map(|index| ((index * 17 + step_index * 29) % 270 + 1) as i64)
+            .collect::<Vec<_>>();
+        let targets = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| ((value + index as i64 + 1) % 270) + 1)
+            .collect::<Vec<_>>();
+        let make_batch = || {
+            let context_only = step_index == 4;
+            let batch = SequenceBatch::new(
+                Tensor::from_data(TensorData::new(values.clone(), [1, block_size]), &device),
+                Tensor::from_data(TensorData::new(targets.clone(), [1, block_size]), &device),
+                None,
+            )
+            .with_ruliad_policy_batch(Some(policy_batch.clone()))
+            .with_absolute_step(step_index)
+            .with_reset_stream_state(step_index == 0);
+            if context_only {
+                batch
+                    .with_loss_mask(Some(Tensor::zeros([1, block_size], &device)))
+                    .with_supervised_token_count(Some(0))
+            } else {
+                batch
+            }
+        };
+
+        let backprop_output = burn_train::TrainStep::step(&backprop, make_batch());
+        let fixed_output = burn_train::TrainStep::step(&fixed, make_batch());
+        let backprop_loss = scalar_loss(TrainOutput {
+            grads: GradientsParams::new(),
+            item: backprop_output.item,
+        });
+        let fixed_loss = scalar_loss(TrainOutput {
+            grads: GradientsParams::new(),
+            item: fixed_output.item,
+        });
+        assert!(
+            (backprop_loss - fixed_loss).abs() < 2.0e-5,
+            "objective loss diverged at schedule step {step_index}: backprop={backprop_loss} fixed={fixed_loss}"
+        );
+
+        backprop = burn_train::TrainStep::optimize::<TestBackend, _>(
+            backprop,
+            &mut backprop_optimizer,
+            learning_rate,
+            backprop_output.grads,
+        );
+        fixed = burn_train::TrainStep::optimize::<TestBackend, _>(
+            fixed,
+            &mut fixed_optimizer,
+            learning_rate,
+            fixed_output.grads,
+        );
+
+        let parameter_difference = maximum_absolute_slice_difference(
+            &model_parameter_values(&backprop),
+            &model_parameter_values(&fixed),
+        );
+        assert!(
+            parameter_difference < 3.0e-4,
+            "parameter trajectory diverged at schedule step {step_index}: max_abs={parameter_difference}"
+        );
+        let backprop_state = backprop
+            .peek_step_state_for_test()
+            .expect("backprop persistent state");
+        let fixed_state = fixed
+            .peek_step_state_for_test()
+            .expect("fixed-prediction persistent state");
+        assert_eq!(backprop_state.position, fixed_state.position);
+        let rho_difference = maximum_absolute_slice_difference(
+            &recurrent_rho_values(&backprop_state),
+            &recurrent_rho_values(&fixed_state),
+        );
+        assert!(
+            rho_difference < 3.0e-4,
+            "recurrent trajectory diverged at schedule step {step_index}: max_abs={rho_difference}"
+        );
+    }
+
+    let snapshot = fixed_profile.snapshot();
+    assert_eq!(snapshot.global_backward_calls, 0, "snapshot={snapshot:?}");
+    assert_eq!(snapshot.structured_terminal_steps, 2);
+    assert_eq!(backprop.gradient_scale_step_index(), 7);
+    assert_eq!(fixed.gradient_scale_step_index(), 7);
+}
+
+#[test]
+fn residual_decoder_calibration_reaches_the_production_verifier_objective() {
+    let device = burn::tensor::Device::<TestBackend>::default();
+    TestBackend::seed(&device, 20260811);
+    let telemetry_dir = tempfile::tempdir().expect("telemetry dir");
+    let telemetry_path = telemetry_dir.path().join("policy.jsonl");
+    let mut supervision = scheduled_ruliad_supervision();
+    supervision.prompt_value_binding.enabled = false;
+    supervision.proof_policy.mode =
+        crate::config::RuliadProofPolicyTrainingMode::StaticThenPairedDagger;
+    supervision.proof_policy.scoring = crate::config::RuliadProofPolicyScoring::ResidualEnergy;
+    supervision.proof_policy.decoder_calibration_steps = 4;
+    supervision.proof_policy.target =
+        crate::config::RuliadProofPolicyTarget::VerifiedProgressDistribution;
+    supervision.proof_policy.gradient_scope =
+        crate::config::RuliadProofPolicyGradientScope::FullModel;
+    supervision.proof_policy.normalization =
+        crate::config::RuliadProofPolicyNormalization::CandidateConditional;
+    supervision.proof_policy.dagger_start_after_steps = 4;
+    let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+        scheduled_score_head_ruliad_model_config(),
+        &device,
+    ))
+    .with_ruliad_supervision(supervision)
+    .with_ruliad_proof_policy_telemetry_path(Some(telemetry_path.clone()))
+    .with_stochastic_seed(20260811);
+    let policy_batch = scheduled_ruliad_policy_batch();
+
+    for step_index in [0, 4] {
+        let objective = model
+            .ruliad_proof_policy_objective_at_step(&policy_batch, &device, 128, step_index)
+            .unwrap_or_else(|| panic!("scheduled objective at step {step_index}"));
+        assert!(tensor_scalar(objective.loss).is_finite());
+    }
+
+    let events = std::fs::read_to_string(telemetry_path)
+        .expect("policy telemetry")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("telemetry json"))
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 2, "events={events:#?}");
+    assert_eq!(events[0]["step_index"], 0);
+    assert_eq!(events[0]["objective"], "vocabulary_marginal_equivalent_v1");
+    assert_eq!(events[0]["target"], "expert_set");
+    assert_eq!(events[0]["mode"], "static_expert");
+    assert_eq!(events[1]["step_index"], 4);
+    assert_eq!(
+        events[1]["objective"],
+        "autoregressive_residual_energy_counterfactual_v1"
+    );
+    assert_eq!(events[1]["target"], "verified_progress_distribution");
+    assert_eq!(events[1]["mode"], "paired_dagger");
+}
+
+#[test]
+fn factorized_joint_materializes_both_normalized_training_factors() {
+    let device = burn::tensor::Device::<TestBackend>::default();
+    TestBackend::seed(&device, 20260812);
+    let telemetry_dir = tempfile::tempdir().expect("telemetry dir");
+    let telemetry_path = telemetry_dir.path().join("policy.jsonl");
+    let mut supervision = scheduled_score_head_ruliad_supervision(
+        crate::config::RuliadProofPolicyScoring::ResidualEnergy,
+        crate::config::RuliadProofPolicyTarget::ExpertSet,
+    );
+    supervision.proof_policy.counterfactual_objective =
+        crate::config::RuliadProofPolicyCounterfactualObjective::FactorizedJoint;
+    supervision.proof_policy.every_steps = 4;
+    let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+        scheduled_score_head_ruliad_model_config(),
+        &device,
+    ))
+    .with_ruliad_supervision(supervision)
+    .with_ruliad_proof_policy_telemetry_path(Some(telemetry_path.clone()))
+    .with_stochastic_seed(20260812);
+    let policy_batch = scheduled_ruliad_policy_batch();
+
+    for step_index in [0, 4] {
+        let objective = model
+            .ruliad_proof_policy_objective_at_step(&policy_batch, &device, 128, step_index)
+            .unwrap_or_else(|| panic!("scheduled objective at step {step_index}"));
+        assert!(tensor_scalar(objective.loss).is_finite());
+    }
+
+    let events = std::fs::read_to_string(telemetry_path)
+        .expect("policy telemetry")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("telemetry json"))
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 2, "events={events:#?}");
+    assert_eq!(events[0]["step_index"], 0);
+    assert_eq!(events[0]["objective"], "vocabulary_marginal_equivalent_v1");
+    assert_eq!(events[0]["gradient_scope"], "full_model");
+    assert_eq!(events[1]["step_index"], 4);
+    assert_eq!(
+        events[1]["objective"],
+        "residual_energy_target_group_conditional_v1"
+    );
+    assert_eq!(events[1]["gradient_scope"], "score_head_only");
+    assert_eq!(events[1]["target_group_conditional_groups"], 1);
+}
+
+#[test]
+fn static_residual_policy_panel_identity_matches_global_and_local_pc_builders() {
+    let device = burn::tensor::Device::<TestBackend>::default();
+    let telemetry_dir = tempfile::tempdir().expect("telemetry dir");
+    let telemetry_path = telemetry_dir.path().join("policy.jsonl");
+    let mut supervision = scheduled_score_head_ruliad_supervision(
+        crate::config::RuliadProofPolicyScoring::ResidualEnergy,
+        crate::config::RuliadProofPolicyTarget::ExpertSet,
+    );
+    supervision.proof_policy.mode = crate::config::RuliadProofPolicyTrainingMode::StaticExpert;
+    supervision.proof_policy.counterfactual_objective =
+        crate::config::RuliadProofPolicyCounterfactualObjective::Independent;
+    supervision.proof_policy.max_rows_per_update = 2;
+    supervision.proof_policy.max_presentation_rows_per_update = 8;
+    let policy = supervision.proof_policy;
+    let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+        scheduled_score_head_ruliad_model_config(),
+        &device,
+    ))
+    .with_ruliad_supervision(supervision)
+    .with_ruliad_proof_policy_telemetry_path(Some(telemetry_path.clone()));
+    let policy_batch = scheduled_ruliad_policy_batch();
+
+    let objective = model
+        .ruliad_proof_policy_objective_at_step(&policy_batch, &device, 128, 0)
+        .expect("global residual policy objective");
+    assert!(tensor_scalar(objective.loss).is_finite());
+    let event: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(telemetry_path)
+            .expect("global policy telemetry")
+            .lines()
+            .next()
+            .expect("global policy event"),
+    )
+    .expect("global policy telemetry JSON");
+    let global_fingerprint = event["objective_panel_fingerprint"]
+        .as_u64()
+        .expect("global objective-panel fingerprint");
+    let local = crate::train::local_predictive_coding::prepare_ruliad_verifier_terminal::<
+        TestInnerBackend,
+    >(&policy_batch, policy, 128, 272, &device)
+    .expect("local-PC residual policy objective");
+
+    assert_ne!(global_fingerprint, 0);
+    assert_eq!(global_fingerprint, local.stats.objective_panel_fingerprint);
+}
+
+#[test]
+fn static_residual_policy_gradients_match_global_and_local_pc_builders() {
+    let device = burn::tensor::Device::<TestBackend>::default();
+    TestBackend::seed(&device, 20260812);
+    let mut supervision = scheduled_score_head_ruliad_supervision(
+        crate::config::RuliadProofPolicyScoring::ResidualEnergy,
+        crate::config::RuliadProofPolicyTarget::ExpertSet,
+    );
+    supervision.proof_policy.mode = crate::config::RuliadProofPolicyTrainingMode::StaticExpert;
+    supervision.proof_policy.gradient_scope =
+        crate::config::RuliadProofPolicyGradientScope::PolicyPath;
+    supervision.proof_policy.counterfactual_objective =
+        crate::config::RuliadProofPolicyCounterfactualObjective::Independent;
+    let policy = supervision.proof_policy;
+    let model =
+        LanguageTrainModel::new(crate::train::test_support::deterministic_matrix_parameters(
+            DragonModel::<TestBackend>::new(scheduled_score_head_ruliad_model_config(), &device),
+        ))
+        .with_ruliad_supervision(supervision);
+    let policy_batch = scheduled_ruliad_policy_batch();
+
+    let global = model
+        .ruliad_proof_policy_objective_at_step(&policy_batch, &device, 128, 0)
+        .expect("global residual policy objective");
+    let global_loss = tensor_scalar(global.loss.clone());
+    let global_grads = GradientsParams::from_grads(global.loss.backward(), &model);
+    let prepared = crate::train::local_predictive_coding::prepare_ruliad_verifier_terminal::<
+        TestInnerBackend,
+    >(&policy_batch, policy, 128, 272, &device)
+    .expect("local-PC residual policy objective");
+    let mut local =
+        crate::train::local_predictive_coding::local_predictive_coding_verifier_train_step(
+            &model.model,
+            prepared,
+            &crate::config::LocalPredictiveCodingConfig {
+                solver: crate::config::LocalPredictiveCodingSolver::FixedPrediction,
+                terminal_criterion:
+                    crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSet,
+                factor_reduction: crate::config::PredictiveCodingFactorReduction::Sum,
+                ..Default::default()
+            },
+            &crate::train::local_predictive_coding::LocalPredictiveCodingProfile::default(),
+        );
+    let local_loss = tensor_scalar(local.loss);
+    for parameter_id in model
+        .model
+        .predictive_coding_structurally_inactive_parameter_ids()
+        .expect("validated predictive-coding model")
+    {
+        let _ = local.grads.remove::<TestInnerBackend, 1>(parameter_id);
+    }
+    let comparison = compare_model_gradients(&model, &local.grads, &global_grads);
+
+    assert!(
+        (local_loss - global_loss).abs() < 2.0e-6,
+        "local={local_loss} global={global_loss}"
+    );
+    assert_eq!(local.report.global_backward_calls, 0);
+    assert_eq!(comparison.presence_mismatches, 0, "{comparison:?}");
+    assert!(comparison.cosine > 0.999_98, "{comparison:?}");
+    assert!(
+        (comparison.norm_ratio - 1.0).abs() < 5.0e-4,
+        "{comparison:?}"
+    );
+    assert!(comparison.relative_l2_error < 5.0e-4, "{comparison:?}");
+}
+
+#[test]
+fn exact_temporal_fixed_prediction_matches_persistent_joint_language_and_verifier_updates() {
+    let device = burn::tensor::Device::<TestBackend>::default();
+    TestBackend::seed(&device, 20260809);
+    let base =
+        crate::train::test_support::deterministic_matrix_parameters(
+            DragonModel::<TestBackend>::new(scheduled_ruliad_model_config(), &device),
+        );
+    let mut supervision = scheduled_ruliad_supervision();
+    supervision.prompt_value_binding.enabled = false;
+    let make_model = |model, algorithm| {
+        let exact_temporal_credit = matches!(algorithm, TrainingAlgorithm::PredictiveCoding);
+        LanguageTrainModel::new(model)
+            .with_training_algorithm(algorithm)
+            .with_local_predictive_coding(LocalPredictiveCodingConfig {
+                solver: LocalPredictiveCodingSolver::FixedPrediction,
+                terminal_criterion:
+                    crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSetJoint,
+                factor_reduction: PredictiveCodingFactorReduction::Sum,
+                temporal_credit: if exact_temporal_credit {
+                    burn_pc::PcTemporalCreditConfig {
+                        mode: burn_pc::PcTemporalCreditMode::ExactWindow,
+                        window_chunks: 2,
+                    }
+                } else {
+                    burn_pc::PcTemporalCreditConfig::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_supervision(supervision)
+            .with_tbptt_chunk_size(Some(if exact_temporal_credit { 64 } else { 128 }))
+            .with_tbptt_persist_across_steps(true)
+            .with_stochastic_seed(20260809)
+    };
+    let mut backprop = make_model(base.clone(), TrainingAlgorithm::Backpropagation);
+    let mut fixed = make_model(base, TrainingAlgorithm::PredictiveCoding);
+    let fixed_profile = fixed.local_predictive_coding_profile();
+    let mut backprop_optimizer =
+        AdamWConfig::new().init::<TestBackend, LanguageTrainModel<TestBackend>>();
+    let mut fixed_optimizer =
+        AdamWConfig::new().init::<TestBackend, LanguageTrainModel<TestBackend>>();
+    let policy_batch = Arc::new(scheduled_ruliad_policy_batch());
+    let block_size = 128;
+
+    for step_index in 0..8 {
+        let values = (0..block_size)
+            .map(|index| ((index * 19 + step_index * 31) % 270 + 1) as i64)
+            .collect::<Vec<_>>();
+        let targets = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| ((value + index as i64 + 3) % 270) + 1)
+            .collect::<Vec<_>>();
+        let make_batch = || {
+            SequenceBatch::new(
+                Tensor::from_data(TensorData::new(values.clone(), [1, block_size]), &device),
+                Tensor::from_data(TensorData::new(targets.clone(), [1, block_size]), &device),
+                None,
+            )
+            .with_ruliad_policy_batch(Some(policy_batch.clone()))
+            .with_absolute_step(step_index)
+            .with_reset_stream_state(step_index == 0)
+        };
+
+        let backprop_output = burn_train::TrainStep::step(&backprop, make_batch());
+        let fixed_output = burn_train::TrainStep::step(&fixed, make_batch());
+        let backprop_loss = scalar_loss(TrainOutput {
+            grads: GradientsParams::new(),
+            item: backprop_output.item,
+        });
+        let fixed_loss = scalar_loss(TrainOutput {
+            grads: GradientsParams::new(),
+            item: fixed_output.item,
+        });
+        assert!(
+            (backprop_loss - fixed_loss).abs() < 2.0e-5,
+            "joint objective loss diverged at step {step_index}: backprop={backprop_loss} fixed={fixed_loss}"
+        );
+
+        backprop = burn_train::TrainStep::optimize::<TestBackend, _>(
+            backprop,
+            &mut backprop_optimizer,
+            3.0e-4,
+            backprop_output.grads,
+        );
+        fixed = burn_train::TrainStep::optimize::<TestBackend, _>(
+            fixed,
+            &mut fixed_optimizer,
+            3.0e-4,
+            fixed_output.grads,
+        );
+        let parameter_difference = maximum_absolute_slice_difference(
+            &model_parameter_values(&backprop),
+            &model_parameter_values(&fixed),
+        );
+        assert!(
+            parameter_difference < 3.0e-4,
+            "joint parameter trajectory diverged at step {step_index}: max_abs={parameter_difference}"
+        );
+        let backprop_state = backprop
+            .peek_step_state_for_test()
+            .expect("joint backprop persistent state");
+        let fixed_state = fixed
+            .peek_step_state_for_test()
+            .expect("joint fixed-prediction persistent state");
+        assert_eq!(backprop_state.position, (step_index + 1) * block_size);
+        assert_eq!(backprop_state.position, fixed_state.position);
+        let rho_difference = maximum_absolute_slice_difference(
+            &recurrent_rho_values(&backprop_state),
+            &recurrent_rho_values(&fixed_state),
+        );
+        assert!(
+            rho_difference < 3.0e-4,
+            "joint recurrent trajectory diverged at step {step_index}: max_abs={rho_difference}"
+        );
+    }
+
+    let snapshot = fixed_profile.snapshot();
+    assert_eq!(snapshot.global_backward_calls, 0, "snapshot={snapshot:?}");
+    assert_eq!(snapshot.structured_terminal_steps, 2);
+    assert_eq!(snapshot.optimizer_updates, 8);
+}
+
+#[test]
+fn exact_temporal_full_model_residual_verifier_matches_joint_backprop_gradients() {
+    assert_exact_temporal_residual_verifier_matches_joint_backprop_gradients(
+        crate::config::RuliadProofPolicyGradientScope::FullModel,
+    );
+}
+
+#[test]
+fn exact_temporal_policy_path_residual_verifier_matches_joint_backprop_gradients() {
+    assert_exact_temporal_residual_verifier_matches_joint_backprop_gradients(
+        crate::config::RuliadProofPolicyGradientScope::PolicyPath,
+    );
+}
+
+fn assert_exact_temporal_residual_verifier_matches_joint_backprop_gradients(
+    gradient_scope: crate::config::RuliadProofPolicyGradientScope,
+) {
+    let device = burn::tensor::Device::<TestBackend>::default();
+    TestBackend::seed(&device, 20260812);
+    let base =
+        crate::train::test_support::deterministic_matrix_parameters(
+            DragonModel::<TestBackend>::new(scheduled_score_head_ruliad_model_config(), &device),
+        );
+    let mut supervision = scheduled_score_head_ruliad_supervision(
+        crate::config::RuliadProofPolicyScoring::ResidualEnergy,
+        crate::config::RuliadProofPolicyTarget::VerifiedProgressDistribution,
+    );
+    supervision.proof_policy.gradient_scope = gradient_scope;
+    supervision.proof_policy.every_steps = 1;
+    let make_model = |model, algorithm| {
+        let exact_temporal_credit = matches!(algorithm, TrainingAlgorithm::PredictiveCoding);
+        LanguageTrainModel::new(model)
+            .with_training_algorithm(algorithm)
+            .with_local_predictive_coding(LocalPredictiveCodingConfig {
+                solver: LocalPredictiveCodingSolver::FixedPrediction,
+                terminal_criterion:
+                    crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSetJoint,
+                factor_reduction: PredictiveCodingFactorReduction::Sum,
+                temporal_credit: if exact_temporal_credit {
+                    burn_pc::PcTemporalCreditConfig {
+                        mode: burn_pc::PcTemporalCreditMode::ExactWindow,
+                        window_chunks: 8,
+                    }
+                } else {
+                    burn_pc::PcTemporalCreditConfig::default()
+                },
+                ..Default::default()
+            })
+            .with_ruliad_supervision(supervision)
+            .with_tbptt_chunk_size(Some(if exact_temporal_credit { 16 } else { 128 }))
+            .with_tbptt_persist_across_steps(true)
+            .with_stochastic_seed(20260812)
+    };
+    let mut backprop = make_model(base.clone(), TrainingAlgorithm::Backpropagation);
+    let mut fixed = make_model(base, TrainingAlgorithm::PredictiveCoding);
+    let policy_batch = Arc::new(scheduled_ruliad_policy_batch());
+    let block_size = 128;
+    let values = (0..block_size)
+        .map(|index| ((index * 23 + 17) % 270 + 1) as i64)
+        .collect::<Vec<_>>();
+    let targets = values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| ((value + index as i64 + 5) % 270) + 1)
+        .collect::<Vec<_>>();
+    let mask = (0..block_size)
+        .map(|index| i64::from(index % 7 != 2 && index % 11 != 5))
+        .collect::<Vec<_>>();
+    let supervised_tokens = mask.iter().filter(|value| **value != 0).count();
+    let make_batch = || {
+        SequenceBatch::new(
+            Tensor::from_data(TensorData::new(values.clone(), [1, block_size]), &device),
+            Tensor::from_data(TensorData::new(targets.clone(), [1, block_size]), &device),
+            None,
+        )
+        .with_loss_mask(Some(Tensor::from_data(
+            TensorData::new(mask.clone(), [1, block_size]),
+            &device,
+        )))
+        .with_supervised_token_count(Some(supervised_tokens))
+        .with_ruliad_policy_batch(Some(policy_batch.clone()))
+        .with_absolute_step(0)
+        .with_reset_stream_state(true)
+    };
+
+    let reference = burn_train::TrainStep::step(&backprop, make_batch());
+    let candidate = burn_train::TrainStep::step(&fixed, make_batch());
+    let reference_loss = scalar_loss(TrainOutput {
+        grads: GradientsParams::new(),
+        item: reference.item,
+    });
+    let candidate_loss = scalar_loss(TrainOutput {
+        grads: GradientsParams::new(),
+        item: candidate.item,
+    });
+    assert!(
+        (reference_loss - candidate_loss).abs() < 2.0e-5,
+        "{gradient_scope:?} residual-energy loss mismatch: reference={reference_loss} candidate={candidate_loss}"
+    );
+
+    let fidelity = compare_model_gradients(&fixed, &candidate.grads, &reference.grads);
+    let parameter_ids = fixed
+        .model
+        .predictive_coding_parameter_ids()
+        .expect("production PC parameter ids");
+    assert_eq!(
+        fidelity.presence_mismatches, 0,
+        "{fidelity:?} ids={parameter_ids:?}"
+    );
+    assert!(fidelity.parameter_tensors >= 15, "{fidelity:?}");
+    assert!(fidelity.cosine > 0.999_8, "{fidelity:?}");
+    assert!((fidelity.norm_ratio - 1.0).abs() < 5.0e-4, "{fidelity:?}");
+    assert!(fidelity.relative_l2_error < 5.0e-4, "{fidelity:?}");
+    let mut backprop_optimizer =
+        AdamWConfig::new().init::<TestBackend, LanguageTrainModel<TestBackend>>();
+    let mut fixed_optimizer =
+        AdamWConfig::new().init::<TestBackend, LanguageTrainModel<TestBackend>>();
+    backprop = burn_train::TrainStep::optimize::<TestBackend, _>(
+        backprop,
+        &mut backprop_optimizer,
+        3.0e-4,
+        reference.grads,
+    );
+    fixed = burn_train::TrainStep::optimize::<TestBackend, _>(
+        fixed,
+        &mut fixed_optimizer,
+        3.0e-4,
+        candidate.grads,
+    );
+    let parameter_difference = maximum_absolute_slice_difference(
+        &model_parameter_values(&backprop),
+        &model_parameter_values(&fixed),
+    );
+    assert!(
+        parameter_difference < 2.0e-6,
+        "{gradient_scope:?} residual-energy AdamW update mismatch: max_abs={parameter_difference}"
+    );
+    let profile = fixed.local_predictive_coding_profile().snapshot();
+    assert_eq!(profile.global_backward_calls, 0, "{profile:?}");
+    assert_eq!(profile.temporal_state_vjp_calls, 14, "{profile:?}");
+    assert_eq!(profile.structured_terminal_steps, 1, "{profile:?}");
+}
+
+fn assert_fixed_prediction_matches_joint_score_head_trajectory(
+    scoring: crate::config::RuliadProofPolicyScoring,
+    target: crate::config::RuliadProofPolicyTarget,
+) {
+    let device = burn::tensor::Device::<TestBackend>::default();
+    TestBackend::seed(&device, 20260811);
+    let base =
+        crate::train::test_support::deterministic_matrix_parameters(
+            DragonModel::<TestBackend>::new(scheduled_score_head_ruliad_model_config(), &device),
+        );
+    let make_model = |model, algorithm| {
+        LanguageTrainModel::new(model)
+            .with_training_algorithm(algorithm)
+            .with_local_predictive_coding(LocalPredictiveCodingConfig {
+                solver: LocalPredictiveCodingSolver::FixedPrediction,
+                terminal_criterion:
+                    crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSetJoint,
+                factor_reduction: PredictiveCodingFactorReduction::Sum,
+                ..Default::default()
+            })
+            .with_ruliad_supervision(scheduled_score_head_ruliad_supervision(scoring, target))
+            .with_tbptt_chunk_size(Some(128))
+            .with_stochastic_seed(20260811)
+    };
+    let mut backprop = make_model(base.clone(), TrainingAlgorithm::Backpropagation);
+    let mut fixed = make_model(base, TrainingAlgorithm::PredictiveCoding);
+    let fixed_profile = fixed.local_predictive_coding_profile();
+    let mut backprop_optimizer =
+        AdamWConfig::new().init::<TestBackend, LanguageTrainModel<TestBackend>>();
+    let mut fixed_optimizer =
+        AdamWConfig::new().init::<TestBackend, LanguageTrainModel<TestBackend>>();
+    let policy_batch = Arc::new(scheduled_ruliad_policy_batch());
+    let block_size = 128;
+    let updates = 32;
+
+    for step_index in 0..updates {
+        let values = (0..block_size)
+            .map(|index| ((index * 23 + step_index * 37) % 270 + 1) as i64)
+            .collect::<Vec<_>>();
+        let targets = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| ((value + index as i64 + 5) % 270) + 1)
+            .collect::<Vec<_>>();
+        let make_batch = || {
+            SequenceBatch::new(
+                Tensor::from_data(TensorData::new(values.clone(), [1, block_size]), &device),
+                Tensor::from_data(TensorData::new(targets.clone(), [1, block_size]), &device),
+                None,
+            )
+            .with_ruliad_policy_batch(Some(policy_batch.clone()))
+            .with_absolute_step(step_index)
+            .with_reset_stream_state(true)
+        };
+
+        let backprop_output = burn_train::TrainStep::step(&backprop, make_batch());
+        let fixed_output = burn_train::TrainStep::step(&fixed, make_batch());
+        let backprop_loss = scalar_loss(TrainOutput {
+            grads: GradientsParams::new(),
+            item: backprop_output.item,
+        });
+        let fixed_loss = scalar_loss(TrainOutput {
+            grads: GradientsParams::new(),
+            item: fixed_output.item,
+        });
+        assert!(
+            (backprop_loss - fixed_loss).abs() < 2.0e-5,
+            "joint {scoring:?}/{target:?} loss diverged at step {step_index}: backprop={backprop_loss} fixed={fixed_loss}"
+        );
+
+        backprop = burn_train::TrainStep::optimize::<TestBackend, _>(
+            backprop,
+            &mut backprop_optimizer,
+            3.0e-4,
+            backprop_output.grads,
+        );
+        fixed = burn_train::TrainStep::optimize::<TestBackend, _>(
+            fixed,
+            &mut fixed_optimizer,
+            3.0e-4,
+            fixed_output.grads,
+        );
+        let parameter_difference = maximum_absolute_slice_difference(
+            &model_parameter_values(&backprop),
+            &model_parameter_values(&fixed),
+        );
+        assert!(
+            parameter_difference < 5.0e-6,
+            "joint {scoring:?}/{target:?} parameter trajectory diverged at step {step_index}: max_abs={parameter_difference}"
+        );
+    }
+
+    let snapshot = fixed_profile.snapshot();
+    assert_eq!(snapshot.global_backward_calls, 0, "snapshot={snapshot:?}");
+    assert_eq!(snapshot.structured_terminal_steps, 8);
+    assert_eq!(snapshot.optimizer_updates, updates as u64);
+}
+
+#[test]
+fn fixed_prediction_matches_joint_semantic_score_head_trajectory() {
+    assert_fixed_prediction_matches_joint_score_head_trajectory(
+        crate::config::RuliadProofPolicyScoring::SemanticEnergy,
+        crate::config::RuliadProofPolicyTarget::ExpertSet,
+    );
+}
+
+#[test]
+fn fixed_prediction_matches_joint_residual_score_head_trajectory() {
+    assert_fixed_prediction_matches_joint_score_head_trajectory(
+        crate::config::RuliadProofPolicyScoring::ResidualEnergy,
+        crate::config::RuliadProofPolicyTarget::ExpertSet,
+    );
+}
+
+#[test]
+fn fixed_prediction_matches_joint_verified_progress_trajectory() {
+    assert_fixed_prediction_matches_joint_score_head_trajectory(
+        crate::config::RuliadProofPolicyScoring::ResidualEnergy,
+        crate::config::RuliadProofPolicyTarget::VerifiedProgressDistribution,
+    );
 }
 
 #[test]
@@ -3788,13 +5024,17 @@ fn prompt_value_binding_primary_step_uses_local_pc_without_global_backward() {
     let event: serde_json::Value =
         serde_json::from_str(line.lines().next().expect("telemetry line")).expect("json");
     assert_eq!(event["algorithm"], "predictive_coding");
+    assert_eq!(event["prompt_context"], "dataset_prompt");
+    assert_eq!(event["objective"], "schema_values");
     assert_eq!(event["global_backward_calls"], 0);
     assert_eq!(event["rows"], 4);
     assert!(event["active_tokens"].as_u64().unwrap_or_default() > 0);
 }
 
-#[test]
-fn prompt_value_binding_fixed_prediction_matches_global_backpropagation() {
+fn assert_prompt_value_binding_fixed_prediction_matches_global_backpropagation(
+    objective: crate::config::RuliadPromptValueBindingObjective,
+    expected_rows: usize,
+) {
     let device = burn::tensor::Device::<TestBackend>::default();
     TestBackend::seed(&device, 43);
     let model =
@@ -3806,6 +5046,7 @@ fn prompt_value_binding_fixed_prediction_matches_global_backpropagation() {
             mode: RuliadSupervisionMode::AnswerCompletion,
             prompt_value_binding: crate::config::RuliadPromptValueBindingConfig {
                 enabled: true,
+                objective,
                 every_steps: 2,
                 phase_steps: 1,
                 max_rows_per_step: 8,
@@ -3815,9 +5056,9 @@ fn prompt_value_binding_fixed_prediction_matches_global_backpropagation() {
         });
     let batch = prompt_value_binding_policy_batch();
     let prepared = learner
-        .prepare_ruliad_prompt_value_binding_batch(&batch, &device, 96)
+        .prepare_ruliad_prompt_value_binding_batch(&batch, &device, 96, 0)
         .expect("prompt-value binding batch");
-    assert_eq!(prepared.rows, 4);
+    assert_eq!(prepared.rows, expected_rows);
     assert!(prepared.active_tokens > 0);
 
     let report = crate::train::local_predictive_coding::local_predictive_coding_gradient_fidelity(
@@ -3846,6 +5087,131 @@ fn prompt_value_binding_fixed_prediction_matches_global_backpropagation() {
             .is_some_and(|error| error < 1.0e-4),
         "{report:?}"
     );
+}
+
+#[test]
+fn prompt_value_binding_fixed_prediction_matches_global_backpropagation() {
+    assert_prompt_value_binding_fixed_prediction_matches_global_backpropagation(
+        crate::config::RuliadPromptValueBindingObjective::SchemaValues,
+        4,
+    );
+}
+
+#[test]
+fn prompt_full_completion_fixed_prediction_matches_global_backpropagation() {
+    assert_prompt_value_binding_fixed_prediction_matches_global_backpropagation(
+        crate::config::RuliadPromptValueBindingObjective::FullCompletion,
+        1,
+    );
+}
+
+#[test]
+fn prompt_value_binding_can_share_the_exact_proof_policy_context() {
+    let device = burn::tensor::Device::<TestBackend>::default();
+    let batch = scheduled_ruliad_policy_batch();
+    let tokenizer = burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+        &batch.tokenization,
+    )
+    .expect("tokenizer");
+    let mut supervision = scheduled_ruliad_supervision();
+    supervision.prompt_value_binding.context =
+        crate::config::RuliadPromptValueBindingContext::ProofPolicy;
+    supervision.proof_policy.prompt_context =
+        crate::config::RuliadProofPolicyPromptContext::LocalActionState;
+    let learner = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+        prompt_value_binding_model_config(),
+        &device,
+    ))
+    .with_ruliad_supervision(supervision);
+
+    let (prompt_tokens, answer) = learner
+        .ruliad_prompt_value_binding_target(&batch.samples[0], &tokenizer, 1)
+        .expect("proof-policy binding target");
+    let prompt = tokenizer.decode_payload(
+        &prompt_tokens
+            .iter()
+            .map(|token| u32::try_from(*token).expect("token id"))
+            .collect::<Vec<_>>(),
+        true,
+    );
+    assert!(prompt.ends_with("\n!:"), "{prompt}");
+    assert!(!prompt.contains("[R3 "), "{prompt}");
+    assert!(
+        burn_dragon_universality::ruliad::wire::decode_model_proof_step(&answer).is_some(),
+        "{answer}"
+    );
+
+    let prepared = learner
+        .prepare_ruliad_prompt_value_binding_batch(&batch, &device, 256, 1)
+        .expect("proof-policy prompt-value rows");
+    assert_eq!(prepared.rows, 4);
+    assert!(prepared.active_tokens > 0);
+}
+
+#[test]
+fn proof_policy_prompt_binding_can_supervise_the_complete_deployed_action() {
+    let device = burn::tensor::Device::<TestBackend>::default();
+    let batch = scheduled_ruliad_policy_batch();
+    let tokenizer = burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(
+        &batch.tokenization,
+    )
+    .expect("tokenizer");
+    let mut supervision = scheduled_ruliad_supervision();
+    supervision.prompt_value_binding.context =
+        crate::config::RuliadPromptValueBindingContext::ProofPolicy;
+    supervision.prompt_value_binding.objective =
+        crate::config::RuliadPromptValueBindingObjective::FullCompletion;
+    supervision.proof_policy.prompt_context =
+        crate::config::RuliadProofPolicyPromptContext::LocalActionState;
+    supervision.proof_policy.scoring = crate::config::RuliadProofPolicyScoring::ResidualEnergy;
+    supervision.proof_policy.gradient_scope =
+        crate::config::RuliadProofPolicyGradientScope::PolicyPath;
+    let learner = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+        prompt_value_binding_model_config(),
+        &device,
+    ))
+    .with_ruliad_supervision(supervision);
+
+    let (prompt_tokens, answer) = learner
+        .ruliad_prompt_value_binding_target(&batch.samples[0], &tokenizer, 1)
+        .expect("proof-policy binding target");
+    let (_, answer_later) = learner
+        .ruliad_prompt_value_binding_target(&batch.samples[0], &tokenizer, 4)
+        .expect("phase-independent deployed binding target");
+    assert_eq!(answer, answer_later);
+    let row = LanguageTrainModel::<TestBackend>::ruliad_prompt_full_completion_row(
+        &tokenizer,
+        &prompt_tokens,
+        &answer,
+        batch.samples[0].item.document_close_marker(),
+        64,
+        256,
+    )
+    .expect("full policy completion row");
+    let decoded_targets = row
+        .1
+        .iter()
+        .zip(&row.2)
+        .filter_map(|(token, active)| (*active > 0.0).then_some(*token as u32))
+        .collect::<Vec<_>>();
+    let expected_targets = tokenizer.encode_payload(&format!(
+        "{answer}\n{}",
+        batch.samples[0].item.document_close_marker()
+    ));
+    assert_eq!(decoded_targets, expected_targets);
+    assert!(
+        tokenizer
+            .decode_payload(&decoded_targets, true)
+            .starts_with(&answer),
+        "full-completion row must retain the semantic action"
+    );
+    assert_eq!(row.3, decoded_targets.len());
+
+    let prepared = learner
+        .prepare_ruliad_prompt_value_binding_batch(&batch, &device, 256, 1)
+        .expect("full proof-policy completion batch");
+    assert_eq!(prepared.rows, batch.samples.len());
+    assert!(prepared.active_tokens >= row.3);
 }
 
 #[test]
@@ -3979,6 +5345,7 @@ fn ruliad_structured_answer_contrast_loss_supports_structured_symbolic_tokenizer
             eos_id: None,
         },
         stop_token_id: None,
+        sampling_metadata: None,
     };
 
     let loss = model
@@ -4047,6 +5414,7 @@ fn ruliad_verifier_policy_loss_can_include_structured_negative_candidates() {
             eos_id: None,
         },
         stop_token_id: None,
+        sampling_metadata: None,
     };
     let loss = model
         .ruliad_verifier_policy_loss(&policy_batch, &device, 48)
@@ -4124,6 +5492,7 @@ fn ruliad_verifier_rollout_imitation_writes_skip_telemetry_for_wrong_generations
             eos_id: None,
         },
         stop_token_id: None,
+        sampling_metadata: None,
     };
 
     assert!(
@@ -4217,6 +5586,7 @@ fn ruliad_verifier_rollout_recovery_accepts_generated_malformed_prefixes() {
             eos_id: None,
         },
         stop_token_id: None,
+        sampling_metadata: None,
     };
 
     let loss = model
@@ -4378,9 +5748,11 @@ fn semantic_sequence_policy_loss_marginalizes_verifier_equivalent_actions() {
     let equivalent =
         Tensor::<TestBackend, 2>::from_data(TensorData::new(vec![1.0, 0.0, 1.0], [1, 3]), &device);
     let weights = Tensor::<TestBackend, 1>::ones([1], &device);
+    let support = Tensor::<TestBackend, 2>::ones([1, 3], &device);
     let conditional = tensor_scalar(grouped_verifier_equivalent_sequence_loss(
         scores.clone(),
         scores.clone(),
+        support.clone(),
         equivalent.clone(),
         weights.clone(),
         GroupedVerifierSequenceLossConfig {
@@ -4393,6 +5765,7 @@ fn semantic_sequence_policy_loss_marginalizes_verifier_equivalent_actions() {
     let marginal = tensor_scalar(grouped_verifier_equivalent_sequence_loss(
         scores.clone(),
         scores,
+        support,
         equivalent,
         weights,
         GroupedVerifierSequenceLossConfig {
@@ -4413,6 +5786,53 @@ fn semantic_sequence_policy_loss_marginalizes_verifier_equivalent_actions() {
         "marginal={marginal}"
     );
     assert!(marginal > conditional);
+}
+
+#[test]
+fn target_group_conditional_loss_rewards_prompt_dependent_target_reversal() {
+    let device = burn::tensor::Device::<TestBackend>::default();
+    let support = Tensor::<TestBackend, 2>::from_data(
+        TensorData::new(vec![1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0], [2, 4]),
+        &device,
+    );
+    let equivalent = Tensor::<TestBackend, 2>::from_data(
+        TensorData::new(vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0], [2, 4]),
+        &device,
+    );
+    let weights = Tensor::<TestBackend, 1>::ones([2], &device);
+    let config = GroupedVerifierSequenceLossConfig {
+        normalization: crate::config::RuliadProofPolicyNormalization::CandidateConditional,
+        presentation_risk: crate::config::RuliadProofPolicyPresentationRisk::Mean,
+        presentation_group_size: 1,
+        weight: 1.0,
+    };
+    let target_independent = Tensor::<TestBackend, 2>::from_data(
+        TensorData::new(vec![2.0, 0.0, -4.0, -4.0, 2.0, 0.0, -4.0, -4.0], [2, 4]),
+        &device,
+    );
+    let conditioned = Tensor::<TestBackend, 2>::from_data(
+        TensorData::new(vec![2.0, 0.0, -4.0, -4.0, 0.0, 2.0, -4.0, -4.0], [2, 4]),
+        &device,
+    );
+    let prior_loss = tensor_scalar(grouped_verifier_equivalent_sequence_loss(
+        target_independent.clone(),
+        target_independent,
+        support.clone(),
+        equivalent.clone(),
+        weights.clone(),
+        config,
+    ));
+    let conditioned_loss = tensor_scalar(grouped_verifier_equivalent_sequence_loss(
+        conditioned.clone(),
+        conditioned,
+        support,
+        equivalent,
+        weights,
+        config,
+    ));
+    assert!(prior_loss > std::f32::consts::LN_2, "{prior_loss}");
+    assert!(conditioned_loss < 0.2, "{conditioned_loss}");
+    assert!(conditioned_loss < prior_loss - 0.8);
 }
 
 #[test]
@@ -4482,8 +5902,12 @@ fn ruliad_proof_policy_dagger_labels_model_visited_state_with_expert_action() {
         .with_ruliad_supervision(RuliadSupervisionConfig {
             proof_policy: crate::config::RuliadProofPolicyTrainingConfig {
                 enabled: true,
+                require_scheduled_update: false,
+                decoder_calibration_steps: 0,
                 mode: crate::config::RuliadProofPolicyTrainingMode::Dagger,
                 scoring: crate::config::RuliadProofPolicyScoring::CompletionLikelihood,
+                prompt_context: crate::config::RuliadProofPolicyPromptContext::FullProblemSuffix,
+                target: crate::config::RuliadProofPolicyTarget::ExpertSet,
                 gradient_scope: crate::config::RuliadProofPolicyGradientScope::FullModel,
                 normalization: crate::config::RuliadProofPolicyNormalization::VocabularyMarginal,
                 candidate_symmetry:
@@ -4498,6 +5922,8 @@ fn ruliad_proof_policy_dagger_labels_model_visited_state_with_expert_action() {
                 max_rows_per_update: 2,
                 max_presentation_rows_per_update: 32,
                 counterfactual_targets_per_state: 0,
+                counterfactual_objective:
+                    crate::config::RuliadProofPolicyCounterfactualObjective::Independent,
                 candidates: 4,
                 max_completion_tokens: 16,
             },
@@ -4548,6 +5974,7 @@ fn ruliad_proof_policy_dagger_labels_model_visited_state_with_expert_action() {
             candidate: None,
             proof_step_index: Some(proof_step_index),
             action_presentation_rotation: Some(0),
+            action_candidate_count: Some(actions.candidates.len()),
             action_answer_contract: Default::default(),
             task: burn_dragon_universality::RuliadTaskKind::SelectProofAction,
         }),
@@ -4562,6 +5989,7 @@ fn ruliad_proof_policy_dagger_labels_model_visited_state_with_expert_action() {
             eos_id: Some(271),
         },
         stop_token_id: Some(271),
+        sampling_metadata: None,
     };
     policy_batch.samples.push(policy_batch.samples[0].clone());
 
@@ -4579,6 +6007,7 @@ fn ruliad_proof_policy_dagger_labels_model_visited_state_with_expert_action() {
     assert_eq!(value["version"], RULIAD_PROOF_POLICY_TELEMETRY_VERSION);
     assert_eq!(value["answer_contract"], "presentation_index");
     assert_eq!(value["objective"], "vocabulary_marginal_equivalent_v1");
+    assert_eq!(value["target"], "expert_set");
     assert_eq!(value["presentation_risk"], "mean");
     assert_eq!(value["configured_mode"], "dagger");
     assert_eq!(value["mode"], "dagger");
@@ -4670,8 +6099,12 @@ fn ruliad_proof_policy_dagger_labels_model_visited_state_with_expert_action() {
     .with_ruliad_supervision(RuliadSupervisionConfig {
         proof_policy: crate::config::RuliadProofPolicyTrainingConfig {
             enabled: true,
+            require_scheduled_update: false,
+            decoder_calibration_steps: 0,
             mode: crate::config::RuliadProofPolicyTrainingMode::StaticExpert,
             scoring: crate::config::RuliadProofPolicyScoring::CompletionLikelihood,
+            prompt_context: crate::config::RuliadProofPolicyPromptContext::FullProblemSuffix,
+            target: crate::config::RuliadProofPolicyTarget::ExpertSet,
             gradient_scope: crate::config::RuliadProofPolicyGradientScope::FullModel,
             normalization: crate::config::RuliadProofPolicyNormalization::CandidateConditional,
             candidate_symmetry:
@@ -4686,6 +6119,8 @@ fn ruliad_proof_policy_dagger_labels_model_visited_state_with_expert_action() {
             max_rows_per_update: 2,
             max_presentation_rows_per_update: 8,
             counterfactual_targets_per_state: 0,
+            counterfactual_objective:
+                crate::config::RuliadProofPolicyCounterfactualObjective::Independent,
             candidates: 4,
             max_completion_tokens: 16,
         },
@@ -4774,8 +6209,12 @@ fn ruliad_proof_policy_dagger_labels_model_visited_state_with_expert_action() {
     .with_ruliad_supervision(RuliadSupervisionConfig {
         proof_policy: crate::config::RuliadProofPolicyTrainingConfig {
             enabled: true,
+            require_scheduled_update: false,
+            decoder_calibration_steps: 0,
             mode: crate::config::RuliadProofPolicyTrainingMode::StaticExpert,
             scoring: crate::config::RuliadProofPolicyScoring::CompletionLikelihood,
+            prompt_context: crate::config::RuliadProofPolicyPromptContext::FullProblemSuffix,
+            target: crate::config::RuliadProofPolicyTarget::ExpertSet,
             gradient_scope: crate::config::RuliadProofPolicyGradientScope::FullModel,
             normalization: crate::config::RuliadProofPolicyNormalization::CandidateConditional,
             candidate_symmetry:
@@ -4790,6 +6229,8 @@ fn ruliad_proof_policy_dagger_labels_model_visited_state_with_expert_action() {
             max_rows_per_update: 1,
             max_presentation_rows_per_update: 8,
             counterfactual_targets_per_state: 0,
+            counterfactual_objective:
+                crate::config::RuliadProofPolicyCounterfactualObjective::Independent,
             candidates: 4,
             max_completion_tokens: 128,
         },
@@ -4839,8 +6280,12 @@ fn ruliad_proof_policy_dagger_labels_model_visited_state_with_expert_action() {
     .with_ruliad_supervision(RuliadSupervisionConfig {
         proof_policy: crate::config::RuliadProofPolicyTrainingConfig {
             enabled: true,
+            require_scheduled_update: false,
+            decoder_calibration_steps: 0,
             mode: crate::config::RuliadProofPolicyTrainingMode::StaticExpert,
             scoring: crate::config::RuliadProofPolicyScoring::SemanticEnergy,
+            prompt_context: crate::config::RuliadProofPolicyPromptContext::FullProblemSuffix,
+            target: crate::config::RuliadProofPolicyTarget::ExpertSet,
             gradient_scope: crate::config::RuliadProofPolicyGradientScope::FullModel,
             normalization: crate::config::RuliadProofPolicyNormalization::CandidateConditional,
             candidate_symmetry: crate::config::RuliadProofPolicyCandidateSymmetry::BalancedRotation,
@@ -4854,6 +6299,8 @@ fn ruliad_proof_policy_dagger_labels_model_visited_state_with_expert_action() {
             max_rows_per_update: 2,
             max_presentation_rows_per_update: 2,
             counterfactual_targets_per_state: 1,
+            counterfactual_objective:
+                crate::config::RuliadProofPolicyCounterfactualObjective::Independent,
             candidates: 4,
             max_completion_tokens: 128,
         },
@@ -4880,6 +6327,7 @@ fn ruliad_proof_policy_dagger_labels_model_visited_state_with_expert_action() {
     );
     assert_eq!(energy_value["answer_contract"], "semantic_step");
     assert_eq!(energy_value["gradient_scope"], "full_model");
+    assert_eq!(energy_value["target"], "expert_set");
     assert_eq!(
         energy_value["objective"],
         "semantic_sequence_energy_counterfactual_v1"
@@ -4909,8 +6357,12 @@ fn ruliad_proof_policy_dagger_labels_model_visited_state_with_expert_action() {
     .with_ruliad_supervision(RuliadSupervisionConfig {
         proof_policy: crate::config::RuliadProofPolicyTrainingConfig {
             enabled: true,
+            require_scheduled_update: false,
+            decoder_calibration_steps: 0,
             mode: crate::config::RuliadProofPolicyTrainingMode::StaticExpert,
             scoring: crate::config::RuliadProofPolicyScoring::CompletionLikelihood,
+            prompt_context: crate::config::RuliadProofPolicyPromptContext::FullProblemSuffix,
+            target: crate::config::RuliadProofPolicyTarget::ExpertSet,
             gradient_scope: crate::config::RuliadProofPolicyGradientScope::LanguageHeadOnly,
             normalization: crate::config::RuliadProofPolicyNormalization::CandidateConditional,
             candidate_symmetry: crate::config::RuliadProofPolicyCandidateSymmetry::BalancedRotation,
@@ -4924,6 +6376,8 @@ fn ruliad_proof_policy_dagger_labels_model_visited_state_with_expert_action() {
             max_rows_per_update: 2,
             max_presentation_rows_per_update: 2,
             counterfactual_targets_per_state: 1,
+            counterfactual_objective:
+                crate::config::RuliadProofPolicyCounterfactualObjective::TargetGroupConditional,
             candidates: 4,
             max_completion_tokens: 128,
         },
@@ -4952,13 +6406,19 @@ fn ruliad_proof_policy_dagger_labels_model_visited_state_with_expert_action() {
     assert_eq!(language_head_value["gradient_scope"], "language_head_only");
     assert_eq!(
         language_head_value["objective"],
-        "candidate_normalized_counterfactual_v1"
+        "completion_target_group_conditional_v1"
+    );
+    assert_eq!(
+        language_head_value["counterfactual_objective"],
+        "target_group_conditional"
     );
     assert_eq!(
         language_head_value["configured_counterfactual_targets_per_state"],
         1
     );
     assert_eq!(language_head_value["target_variants_per_state"], 2);
+    assert_eq!(language_head_value["target_group_conditional_groups"], 1);
+    assert_eq!(language_head_value["target_group_conditional_rows"], 2);
     assert_eq!(language_head_value["base_semantic_state_rows"], 1);
     assert_eq!(language_head_value["counterfactual_semantic_state_rows"], 1);
     assert_eq!(language_head_value["counterfactual_target_shortfall"], 0);
@@ -4976,8 +6436,12 @@ fn ruliad_proof_policy_dagger_labels_model_visited_state_with_expert_action() {
     .with_ruliad_supervision(RuliadSupervisionConfig {
         proof_policy: crate::config::RuliadProofPolicyTrainingConfig {
             enabled: true,
+            require_scheduled_update: false,
+            decoder_calibration_steps: 0,
             mode: crate::config::RuliadProofPolicyTrainingMode::StaticExpert,
             scoring: crate::config::RuliadProofPolicyScoring::CompletionLikelihood,
+            prompt_context: crate::config::RuliadProofPolicyPromptContext::FullProblemSuffix,
+            target: crate::config::RuliadProofPolicyTarget::ExpertSet,
             gradient_scope: crate::config::RuliadProofPolicyGradientScope::FullModel,
             normalization: crate::config::RuliadProofPolicyNormalization::PrefixConditional,
             candidate_symmetry: crate::config::RuliadProofPolicyCandidateSymmetry::BalancedRotation,
@@ -4991,6 +6455,8 @@ fn ruliad_proof_policy_dagger_labels_model_visited_state_with_expert_action() {
             max_rows_per_update: 2,
             max_presentation_rows_per_update: 2,
             counterfactual_targets_per_state: 0,
+            counterfactual_objective:
+                crate::config::RuliadProofPolicyCounterfactualObjective::Independent,
             candidates: 4,
             max_completion_tokens: 128,
         },
@@ -5042,8 +6508,12 @@ fn ruliad_proof_policy_dagger_accepts_every_production_cadence_panel() {
     TestBackend::seed(&device, 20260831);
     let proof_policy = crate::config::RuliadProofPolicyTrainingConfig {
         enabled: true,
+        require_scheduled_update: false,
+        decoder_calibration_steps: 0,
         mode: crate::config::RuliadProofPolicyTrainingMode::Dagger,
         scoring: crate::config::RuliadProofPolicyScoring::CompletionLikelihood,
+        prompt_context: crate::config::RuliadProofPolicyPromptContext::FullProblemSuffix,
+        target: crate::config::RuliadProofPolicyTarget::ExpertSet,
         gradient_scope: crate::config::RuliadProofPolicyGradientScope::FullModel,
         normalization: crate::config::RuliadProofPolicyNormalization::PrefixConditional,
         candidate_symmetry: crate::config::RuliadProofPolicyCandidateSymmetry::BalancedRotation,
@@ -5057,6 +6527,8 @@ fn ruliad_proof_policy_dagger_accepts_every_production_cadence_panel() {
         max_rows_per_update: 16,
         max_presentation_rows_per_update: 128,
         counterfactual_targets_per_state: 0,
+        counterfactual_objective:
+            crate::config::RuliadProofPolicyCounterfactualObjective::Independent,
         candidates: 4,
         max_completion_tokens: 128,
     };
@@ -5188,6 +6660,9 @@ fn ruliad_proof_policy_batch_plan_pairs_expert_and_model_visited_rows() {
     assert_eq!(plan.dagger_trajectory_budget, 4);
     assert_eq!(plan.trajectory_budget(), 20);
     assert_eq!(plan.rollout_steps, 4);
+    assert_eq!(plan.dagger_trajectories_for_samples(1), 1);
+    assert_eq!(plan.dagger_depth_for_count(0, 1), 4);
+    assert_eq!(plan.rollout_steps_for_dagger_count(1), 4);
     assert_eq!(
         (0..plan.dagger_trajectory_budget)
             .map(|index| plan.dagger_depth(index))
@@ -5219,6 +6694,53 @@ fn ruliad_proof_policy_batch_plan_pairs_expert_and_model_visited_rows() {
     assert_eq!(bounded_causal.dagger_trajectory_budget, 1);
     assert_eq!(bounded_causal.rollout_steps, 2);
     assert_eq!(bounded_causal.dagger_depth(0), 2);
+}
+
+#[test]
+fn paired_dagger_objective_executes_model_visited_rows_with_batch_one() {
+    let device = burn::tensor::Device::<TestBackend>::default();
+    TestBackend::seed(&device, 20260812);
+    let telemetry_dir = tempfile::tempdir().expect("telemetry directory");
+    let telemetry_path = telemetry_dir.path().join("paired-dagger.jsonl");
+    let mut supervision = scheduled_score_head_ruliad_supervision(
+        crate::config::RuliadProofPolicyScoring::ResidualEnergy,
+        crate::config::RuliadProofPolicyTarget::ExpertSet,
+    );
+    supervision.proof_policy.mode =
+        crate::config::RuliadProofPolicyTrainingMode::StaticThenPairedDagger;
+    supervision.proof_policy.dagger_start_after_steps = 0;
+    supervision.proof_policy.rollout_steps = 4;
+    supervision.proof_policy.max_rows_per_update = 32;
+    supervision.proof_policy.max_presentation_rows_per_update = 32;
+    let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
+        scheduled_score_head_ruliad_model_config(),
+        &device,
+    ))
+    .with_ruliad_supervision(supervision)
+    .with_ruliad_proof_policy_telemetry_path(Some(telemetry_path.clone()));
+
+    let objective = model
+        .ruliad_proof_policy_objective_at_step(&scheduled_ruliad_policy_batch(), &device, 512, 0)
+        .expect("batch-one paired DAgger objective");
+    assert!(tensor_scalar(objective.loss).is_finite());
+
+    let event: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(telemetry_path)
+            .expect("paired DAgger telemetry")
+            .lines()
+            .next()
+            .expect("telemetry event"),
+    )
+    .expect("telemetry JSON");
+    assert_eq!(event["mode"], "paired_dagger");
+    assert!(event["model_scoring_batches"].as_u64().unwrap_or_default() > 0);
+    assert!(
+        event["model_visited_expert_rows"]
+            .as_u64()
+            .unwrap_or_default()
+            > 0
+    );
+    assert!(event["rollout_depth_reached"].as_u64().unwrap_or_default() > 1);
 }
 
 #[test]
@@ -5265,6 +6787,7 @@ fn ruliad_structured_answer_contrast_loss_scores_oracle_against_field_negatives(
             eos_id: None,
         },
         stop_token_id: None,
+        sampling_metadata: None,
     };
 
     model.gradient_scale_step.store(3, Ordering::Relaxed);
@@ -5340,6 +6863,7 @@ fn ruliad_structured_answer_contrast_loss_scores_schema_negatives() {
             eos_id: None,
         },
         stop_token_id: None,
+        sampling_metadata: None,
     };
 
     let loss = model
@@ -5430,6 +6954,7 @@ fn ruliad_field_binding_contrast_loss_scores_prompt_counterfactuals() {
             eos_id: None,
         },
         stop_token_id: None,
+        sampling_metadata: None,
     };
 
     model.gradient_scale_step.store(3, Ordering::Relaxed);
@@ -5530,6 +7055,7 @@ fn ruliad_field_binding_contrast_loss_writes_activity_and_skip_telemetry() {
             eos_id: None,
         },
         stop_token_id: None,
+        sampling_metadata: None,
     };
     let loss = model
         .ruliad_field_binding_contrast_loss(&policy_batch, &device, 64)
@@ -5559,6 +7085,7 @@ fn ruliad_field_binding_contrast_loss_writes_activity_and_skip_telemetry() {
             eos_id: None,
         },
         stop_token_id: None,
+        sampling_metadata: None,
     };
     assert!(
         model
@@ -5735,6 +7262,7 @@ fn ruliad_field_binding_contrast_never_uses_presented_actions_as_negatives() {
             candidate: None,
             proof_step_index: Some(proof_step_index),
             action_presentation_rotation: Some(0),
+            action_candidate_count: Some(actions.candidates.len()),
             action_answer_contract: contract,
             task: burn_dragon_universality::RuliadTaskKind::SelectProofAction,
         }),
@@ -5758,6 +7286,7 @@ fn ruliad_field_binding_contrast_never_uses_presented_actions_as_negatives() {
             eos_id: None,
         },
         stop_token_id: None,
+        sampling_metadata: None,
     };
 
     assert!(
@@ -5828,6 +7357,7 @@ fn ruliad_field_binding_contrast_uses_template_negatives_for_single_sample() {
             eos_id: None,
         },
         stop_token_id: None,
+        sampling_metadata: None,
     };
 
     let loss = model
@@ -5903,6 +7433,7 @@ fn ruliad_field_binding_contrast_uses_schema_negatives_for_single_sample() {
             eos_id: None,
         },
         stop_token_id: None,
+        sampling_metadata: None,
     };
 
     let loss = model
@@ -5988,6 +7519,7 @@ fn ruliad_field_binding_contrast_prioritizes_prompt_coverage_over_global_byte_di
             eos_id: None,
         },
         stop_token_id: None,
+        sampling_metadata: None,
     };
 
     let loss = model
@@ -6070,6 +7602,7 @@ fn ruliad_field_binding_contrast_uses_replay_for_single_sample_batches() {
         }],
         tokenization: tokenization.clone(),
         stop_token_id: None,
+        sampling_metadata: None,
     };
     assert!(
         model
@@ -6085,6 +7618,7 @@ fn ruliad_field_binding_contrast_uses_replay_for_single_sample_batches() {
         }],
         tokenization,
         stop_token_id: None,
+        sampling_metadata: None,
     };
     let loss = model
         .ruliad_field_binding_contrast_loss(&second_batch, &device, 64)
@@ -6318,6 +7852,7 @@ fn ruliad_field_binding_contrast_uses_generated_attractor_replay() {
             eos_id: None,
         },
         stop_token_id: None,
+        sampling_metadata: None,
     };
     let loss = model
         .ruliad_field_binding_contrast_loss(&policy_batch, &device, 64)
@@ -6419,6 +7954,7 @@ fn ruliad_verifier_policy_loss_uses_generated_attractor_replay_candidates() {
             eos_id: None,
         },
         stop_token_id: None,
+        sampling_metadata: None,
     };
     let loss = model
         .ruliad_verifier_policy_loss(&policy_batch, &device, 64)
@@ -6497,6 +8033,7 @@ fn ruliad_structured_answer_contrast_loss_writes_activity_telemetry() {
             eos_id: None,
         },
         stop_token_id: None,
+        sampling_metadata: None,
     };
 
     let loss = model
@@ -6573,6 +8110,7 @@ fn ruliad_verifier_policy_loss_writes_reward_telemetry() {
             eos_id: None,
         },
         stop_token_id: None,
+        sampling_metadata: None,
     };
     let loss = model
         .ruliad_verifier_policy_loss(&policy_batch, &device, 8)
@@ -7415,6 +8953,7 @@ fn train_step_runs_structured_recovery_with_tbptt_policy_batch() {
             eos_id: None,
         },
         stop_token_id: None,
+        sampling_metadata: None,
     });
     let train_batch = SequenceBatch::new(
         Tensor::<TestBackend, 2, Int>::from_data(
@@ -7501,6 +9040,7 @@ fn train_step_runs_field_binding_contrast_with_tbptt_policy_batch() {
             eos_id: None,
         },
         stop_token_id: None,
+        sampling_metadata: None,
     });
     let inputs = (0..64)
         .map(|value| (value % 128) as i64)
@@ -8019,7 +9559,7 @@ fn next_latent_train_step_runs_without_inference_latent_reasoning() {
     TestBackend::seed(&device, 7);
     let mut config = tiny_model_config();
     config.next_latent_transition.enabled = true;
-    let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
+    let mut model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(config, &device))
         .with_latent_reasoning(LatentReasoningTrainingConfig {
             enabled: true,
             jepa_future_offsets: vec![usize::MAX],
@@ -8042,6 +9582,7 @@ fn next_latent_train_step_runs_without_inference_latent_reasoning() {
             },
             ..Default::default()
         });
+    model.next_latent_token_layout = Some(Default::default());
     assert!(!model.model.latent_reasoning_enabled());
     assert!(model.model.next_latent_transition_enabled());
     let loss = scalar_loss(TrainStep::step(&model, batch(&device)));

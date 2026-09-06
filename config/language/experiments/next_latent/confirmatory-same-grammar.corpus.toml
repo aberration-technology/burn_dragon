@@ -1,0 +1,6 @@
+extends = ["in-distribution.corpus.toml"]
+
+# An unused generator seed, not merely a reshuffle of the development index set.
+seed = 8817301
+name = "nextlat-memory-confirmatory-same-grammar"
+validation_samples = 512

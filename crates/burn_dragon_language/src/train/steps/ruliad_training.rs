@@ -1542,6 +1542,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                 prompt: Vec<i64>,
                 candidate_completions: Vec<Vec<i64>>,
                 equivalent_indices: Vec<usize>,
+                target_action_weights: Option<Vec<f32>>,
             },
         }
 
@@ -1549,6 +1550,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         struct ExpertRow {
             objective: ExpertRowObjective,
             presentation_weight: f32,
+            target_group: usize,
         }
 
         struct PrefixBranchRow {
@@ -1593,9 +1595,15 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         let mut candidate_target_tokens = 0usize;
         let mut equivalent_target_tokens = 0usize;
         let mut supervised_action_tokens = 0usize;
+        let mut original_prompt_tokens = 0usize;
+        let mut retained_prompt_tokens = 0usize;
+        let mut maximum_original_prompt_tokens = 0usize;
+        let mut maximum_retained_prompt_tokens = 0usize;
+        let mut truncated_presentations = 0usize;
         let mut rollout_depth_reached = 0usize;
         let mut presentation_budget_exhausted = false;
 
+        #[derive(Clone)]
         struct DaggerTrajectory {
             sample_index: usize,
             difficulty_level: usize,
@@ -1624,6 +1632,11 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             scoring_presentations: Vec<DaggerScoringPresentation>,
             presentation_selected_indices: Vec<usize>,
             presentation_equivalent_indices: Vec<Vec<usize>>,
+            original_prompt_tokens: usize,
+            retained_prompt_tokens: usize,
+            maximum_original_prompt_tokens: usize,
+            maximum_retained_prompt_tokens: usize,
+            truncated_presentations: usize,
         }
 
         let prepare_expert_state = |
@@ -1631,6 +1644,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             actions: &burn_dragon_universality::ruliad::RuliadProofActionSet,
             presentation_index: usize,
             scoring_contract: burn_dragon_universality::ruliad::RuliadProofActionAnswerContract,
+            target_group_offset: usize,
             base_rotations: Option<&[usize]>,
         | -> Option<PreparedExpertState> {
             let rotations = crate::train::ruliad_policy::target_group_presentation_rotations(
@@ -1643,7 +1657,8 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             .ok()?;
             let canonical_prompt = tokenizer
                 .encode_payload(
-                    &burn_dragon_universality::ruliad::ruliad_proof_action_prompt(
+                    &crate::train::ruliad_policy::ruliad_proof_policy_prompt(
+                        config.prompt_context,
                         problem, actions,
                     )
                     .ok()?,
@@ -1658,14 +1673,20 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             let mut presentation_selected_indices = Vec::<usize>::with_capacity(rotations.len());
             let mut presentation_equivalent_indices =
                 Vec::<Vec<usize>>::with_capacity(rotations.len());
-            for rotation in rotations {
+            let mut original_prompt_tokens = 0usize;
+            let mut retained_prompt_tokens = 0usize;
+            let mut maximum_original_prompt_tokens = 0usize;
+            let mut maximum_retained_prompt_tokens = 0usize;
+            let mut truncated_presentations = 0usize;
+            for (presentation_slot, rotation) in rotations.into_iter().enumerate() {
+                let target_group = target_group_offset.saturating_add(presentation_slot);
                 let presented_actions = actions.rotate_left(rotation).ok()?;
-                let prompt_text =
-                    burn_dragon_universality::ruliad::ruliad_proof_action_prompt(
-                        problem,
-                        &presented_actions,
-                    )
-                    .ok()?;
+                let prompt_text = crate::train::ruliad_policy::ruliad_proof_policy_prompt(
+                    config.prompt_context,
+                    problem,
+                    &presented_actions,
+                )
+                .ok()?;
                 let candidate_completions = (0..presented_actions.candidates.len())
                     .map(|candidate_index| {
                         let answer = burn_dragon_universality::ruliad::proof_action_answer(
@@ -1710,6 +1731,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                     .into_iter()
                     .map(i64::from)
                     .collect::<Vec<_>>();
+                let original_prompt_token_count = prompt.len();
                 let prompt = Self::ruliad_trim_prompt_for_completion(
                     &prompt,
                     candidate_completions
@@ -1722,6 +1744,15 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                 if prompt.is_empty() {
                     return None;
                 }
+                original_prompt_tokens =
+                    original_prompt_tokens.saturating_add(original_prompt_token_count);
+                retained_prompt_tokens = retained_prompt_tokens.saturating_add(prompt.len());
+                maximum_original_prompt_tokens =
+                    maximum_original_prompt_tokens.max(original_prompt_token_count);
+                maximum_retained_prompt_tokens =
+                    maximum_retained_prompt_tokens.max(prompt.len());
+                truncated_presentations = truncated_presentations
+                    .saturating_add(usize::from(prompt.len() < original_prompt_token_count));
                 let objective = match scoring_contract {
                     burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::PresentationIndex => {
                         let branch_token_index = crate::train::ruliad_policy::candidate_branch_index(
@@ -1770,6 +1801,15 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                             prompt: prompt.clone(),
                             candidate_completions: candidate_completions.clone(),
                             equivalent_indices: presented_actions.equivalent_indices.clone(),
+                            target_action_weights: (config.target
+                                == crate::config::RuliadProofPolicyTarget::VerifiedProgressDistribution)
+                                .then(|| {
+                                    presented_actions
+                                        .candidate_progress_units()
+                                        .into_iter()
+                                        .map(|weight| weight as f32)
+                                        .collect()
+                                }),
                         }
                     }
                 };
@@ -1779,6 +1819,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                 presentation_rows.push(ExpertRow {
                     objective,
                     presentation_weight,
+                    target_group,
                 });
                 scoring_presentations.push(DaggerScoringPresentation {
                     rotation,
@@ -1794,6 +1835,11 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                     scoring_presentations,
                     presentation_selected_indices,
                     presentation_equivalent_indices,
+                    original_prompt_tokens,
+                    retained_prompt_tokens,
+                    maximum_original_prompt_tokens,
+                    maximum_retained_prompt_tokens,
+                    truncated_presentations,
                 },
             )
         };
@@ -1866,7 +1912,42 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         }
         let state_prepare_ms = state_prepare_started.elapsed().as_micros() as f64 / 1_000.0;
 
-        for rollout_depth in 0..batch_plan.rollout_steps {
+        let source_trajectory_count = trajectories.len();
+        let desired_dagger_trajectories =
+            batch_plan.dagger_trajectories_for_samples(source_trajectory_count);
+        let existing_dagger_trajectories = trajectories
+            .iter()
+            .filter(|trajectory| trajectory.is_dagger)
+            .count();
+        let missing_dagger_trajectories =
+            desired_dagger_trajectories.saturating_sub(existing_dagger_trajectories);
+        let paired_reuse = trajectories
+            .iter()
+            .filter(|trajectory| !trajectory.is_dagger)
+            .take(missing_dagger_trajectories)
+            .cloned()
+            .collect::<Vec<_>>();
+        for mut trajectory in paired_reuse {
+            trajectory.is_dagger = true;
+            trajectory.max_depth = 1;
+            trajectories.push(trajectory);
+        }
+        let dagger_trajectory_count = trajectories
+            .iter()
+            .filter(|trajectory| trajectory.is_dagger)
+            .count();
+        for (dagger_index, trajectory) in trajectories
+            .iter_mut()
+            .filter(|trajectory| trajectory.is_dagger)
+            .enumerate()
+        {
+            trajectory.max_depth =
+                batch_plan.dagger_depth_for_count(dagger_index, dagger_trajectory_count);
+        }
+        let effective_rollout_steps =
+            batch_plan.rollout_steps_for_dagger_count(dagger_trajectory_count);
+
+        for rollout_depth in 0..effective_rollout_steps {
             if presentation_budget_exhausted
                 || base_semantic_state_rows >= base_semantic_row_budget
                 || trajectories
@@ -1908,6 +1989,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                     &actions,
                     semantic_state_rows,
                     trajectory.answer_contract,
+                    base_semantic_state_rows.saturating_mul(config.presentations_per_state()),
                     None,
                 ) else {
                     model_invalid_actions = model_invalid_actions.saturating_add(1);
@@ -1957,6 +2039,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                         &counterfactual_actions,
                         semantic_state_rows.saturating_add(prepared_states.len()),
                         trajectory.answer_contract,
+                        base_semantic_state_rows.saturating_mul(config.presentations_per_state()),
                         Some(&target_group_rotations),
                     ) else {
                         group_shortfall = group_shortfall.saturating_add(1);
@@ -1968,18 +2051,22 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                     counterfactual_target_shortfall.saturating_add(group_shortfall);
                 let complete_target_group = group_shortfall == 0
                     && prepared_states.len() == config.target_variants_per_state();
+                // Keep every counterfactual update balanced. A partial group leaks target
+                // frequency and invalidates the paired joint-objective estimator.
+                let requires_complete_target_group = config.counterfactual_targets_per_state > 0;
+                let usable_target_group = complete_target_group || !requires_complete_target_group;
                 let presentation_rows = prepared_states
                     .iter()
                     .map(|state| state.presentation_rows.len())
                     .sum::<usize>();
-                if complete_target_group
+                if usable_target_group
                     && rows.len().saturating_add(presentation_rows)
                         > config.max_presentation_rows_per_update
                 {
                     presentation_budget_exhausted = true;
                     break;
                 }
-                let unique_target_group = complete_target_group
+                let unique_target_group = usable_target_group
                     && prepared_states
                         .iter()
                         .all(|state| !visited_prompts.contains(&state.canonical_prompt));
@@ -1987,6 +2074,16 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                     let variants_added = prepared_states.len();
                     for state in prepared_states {
                         visited_prompts.insert(state.canonical_prompt);
+                        original_prompt_tokens =
+                            original_prompt_tokens.saturating_add(state.original_prompt_tokens);
+                        retained_prompt_tokens =
+                            retained_prompt_tokens.saturating_add(state.retained_prompt_tokens);
+                        maximum_original_prompt_tokens = maximum_original_prompt_tokens
+                            .max(state.maximum_original_prompt_tokens);
+                        maximum_retained_prompt_tokens = maximum_retained_prompt_tokens
+                            .max(state.maximum_retained_prompt_tokens);
+                        truncated_presentations =
+                            truncated_presentations.saturating_add(state.truncated_presentations);
                         for selected_index in state.presentation_selected_indices {
                             *expert_selected_index_histogram
                                 .entry(selected_index)
@@ -2222,6 +2319,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                     prompt,
                     candidate_completions,
                     equivalent_indices,
+                    ..
                 } = &row.objective
                 else {
                     return None;
@@ -2254,141 +2352,202 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
             .iter()
             .map(|row| row.equivalent_target_tokens.len())
             .sum::<usize>();
-
-        debug_assert!(rows.len() <= config.max_presentation_rows_per_update);
-        self.write_ruliad_proof_policy_dagger_telemetry(RuliadProofPolicyDaggerTelemetry {
-            version: RULIAD_PROOF_POLICY_TELEMETRY_VERSION,
-            answer_contract: answer_contract.unwrap_or_default().label(),
-            objective: match config.scoring {
+        let objective_panel_fingerprint = if !prefix_branch_rows.is_empty() {
+            let mut panel =
+                crate::train::ruliad_objective_fingerprint::RuliadObjectivePanelFingerprint::new(
+                    prefix_branch_rows.len(),
+                );
+            for row in &prefix_branch_rows {
+                panel.push_prefix(
+                    &row.inputs,
+                    row.branch_position,
+                    &row.candidate_target_tokens,
+                    &row.equivalent_target_tokens,
+                    row.weight * weight,
+                );
+            }
+            panel.finish()?
+        } else {
+            let sequence_kind = match config.scoring {
+                crate::config::RuliadProofPolicyScoring::CompletionLikelihood => {
+                    crate::train::ruliad_objective_fingerprint::RuliadObjectiveSequenceKind::CompletionLikelihood
+                }
                 crate::config::RuliadProofPolicyScoring::SemanticEnergy => {
-                    if config.counterfactual_targets_per_state > 0 {
-                        "semantic_sequence_energy_counterfactual_v1"
-                    } else {
-                        "semantic_sequence_energy_v1"
-                    }
+                    crate::train::ruliad_objective_fingerprint::RuliadObjectiveSequenceKind::SemanticEnergy
                 }
                 crate::config::RuliadProofPolicyScoring::ResidualEnergy => {
-                    if config.counterfactual_targets_per_state > 0 {
-                        "autoregressive_residual_energy_counterfactual_v1"
-                    } else {
-                        "autoregressive_residual_energy_v1"
+                    crate::train::ruliad_objective_fingerprint::RuliadObjectiveSequenceKind::ResidualEnergy
+                }
+            };
+            let mut panel =
+                crate::train::ruliad_objective_fingerprint::RuliadObjectivePanelFingerprint::new(
+                    rows.len(),
+                );
+            for row in &rows {
+                let effective_weight = row.presentation_weight * weight;
+                match &row.objective {
+                    ExpertRowObjective::PresentationIndex {
+                        inputs,
+                        branch_position,
+                        candidate_target_tokens,
+                        equivalent_target_tokens,
+                    } => panel.push_prefix(
+                        inputs,
+                        *branch_position,
+                        candidate_target_tokens,
+                        equivalent_target_tokens,
+                        effective_weight,
+                    ),
+                    ExpertRowObjective::SemanticStep {
+                        prompt,
+                        candidate_completions,
+                        equivalent_indices,
+                        target_action_weights,
+                    } => panel.push_sequence(
+                        sequence_kind,
+                        prompt,
+                        candidate_completions,
+                        equivalent_indices,
+                        target_action_weights.as_deref(),
+                        row.target_group,
+                        effective_weight,
+                    ),
+                }
+            }
+            panel.finish()?
+        };
+
+        debug_assert!(rows.len() <= config.max_presentation_rows_per_update);
+        self.write_ruliad_proof_policy_dagger_telemetry(
+            RuliadProofPolicyDaggerTelemetry {
+                version: RULIAD_PROOF_POLICY_TELEMETRY_VERSION,
+                answer_contract: answer_contract.unwrap_or_default().label(),
+                objective: super::ruliad_proof_policy_objective_label(&config),
+                prompt_context: config.prompt_context.as_str(),
+                target: config.target.as_str(),
+                gradient_scope: config.gradient_scope.as_str(),
+                presentation_risk: match config.presentation_risk {
+                    crate::config::RuliadProofPolicyPresentationRisk::Mean => "mean",
+                    crate::config::RuliadProofPolicyPresentationRisk::Worst => "worst",
+                },
+                configured_mode: match config.mode {
+                    crate::config::RuliadProofPolicyTrainingMode::StaticExpert => "static_expert",
+                    crate::config::RuliadProofPolicyTrainingMode::Dagger => "dagger",
+                    crate::config::RuliadProofPolicyTrainingMode::StaticThenPairedDagger => {
+                        "static_then_paired_dagger"
                     }
-                }
-                crate::config::RuliadProofPolicyScoring::CompletionLikelihood => {
-                    match config.normalization {
-                        crate::config::RuliadProofPolicyNormalization::CandidateConditional => {
-                            if config.counterfactual_targets_per_state > 0 {
-                                "candidate_normalized_counterfactual_v1"
-                            } else {
-                                "candidate_normalized_equivalent_v1"
-                            }
-                        }
-                        crate::config::RuliadProofPolicyNormalization::PrefixConditional => {
-                            if config.counterfactual_targets_per_state > 0 {
-                                "prefix_conditional_counterfactual_v1"
-                            } else {
-                                "prefix_conditional_equivalent_v1"
-                            }
-                        }
-                        crate::config::RuliadProofPolicyNormalization::VocabularyMarginal => {
-                            "vocabulary_marginal_equivalent_v1"
-                        }
+                },
+                mode: match effective_mode {
+                    crate::config::RuliadProofPolicyEffectiveMode::StaticExpert => "static_expert",
+                    crate::config::RuliadProofPolicyEffectiveMode::Dagger => "dagger",
+                    crate::config::RuliadProofPolicyEffectiveMode::PairedDagger => "paired_dagger",
+                },
+                candidate_symmetry: match config.candidate_symmetry {
+                    crate::config::RuliadProofPolicyCandidateSymmetry::Canonical => "canonical",
+                    crate::config::RuliadProofPolicyCandidateSymmetry::BalancedRotation => {
+                        "balanced_rotation"
                     }
-                }
-            },
-            gradient_scope: match config.gradient_scope {
-                crate::config::RuliadProofPolicyGradientScope::FullModel => "full_model",
-                crate::config::RuliadProofPolicyGradientScope::ScoreHeadOnly => "score_head_only",
-                crate::config::RuliadProofPolicyGradientScope::LanguageHeadOnly => {
-                    "language_head_only"
-                }
-            },
-            presentation_risk: match config.presentation_risk {
-                crate::config::RuliadProofPolicyPresentationRisk::Mean => "mean",
-                crate::config::RuliadProofPolicyPresentationRisk::Worst => "worst",
-            },
-            configured_mode: match config.mode {
-                crate::config::RuliadProofPolicyTrainingMode::StaticExpert => "static_expert",
-                crate::config::RuliadProofPolicyTrainingMode::Dagger => "dagger",
-                crate::config::RuliadProofPolicyTrainingMode::StaticThenPairedDagger => {
-                    "static_then_paired_dagger"
-                }
-            },
-            mode: match effective_mode {
-                crate::config::RuliadProofPolicyEffectiveMode::StaticExpert => "static_expert",
-                crate::config::RuliadProofPolicyEffectiveMode::Dagger => "dagger",
-                crate::config::RuliadProofPolicyEffectiveMode::PairedDagger => "paired_dagger",
-            },
-            candidate_symmetry: match config.candidate_symmetry {
-                crate::config::RuliadProofPolicyCandidateSymmetry::Canonical => "canonical",
-                crate::config::RuliadProofPolicyCandidateSymmetry::BalancedRotation => {
-                    "balanced_rotation"
-                }
-                crate::config::RuliadProofPolicyCandidateSymmetry::CyclicOrbitAverage => {
-                    "cyclic_orbit_average"
-                }
-            },
-            step_index,
-            skip_reason: rows
-                .is_empty()
-                .then(|| "no_formal_policy_states".to_string()),
-            available_sample_groups,
-            sample_groups,
-            nonzero_start_trajectories,
-            mean_start_step: start_step_sum as f64 / sample_groups.max(1) as f64,
-            visited_states,
-            semantic_state_rows,
-            base_semantic_state_rows,
-            counterfactual_semantic_state_rows,
-            counterfactual_target_shortfall,
-            expert_rows: semantic_state_rows,
-            static_expert_rows,
-            dagger_expert_rows,
-            model_visited_expert_rows,
-            supervised_action_tokens,
-            supervised_presentation_rows: rows.len(),
-            mean_presentations_per_state: rows.len() as f64 / semantic_state_rows.max(1) as f64,
-            model_valid_actions,
-            model_invalid_actions,
-            model_expert_equivalent_actions,
-            model_off_expert_actions,
-            repeated_states,
-            model_backtracks,
-            solved_proofs,
-            model_scoring_batches,
-            maximum_model_scoring_batch_rows,
-            model_scoring_padded_tokens,
-            sampling_model_materialize_ms,
-            state_prepare_ms,
-            rollout_cpu_prepare_ms,
-            model_scoring_ms,
-            difficulty_sample_groups,
-            difficulty_visited_states,
-            difficulty_expert_rows,
-            expert_selected_index_histogram,
-            expert_equivalent_index_histogram,
-            model_selected_index_histogram,
-            candidate_target_tokens,
-            equivalent_target_tokens,
-            mean_candidate_targets_per_row: candidate_target_tokens as f64
-                / rows.len().max(1) as f64,
-            mean_equivalent_targets_per_row: equivalent_target_tokens as f64
-                / rows.len().max(1) as f64,
-            prefix_branch_rows: prefix_branch_rows.len(),
-            prefix_candidate_tokens,
-            prefix_equivalent_tokens,
-            weight,
-            rollout_steps: batch_plan.rollout_steps,
-            rollout_depth_reached,
-            configured_rollout_steps: config.rollout_steps,
-            trajectory_budget,
-            semantic_row_budget,
-            base_semantic_row_budget,
-            configured_counterfactual_targets_per_state: config.counterfactual_targets_per_state,
-            target_variants_per_state: config.target_variants_per_state(),
-            max_rows_per_update: config.max_rows_per_update,
-            max_presentation_rows_per_update: config.max_presentation_rows_per_update,
-        });
+                    crate::config::RuliadProofPolicyCandidateSymmetry::CyclicOrbitAverage => {
+                        "cyclic_orbit_average"
+                    }
+                },
+                step_index,
+                policy_batch_fingerprint: policy_batch.fingerprint(),
+                objective_panel_fingerprint,
+                consolidation_logical_epoch_index: 0,
+                consolidation_logical_selection_step: 0,
+                consolidation_generation_epoch_index: 0,
+                consolidation_enabled: false,
+                consolidation_generation_step: 0,
+                consolidation_released_unique_steps: 0,
+                consolidation_novel: false,
+                skip_reason: rows
+                    .is_empty()
+                    .then(|| "no_formal_policy_states".to_string()),
+                available_sample_groups,
+                sample_groups,
+                nonzero_start_trajectories,
+                mean_start_step: start_step_sum as f64 / sample_groups.max(1) as f64,
+                visited_states,
+                semantic_state_rows,
+                base_semantic_state_rows,
+                counterfactual_semantic_state_rows,
+                counterfactual_target_shortfall,
+                target_group_conditional_groups: if config
+                    .counterfactual_objective
+                    .uses_target_group_support()
+                {
+                    base_semantic_state_rows.saturating_mul(config.presentations_per_state())
+                } else {
+                    0
+                },
+                target_group_conditional_rows: if config
+                    .counterfactual_objective
+                    .uses_target_group_support()
+                {
+                    rows.len()
+                } else {
+                    0
+                },
+                expert_rows: semantic_state_rows,
+                static_expert_rows,
+                dagger_expert_rows,
+                model_visited_expert_rows,
+                supervised_action_tokens,
+                supervised_presentation_rows: rows.len(),
+                mean_presentations_per_state: rows.len() as f64 / semantic_state_rows.max(1) as f64,
+                model_valid_actions,
+                model_invalid_actions,
+                model_expert_equivalent_actions,
+                model_off_expert_actions,
+                repeated_states,
+                model_backtracks,
+                solved_proofs,
+                model_scoring_batches,
+                maximum_model_scoring_batch_rows,
+                model_scoring_padded_tokens,
+                sampling_model_materialize_ms,
+                state_prepare_ms,
+                rollout_cpu_prepare_ms,
+                model_scoring_ms,
+                difficulty_sample_groups,
+                difficulty_visited_states,
+                difficulty_expert_rows,
+                expert_selected_index_histogram,
+                expert_equivalent_index_histogram,
+                model_selected_index_histogram,
+                candidate_target_tokens,
+                equivalent_target_tokens,
+                mean_candidate_targets_per_row: candidate_target_tokens as f64
+                    / rows.len().max(1) as f64,
+                mean_equivalent_targets_per_row: equivalent_target_tokens as f64
+                    / rows.len().max(1) as f64,
+                prefix_branch_rows: prefix_branch_rows.len(),
+                prefix_candidate_tokens,
+                prefix_equivalent_tokens,
+                original_prompt_tokens,
+                retained_prompt_tokens,
+                maximum_original_prompt_tokens,
+                maximum_retained_prompt_tokens,
+                truncated_presentations,
+                prompt_retention_fraction: retained_prompt_tokens as f64
+                    / original_prompt_tokens.max(1) as f64,
+                weight,
+                rollout_steps: effective_rollout_steps,
+                rollout_depth_reached,
+                configured_rollout_steps: config.rollout_steps,
+                trajectory_budget,
+                semantic_row_budget,
+                base_semantic_row_budget,
+                configured_counterfactual_targets_per_state: config
+                    .counterfactual_targets_per_state,
+                counterfactual_objective: config.counterfactual_objective.as_str(),
+                target_variants_per_state: config.target_variants_per_state(),
+                max_rows_per_update: config.max_rows_per_update,
+                max_presentation_rows_per_update: config.max_presentation_rows_per_update,
+            }
+            .with_policy_sampling(Some(policy_batch)),
+        );
         if rows.is_empty() {
             return None;
         }
@@ -2397,6 +2556,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         }
         let presentation_group_size = rows.len() / semantic_state_rows;
         let row_count = rows.len();
+        let target_groups = rows.iter().map(|row| row.target_group).collect::<Vec<_>>();
         let row_weights = Tensor::<B, 1>::from_data(
             TensorData::new(
                 rows.iter()
@@ -2473,6 +2633,20 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                         equivalent_mask_values[row_index * vocab + token] = 1.0;
                     }
                 }
+                let candidate_mask_values = if config
+                    .counterfactual_objective
+                    .uses_target_group_support()
+                {
+                    crate::train::ruliad_policy::target_group_candidate_support_mask(
+                        true,
+                        &equivalent_mask_values,
+                        &target_groups,
+                        vocab,
+                        config.target_variants_per_state(),
+                    )?
+                } else {
+                    candidate_mask_values
+                };
                 let candidate_mask = Tensor::<B, 3>::from_data(
                     TensorData::new(candidate_mask_values, [row_count, 1, vocab]),
                     device,
@@ -2586,11 +2760,15 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                 let mut prompts = Vec::with_capacity(row_count);
                 let mut candidates = Vec::with_capacity(row_count);
                 let mut equivalent_indices = Vec::with_capacity(row_count);
+                let mut target_action_weights = (config.target
+                    == crate::config::RuliadProofPolicyTarget::VerifiedProgressDistribution)
+                    .then(|| Vec::with_capacity(row_count));
                 for row in &rows {
                     let ExpertRowObjective::SemanticStep {
                         prompt,
                         candidate_completions,
                         equivalent_indices: row_equivalent_indices,
+                        target_action_weights: row_target_action_weights,
                     } = &row.objective
                     else {
                         return None;
@@ -2598,6 +2776,13 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                     prompts.push(prompt.clone());
                     candidates.push(candidate_completions.clone());
                     equivalent_indices.push(row_equivalent_indices.clone());
+                    match (&mut target_action_weights, row_target_action_weights) {
+                        (Some(target_action_weights), Some(row_target_action_weights)) => {
+                            target_action_weights.push(row_target_action_weights.clone());
+                        }
+                        (None, None) => {}
+                        _ => return None,
+                    }
                 }
                 let candidate_count = candidates.first()?.len();
                 if candidate_count < 2
@@ -2664,33 +2849,71 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
                     }
                 }
                 let equivalent_mask = Tensor::<B, 2>::from_data(
-                    TensorData::new(equivalent_mask_values, [row_count, candidate_count]),
+                    TensorData::new(equivalent_mask_values.clone(), [row_count, candidate_count]),
                     device,
                 );
-                let padded_tokens = prompts
+                let target_action_weights = target_action_weights
+                    .map(|rows| {
+                        rows.into_iter().flatten().collect::<Vec<_>>()
+                    })
+                    .map(|weights| {
+                        Tensor::<B, 2>::from_data(
+                            TensorData::new(weights, [row_count, candidate_count]),
+                            device,
+                        )
+                    });
+                let support_mask_values =
+                    crate::train::ruliad_policy::target_group_candidate_support_mask(
+                        config.counterfactual_objective.uses_target_group_support(),
+                        &equivalent_mask_values,
+                        &target_groups,
+                        candidate_count,
+                        config.target_variants_per_state(),
+                    )?;
+                let support_mask = Tensor::<B, 2>::from_data(
+                    TensorData::new(support_mask_values, [row_count, candidate_count]),
+                    device,
+                );
+                // The dense scorer concatenates every candidate row into one
+                // tensor and pads to a matrix-wide maximum, not a per-problem
+                // maximum. Report the allocation geometry actually executed.
+                let maximum_sequence_len = prompts
                     .iter()
                     .zip(candidates.iter())
-                    .map(|(prompt, completions)| {
-                        let max_completion = completions.iter().map(Vec::len).max().unwrap_or(0);
-                        prompt
-                            .len()
-                            .saturating_add(max_completion)
-                            .saturating_mul(completions.len())
+                    .flat_map(|(prompt, completions)| {
+                        completions.iter().map(move |completion| {
+                            prompt.len().saturating_add(completion.len())
+                        })
                     })
-                    .sum();
-                Some(RuliadProofPolicyObjective {
-                    loss: grouped_verifier_equivalent_sequence_loss(
+                    .max()
+                    .unwrap_or_default();
+                let candidate_rows = candidates.iter().map(Vec::len).sum::<usize>();
+                let padded_tokens = candidate_rows.saturating_mul(maximum_sequence_len);
+                let loss_config = GroupedVerifierSequenceLossConfig {
+                    normalization: config.normalization,
+                    presentation_risk: config.presentation_risk,
+                    presentation_group_size,
+                    weight,
+                };
+                let loss = match target_action_weights {
+                    Some(target_action_weights) => grouped_verifier_progress_distribution_loss(
+                        mean_log_scores.reshape([row_count, candidate_count]),
+                        support_mask,
+                        target_action_weights,
+                        row_weights,
+                        loss_config,
+                    ),
+                    None => grouped_verifier_equivalent_sequence_loss(
                         mean_log_scores.reshape([row_count, candidate_count]),
                         sum_log_scores.reshape([row_count, candidate_count]),
+                        support_mask,
                         equivalent_mask,
                         row_weights,
-                        GroupedVerifierSequenceLossConfig {
-                            normalization: config.normalization,
-                            presentation_risk: config.presentation_risk,
-                            presentation_group_size,
-                            weight,
-                        },
+                        loss_config,
                     ),
+                };
+                Some(RuliadProofPolicyObjective {
+                    loss,
                     semantic_states: semantic_state_rows,
                     decision_rows: row_count,
                     padded_tokens,

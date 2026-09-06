@@ -193,8 +193,57 @@ fn ruliad_policy_promotion_gate_accepts_solved_stable_trajectory() {
 }
 
 #[test]
+fn ruliad_policy_context_binding_gate_fails_closed_and_rejects_target_independence() {
+    let gate = crate::config::RuliadPolicyPromotionGateConfig {
+        enabled: true,
+        require_context_binding: true,
+        ..Default::default()
+    };
+    let missing = ruliad_policy_context_binding_gate_status(None, gate);
+    assert!(!missing.passed);
+    assert_eq!(missing.reasons, ["context_binding_probe=missing"]);
+
+    let target_independent = RuliadCorrectnessConstrainedPolicyResult {
+        summary: RuliadCorrectnessConstrainedPolicySummary {
+            context_swap_items: 32,
+            counterfactual_target_items: 32,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let status = ruliad_policy_context_binding_gate_status(Some(&target_independent), gate);
+    assert!(!status.passed);
+    assert!(
+        status
+            .reasons
+            .iter()
+            .any(|reason| reason.starts_with("context_swap_top1_change_rate="))
+    );
+    assert!(
+        status
+            .reasons
+            .iter()
+            .any(|reason| reason.starts_with("counterfactual_target_top1_change_rate="))
+    );
+}
+
+#[test]
+fn ruliad_policy_context_binding_gate_accepts_directional_conditioning() {
+    let gate = crate::config::RuliadPolicyPromotionGateConfig {
+        enabled: true,
+        require_context_binding: true,
+        ..Default::default()
+    };
+    let constrained = healthy_context_binding_probe();
+    let status = ruliad_policy_context_binding_gate_status(Some(&constrained), gate);
+    assert!(status.passed, "{:?}", status.reasons);
+}
+
+#[test]
 fn constrained_correctness_scores_equivalent_actions_without_preferred_bias() {
     let job = RuliadCorrectnessConstrainedPolicyJob {
+        difficulty_level: 0,
+        source_label: "fixture".into(),
         presentations: vec![RuliadPolicyActionPresentation {
             rotation: 0,
             prompt_tokens: vec![1, 2],
@@ -227,8 +276,36 @@ fn constrained_correctness_scores_equivalent_actions_without_preferred_bias() {
 }
 
 #[test]
+fn constrained_correctness_bucket_updates_match_the_aggregate() {
+    let job = RuliadCorrectnessConstrainedPolicyJob {
+        difficulty_level: 7,
+        source_label: "source:formal_proof:select_proof_action@d7#proof_action_step".into(),
+        presentations: vec![RuliadPolicyActionPresentation {
+            rotation: 0,
+            prompt_tokens: vec![1, 2],
+            candidate_tokens: vec![vec![3], vec![4]],
+            answer_contract: Default::default(),
+        }],
+        prompt_contexts: Vec::new(),
+        base_context: None,
+        selected_index: 1,
+        equivalent_indices: vec![1],
+    };
+    let mut result = RuliadCorrectnessConstrainedPolicyResult::default();
+    update_ruliad_correctness_constrained_summaries(&mut result, &job, |summary| {
+        record_ruliad_correctness_constrained_scores(summary, &job, &[0.2f32.ln(), 0.8f32.ln()]);
+    });
+
+    assert_eq!(result.summary.items, 1);
+    assert_eq!(result.difficulty_summaries[&7], result.summary);
+    assert_eq!(result.source_summaries[&job.source_label], result.summary);
+}
+
+#[test]
 fn constrained_correctness_context_swap_detects_prompt_dependence() {
     let job = RuliadCorrectnessConstrainedPolicyJob {
+        difficulty_level: 0,
+        source_label: "fixture".into(),
         presentations: vec![RuliadPolicyActionPresentation {
             rotation: 0,
             prompt_tokens: vec![1, 2],
@@ -258,6 +335,8 @@ fn constrained_correctness_context_swap_detects_prompt_dependence() {
 #[test]
 fn constrained_correctness_counterfactual_target_requires_preference_change() {
     let counterfactual_job = RuliadCorrectnessConstrainedPolicyJob {
+        difficulty_level: 0,
+        source_label: "fixture".into(),
         presentations: vec![RuliadPolicyActionPresentation {
             rotation: 0,
             prompt_tokens: vec![1, 2],
@@ -319,6 +398,8 @@ fn context_swap_changes_only_current_and_target_proof_state() {
 #[test]
 fn constrained_correctness_exposes_canonical_and_worst_orbit_behavior() {
     let job = RuliadCorrectnessConstrainedPolicyJob {
+        difficulty_level: 0,
+        source_label: "fixture".into(),
         presentations: vec![RuliadPolicyActionPresentation {
             rotation: 0,
             prompt_tokens: vec![1, 2],
@@ -516,7 +597,28 @@ fn policy_contract_training(
     training.ruliad_policy_probe.enabled = true;
     training.ruliad_policy_probe.checkpoint_capability_contract = contract;
     training.ruliad_policy_probe.promotion_gate.enabled = true;
+    // Legacy rollout-only unit cases exercise the rollout ordering contract.
+    // Context binding has dedicated composite-gate tests below.
     training
+        .ruliad_policy_probe
+        .promotion_gate
+        .require_context_binding = false;
+    training
+}
+
+fn healthy_context_binding_probe() -> RuliadCorrectnessConstrainedPolicyResult {
+    RuliadCorrectnessConstrainedPolicyResult {
+        summary: RuliadCorrectnessConstrainedPolicySummary {
+            context_swap_items: 32,
+            context_swap_top1_changes: 12,
+            context_swap_equivalent_probability_drop_sum: 3.2,
+            counterfactual_target_items: 32,
+            counterfactual_target_top1_changes: 14,
+            counterfactual_target_equivalent_probability_gain_sum: 4.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
 }
 
 fn healthy_policy_rollout(solved: usize, solved_goals: usize) -> RuliadPolicyRolloutProbeResult {
@@ -698,6 +800,7 @@ fn checkpoint_promotion_rejects_loss_only_ruliad_progress_when_free_run_is_flat(
         output_degeneracy: None,
         ruliad_eval_report: Some(ruliad_eval_report(0.0, 0.0, 0.0, 0.0)),
         ruliad_policy_rollout: None,
+        ruliad_constrained_policy: None,
     };
 
     assert!(!should_promote_checkpoint(
@@ -722,6 +825,7 @@ fn checkpoint_promotion_prefers_free_run_ruliad_competence_over_teacher_forced_l
         output_degeneracy: None,
         ruliad_eval_report: Some(ruliad_eval_report(0.01, 0.01, 0.10, 0.10)),
         ruliad_policy_rollout: None,
+        ruliad_constrained_policy: None,
     };
 
     assert!(should_promote_checkpoint(
@@ -748,6 +852,7 @@ fn checkpoint_promotion_rejects_loss_only_when_capability_gate_fails() {
         output_degeneracy: None,
         ruliad_eval_report: Some(report),
         ruliad_policy_rollout: None,
+        ruliad_constrained_policy: None,
     };
 
     assert!(!should_promote_checkpoint(
@@ -771,6 +876,38 @@ fn closed_loop_checkpoint_contract_promotes_policy_with_zero_free_run_verifier()
         ..Default::default()
     };
 
+    assert!(should_promote_checkpoint(
+        &validation,
+        Some(1.0),
+        None,
+        None,
+        &training,
+    ));
+}
+
+#[test]
+fn closed_loop_checkpoint_contract_requires_context_binding_when_configured() {
+    let mut training = policy_contract_training(
+        crate::config::RuliadCheckpointCapabilityContract::ClosedLoopPolicy,
+    );
+    training
+        .ruliad_policy_probe
+        .promotion_gate
+        .require_context_binding = true;
+    let mut validation = DynamicValidationReport {
+        loss: 3.0,
+        ruliad_policy_rollout: Some(healthy_policy_rollout(24, 90)),
+        ..Default::default()
+    };
+    assert!(!should_promote_checkpoint(
+        &validation,
+        Some(1.0),
+        None,
+        None,
+        &training,
+    ));
+
+    validation.ruliad_constrained_policy = Some(healthy_context_binding_probe());
     assert!(should_promote_checkpoint(
         &validation,
         Some(1.0),
@@ -1479,6 +1616,7 @@ fn capability_quality_collapse_requests_source_capability_recovery_during_grace(
             output_degeneracy: None,
             ruliad_eval_report: Some(collapsed_report),
             ruliad_policy_rollout: None,
+            ruliad_constrained_policy: None,
         },
         1,
         0,
@@ -1607,6 +1745,7 @@ fn capability_field_value_collapse_requests_source_capability_recovery_during_gr
             output_degeneracy: None,
             ruliad_eval_report: Some(collapsed_report),
             ruliad_policy_rollout: None,
+            ruliad_constrained_policy: None,
         },
         1,
         0,
@@ -1719,6 +1858,7 @@ fn ruliad_correctness_regression_rolls_back_to_promoted_checkpoint() {
             output_degeneracy: None,
             ruliad_eval_report: Some(report),
             ruliad_policy_rollout: None,
+            ruliad_constrained_policy: None,
         },
         5,
         2559,
@@ -1835,6 +1975,7 @@ fn ruliad_correctness_regression_uses_capability_checkpoint_after_patience() {
                 output_degeneracy: None,
                 ruliad_eval_report: Some(regressed_report.clone()),
                 ruliad_policy_rollout: None,
+                ruliad_constrained_policy: None,
             },
             epoch,
             epoch.saturating_mul(10),
@@ -2041,6 +2182,7 @@ fn continual_learning_output_degeneracy_defers_recovery_to_ecs_without_rollback(
             output_degeneracy: Some(degeneracy_stats(0.1, 0.99, 0.0, 1.0)),
             ruliad_eval_report: None,
             ruliad_policy_rollout: None,
+            ruliad_constrained_policy: None,
         },
         1,
         0,
@@ -2147,6 +2289,7 @@ fn disabled_dynamics_policy_emits_gate_without_recovery_control() {
             output_degeneracy: Some(degeneracy_stats(3.5, 0.52, 0.05, 0.04)),
             ruliad_eval_report: None,
             ruliad_policy_rollout: None,
+            ruliad_constrained_policy: None,
         },
         1,
         0,
@@ -2593,6 +2736,7 @@ fn ruliad_completion_degeneracy_summary_tracks_periodic_answers() {
 
     assert_eq!(summary.sequence_count, 2);
     assert_eq!(summary.token_count, 10);
+    assert_eq!(summary.mean_model_tokens(), 5.0);
     assert!(summary.distinct_2_fraction < 1.0);
     assert_eq!(summary.dominant_period_2_to_64, 2);
     assert!(
@@ -2612,8 +2756,34 @@ fn ruliad_completion_degeneracy_summary_trims_after_close_token() {
 
     assert_eq!(summary.sequence_count, 2);
     assert_eq!(summary.token_count, 6);
+    assert_eq!(summary.mean_model_tokens(), 3.0);
     assert!(summary.repetition_fraction < 0.1, "{summary:?}");
     assert!(summary.max_period_2_to_64_fraction < 0.1, "{summary:?}");
+}
+
+#[test]
+fn ruliad_capability_sample_reports_model_tokens_not_whitespace_segments() {
+    let mut report = ruliad_eval_report(0.0, 0.0, 0.0, 0.0);
+    report.mean_completion_tokens = 1.0;
+    let sample = ruliad_capability_probe_sample(
+        RuliadProbeIdentity {
+            run_name: "model-token-metric",
+            epoch: 0,
+            absolute_step: 0,
+            probe_name: "free_run",
+        },
+        &report,
+        RuliadCompetenceKey::default(),
+        None,
+        &[],
+        Some(RuliadCompletionDegeneracySummary {
+            sequence_count: 2,
+            token_count: 84,
+            ..Default::default()
+        }),
+    );
+
+    assert_eq!(sample.mean_completion_tokens, 42.0);
 }
 
 #[test]
@@ -3537,6 +3707,7 @@ fn proof_action_scoring_chunks_bound_rows_and_padded_tokens() {
 
 fn tiny_training_hparams() -> TrainingHyperparameters {
     TrainingHyperparameters {
+        provenance: Default::default(),
         algorithm: TrainingAlgorithm::Auto,
         block_size: 4,
         tbptt_chunk_size: None,
@@ -3607,11 +3778,43 @@ fn persistent_tbptt_uses_stream_loss_metric_name() {
     training.events.source_selection_every_steps = 2;
 
     assert_eq!(train_loss_metric_name(&training), METRIC_STREAM_WARM_LOSS);
+    assert_eq!(train_objective_metric_name(&training, 0), None);
     assert_eq!(
         crate::train::events::train_loss_metric_frequency(&training, None),
         7
     );
     assert!(!source_selection_telemetry_due_for(&training, None, 0));
+}
+
+#[test]
+fn train_objective_metric_names_scheduled_ruliad_contracts() {
+    let mut training = tiny_training_hparams();
+    training.ruliad_supervision.proof_policy.enabled = true;
+    training.ruliad_supervision.proof_policy.every_steps = 2;
+    training.ruliad_supervision.proof_policy.start_after_steps = 0;
+    training.local_predictive_coding.terminal_criterion =
+        crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSet;
+    assert_eq!(
+        train_objective_metric_name(&training, 0),
+        Some(METRIC_RULIAD_PROOF_POLICY_LOSS),
+    );
+    assert_eq!(train_objective_metric_name(&training, 1), None);
+
+    training.local_predictive_coding.terminal_criterion =
+        crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSetJoint;
+    assert_eq!(
+        train_objective_metric_name(&training, 2),
+        Some(METRIC_RULIAD_JOINT_POLICY_LOSS),
+    );
+
+    training.ruliad_supervision.proof_policy.enabled = false;
+    training.ruliad_supervision.prompt_value_binding.enabled = true;
+    training.ruliad_supervision.prompt_value_binding.every_steps = 1;
+    training.ruliad_supervision.prompt_value_binding.phase_steps = 0;
+    assert_eq!(
+        train_objective_metric_name(&training, 3),
+        Some(METRIC_RULIAD_PROMPT_VALUE_BINDING_LOSS),
+    );
 }
 
 #[test]
@@ -4238,6 +4441,15 @@ fn eggroll_baseline_is_reasonable_against_nearby_variants() {
 }
 
 fn single_device_scheduler_smoke(objective: TrainingObjectiveConfig, run_name: &str) -> f32 {
+    single_device_scheduler_validation_smoke(objective, run_name, 1, false)
+}
+
+fn single_device_scheduler_validation_smoke(
+    objective: TrainingObjectiveConfig,
+    run_name: &str,
+    valid_steps: usize,
+    dynamic: bool,
+) -> f32 {
     let dir = tempfile::tempdir().expect("tempdir");
     let run_dir = dir.path().join("run");
     let parallel_config = burn_dragon_train::ParallelConfig::default();
@@ -4261,12 +4473,13 @@ fn single_device_scheduler_smoke(objective: TrainingObjectiveConfig, run_name: &
             [2, 4],
         ),
     ];
-    let valid_batches = vec![make_batch::<TestValidBackend>(
+    let valid_batch = make_batch::<TestValidBackend>(
         &valid_device,
         &[0, 0, 1, 1, 2, 2, 3, 3],
         &[0, 1, 1, 2, 2, 3, 3, 0],
         [2, 4],
-    )];
+    );
+    let valid_batches = vec![valid_batch; valid_steps];
 
     let training = objective_training_hparams(objective.clone());
     let model_config = tiny_model_config();
@@ -4291,20 +4504,39 @@ fn single_device_scheduler_smoke(objective: TrainingObjectiveConfig, run_name: &
         neuron_scaling_slot: None,
         epochs: 1,
         total_steps: 2,
-        valid_steps: 1,
+        valid_steps,
     };
     let model = LanguageTrainModel::new(DragonModel::<TestBackend>::new(
         model_config.clone(),
         &primary_device,
     ))
     .with_training_objective(objective);
-    let optimizer = AdamWConfig::new()
-        .with_weight_decay(0.0)
-        .init::<TestBackend, LanguageTrainModel<TestBackend>>();
-
-    let trained =
-        train_with_scheduler(&env, model, optimizer, 1e-3).expect("objective scheduler train");
+    let trained = if dynamic {
+        let optimizer = tiny_language_optimizer(&training, &model_config, &primary_device);
+        train_with_dynamic_neuron_scaling_scheduler(&env, model, optimizer, 1e-3)
+            .expect("dynamic scheduler train")
+    } else {
+        let optimizer = AdamWConfig::new()
+            .with_weight_decay(0.0)
+            .init::<TestBackend, LanguageTrainModel<TestBackend>>();
+        train_with_scheduler(&env, model, optimizer, 1e-3).expect("objective scheduler train")
+    };
     assert!(run_dir.join("checkpoint").join("model-1.bin").is_file());
+
+    if dynamic {
+        let events = read_training_events(&run_dir);
+        let validation_metrics = events
+            .iter()
+            .filter(|event| event["type"] == "metric" && event["split"] == "valid")
+            .collect::<Vec<_>>();
+        assert!(!validation_metrics.is_empty());
+        for event in validation_metrics {
+            assert_eq!(
+                event["absolute_step"], 1,
+                "validation must retain the completed training step: {event}"
+            );
+        }
+    }
 
     let probe = make_batch::<TestValidBackend>(
         &valid_device,
@@ -4326,6 +4558,19 @@ fn train_with_scheduler_accepts_next_token_objective_toggle() {
         "single-next-token-objective-smoke",
     );
     assert!(loss.is_finite(), "next_token smoke loss must be finite");
+}
+
+#[test]
+fn validation_clock_is_independent_of_validation_budget() {
+    for batches in [1, 5] {
+        let loss = single_device_scheduler_validation_smoke(
+            TrainingObjectiveConfig::NextToken,
+            "validation-clock-smoke",
+            batches,
+            true,
+        );
+        assert!(loss.is_finite());
+    }
 }
 
 #[test]

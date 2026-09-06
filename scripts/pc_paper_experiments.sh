@@ -13,6 +13,7 @@ BLOCK_SIZE="${BURN_DRAGON_PC_PAPER_BLOCK_SIZE:-}"
 TBPTT_CHUNK_SIZE="${BURN_DRAGON_PC_PAPER_TBPTT_CHUNK_SIZE:-64}"
 TBPTT_PERSIST_ACROSS_STEPS="${BURN_DRAGON_PC_PAPER_TBPTT_PERSIST_ACROSS_STEPS:-}"
 SEQUENCE_BATCHING="${BURN_DRAGON_PC_PAPER_SEQUENCE_BATCHING:-}"
+RULIAD_SOURCE_SELECTION_DOCUMENTS_PER_STEP="${BURN_DRAGON_PC_PAPER_RULIAD_SOURCE_SELECTION_DOCUMENTS_PER_STEP:-${DragonModel_RULIAD_SOURCE_SELECTION_DOCUMENTS_PER_STEP:-}}"
 SEQUENCE_STATE_PROBE="${BURN_DRAGON_PC_PAPER_SEQUENCE_STATE_PROBE:-}"
 SEQUENCE_STATE_PROBE_PAIRED_BATCHES="${BURN_DRAGON_PC_PAPER_SEQUENCE_STATE_PROBE_PAIRED_BATCHES:-8}"
 CHECKPOINT_INTERVAL_ITERS="${BURN_DRAGON_PC_PAPER_CHECKPOINT_INTERVAL_ITERS:-512}"
@@ -25,6 +26,7 @@ RULIAD_CORRECTNESS_PROBE_EVERY_EPOCHS="${BURN_DRAGON_PC_PAPER_RULIAD_CORRECTNESS
 RULIAD_CORRECTNESS_PROBE_ITEMS="${BURN_DRAGON_PC_PAPER_RULIAD_CORRECTNESS_PROBE_ITEMS:-32}"
 RULIAD_POLICY_PROBE_EVERY_EPOCHS="${BURN_DRAGON_PC_PAPER_RULIAD_POLICY_PROBE_EVERY_EPOCHS:-}"
 RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS="${BURN_DRAGON_PC_PAPER_RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS:-}"
+RULIAD_POLICY_PROMPT_CONTEXT="${BURN_DRAGON_PC_PAPER_RULIAD_POLICY_PROMPT_CONTEXT:-local_action_state}"
 RULIAD_DAGGER_START_AFTER_STEPS="${BURN_DRAGON_PC_PAPER_RULIAD_DAGGER_START_AFTER_STEPS:-128}"
 PC_AMORTIZATION_TOLERANCE="${BURN_DRAGON_PC_PAPER_AMORTIZATION_TOLERANCE:-0.05}"
 TIMEOUT_SECONDS="${BURN_DRAGON_PC_PAPER_TIMEOUT_SECONDS:-0}"
@@ -52,6 +54,20 @@ RULIAD_COLD_START_ENABLED="${BURN_DRAGON_PC_PAPER_RULIAD_COLD_START_ENABLED:-}"
 RULIAD_PANEL_MODE="${BURN_DRAGON_PC_PAPER_RULIAD_PANEL_MODE:-auto}"
 RULIAD_PANEL_BASE_DIFFICULTY_LEVELS="${BURN_DRAGON_PC_PAPER_RULIAD_PANEL_BASE_DIFFICULTY_LEVELS:-4}"
 MIN_CAPABILITY_FEEDBACK_ROUNDS="${BURN_DRAGON_PC_PAPER_MIN_CAPABILITY_FEEDBACK_ROUNDS:-0}"
+RULIAD_CONSOLIDATION="${BURN_DRAGON_PC_PAPER_RULIAD_CONSOLIDATION:-0}"
+RULIAD_CONSOLIDATION_INITIAL_UNIQUE_STEPS="${BURN_DRAGON_PC_PAPER_RULIAD_CONSOLIDATION_INITIAL_UNIQUE_STEPS:-16}"
+RULIAD_CONSOLIDATION_HOLD_STEPS="${BURN_DRAGON_PC_PAPER_RULIAD_CONSOLIDATION_HOLD_STEPS:-64}"
+RULIAD_CONSOLIDATION_NOVELTY_INTERVAL_STEPS="${BURN_DRAGON_PC_PAPER_RULIAD_CONSOLIDATION_NOVELTY_INTERVAL_STEPS:-4}"
+RULIAD_CONSOLIDATION_SEED="${BURN_DRAGON_PC_PAPER_RULIAD_CONSOLIDATION_SEED:-6027518751057927917}"
+CHECKPOINT_EVAL="${BURN_DRAGON_PC_PAPER_CHECKPOINT_EVAL:-0}"
+CHECKPOINT_EVAL_FREE_RUN_ITEMS="${BURN_DRAGON_PC_PAPER_CHECKPOINT_EVAL_FREE_RUN_ITEMS:-32}"
+CHECKPOINT_EVAL_POLICY_ITEMS="${BURN_DRAGON_PC_PAPER_CHECKPOINT_EVAL_POLICY_ITEMS:-64}"
+CHECKPOINT_EVAL_DIFFICULTY_LEVELS="${BURN_DRAGON_PC_PAPER_CHECKPOINT_EVAL_DIFFICULTY_LEVELS:-4}"
+CHECKPOINT_EVAL_BATCH_SIZE="${BURN_DRAGON_PC_PAPER_CHECKPOINT_EVAL_BATCH_SIZE:-}"
+CHECKPOINT_EVAL_POLICY_SCORING="${BURN_DRAGON_PC_PAPER_CHECKPOINT_EVAL_POLICY_SCORING:-residual_energy}"
+CHECKPOINT_EVAL_POLICY_MAX_STEPS="${BURN_DRAGON_PC_PAPER_CHECKPOINT_EVAL_POLICY_MAX_STEPS:-0}"
+CHECKPOINT_EVAL_TIMEOUT_SECONDS="${BURN_DRAGON_PC_PAPER_CHECKPOINT_EVAL_TIMEOUT_SECONDS:-600}"
+CHECKPOINT_EVAL_REFERENCE_ARM="${BURN_DRAGON_PC_PAPER_CHECKPOINT_EVAL_REFERENCE_ARM:-}"
 
 usage() {
   cat <<'USAGE'
@@ -70,6 +86,9 @@ Options:
                                local-verifier-trajectory | local-verifier-equivariance |
                                local-verifier-goal-conditioning | local-verifier-closed-loop |
                                local-verifier-source-frozen | local-verifier-exogenous |
+                               local-verifier-semantic-exogenous |
+                               local-verifier-semantic-nonexact |
+                               local-verifier-typed-policy |
                                local-verifier-nonexact |
                                hparam | nextlat-tbptt
   --profile <path>             Base training TOML. Default: ruliad-1m JEPA profile.
@@ -101,6 +120,8 @@ Local-factor controls:
   BURN_DRAGON_PC_PAPER_BLOCK_SIZE                    Optional model/training block size override
   BURN_DRAGON_PC_PAPER_TBPTT_PERSIST_ACROSS_STEPS  true for recurrent matrices
   BURN_DRAGON_PC_PAPER_SEQUENCE_BATCHING            auto | random | streaming
+  BURN_DRAGON_PC_PAPER_RULIAD_SOURCE_SELECTION_DOCUMENTS_PER_STEP
+                                                    Generated documents per live step; default batch size
   BURN_DRAGON_PC_PAPER_SEQUENCE_STATE_PROBE         true for recurrent matrices
   BURN_DRAGON_PC_PAPER_SEQUENCE_STATE_PROBE_PAIRED_BATCHES  Default: 8
   BURN_DRAGON_PC_PAPER_SOURCE_SELECTION_FEEDBACK_UPDATES    true | false | unset
@@ -110,7 +131,21 @@ Local-factor controls:
   BURN_DRAGON_PC_PAPER_RULIAD_PANEL_BASE_DIFFICULTY_LEVELS  Default: 4; 0 disables stratification
   BURN_DRAGON_PC_PAPER_RULIAD_POLICY_PROBE_EVERY_EPOCHS     Optional constrained-action cadence
   BURN_DRAGON_PC_PAPER_RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS  Optional cadence
+  BURN_DRAGON_PC_PAPER_RULIAD_POLICY_PROMPT_CONTEXT  local_action_state | full_problem_suffix
   BURN_DRAGON_PC_PAPER_MIN_CAPABILITY_FEEDBACK_ROUNDS        Fail if a trial has too few epochs
+  BURN_DRAGON_PC_PAPER_RULIAD_CONSOLIDATION                  1 enables deterministic finite-to-open replay
+  BURN_DRAGON_PC_PAPER_RULIAD_CONSOLIDATION_INITIAL_UNIQUE_STEPS  Default: 16
+  BURN_DRAGON_PC_PAPER_RULIAD_CONSOLIDATION_HOLD_STEPS       Default: 64
+  BURN_DRAGON_PC_PAPER_RULIAD_CONSOLIDATION_NOVELTY_INTERVAL_STEPS Default: 4; 1 is fresh-only
+  BURN_DRAGON_PC_PAPER_CHECKPOINT_EVAL                    1 runs the held-out checkpoint evaluator
+  BURN_DRAGON_PC_PAPER_CHECKPOINT_EVAL_FREE_RUN_ITEMS     Default: 32
+  BURN_DRAGON_PC_PAPER_CHECKPOINT_EVAL_POLICY_ITEMS       Default: 64
+  BURN_DRAGON_PC_PAPER_CHECKPOINT_EVAL_DIFFICULTY_LEVELS  Default: 4
+  BURN_DRAGON_PC_PAPER_CHECKPOINT_EVAL_BATCH_SIZE         Default: training batch size
+  BURN_DRAGON_PC_PAPER_CHECKPOINT_EVAL_POLICY_SCORING     Default: residual_energy
+  BURN_DRAGON_PC_PAPER_CHECKPOINT_EVAL_POLICY_MAX_STEPS   Default: 0 (certificate-derived)
+  BURN_DRAGON_PC_PAPER_CHECKPOINT_EVAL_TIMEOUT_SECONDS    Default: 600
+  BURN_DRAGON_PC_PAPER_CHECKPOINT_EVAL_REFERENCE_ARM      Default: first matrix arm
 
 The runner isolates every trial under its own BURN_DRAGON_RUN_ROOT and writes
 one JSON manifest per trial. Raw checkpoints and metric events remain under
@@ -207,6 +242,10 @@ if [[ "$DRY_RUN" != "0" && "$DRY_RUN" != "1" ]]; then
 fi
 if [[ "$REQUIRE_CLEAN_GIT" != "0" && "$REQUIRE_CLEAN_GIT" != "1" ]]; then
   echo "BURN_DRAGON_PC_PAPER_REQUIRE_CLEAN_GIT must be 0 or 1; got $REQUIRE_CLEAN_GIT" >&2
+  exit 2
+fi
+if [[ "$RULIAD_POLICY_PROMPT_CONTEXT" != "local_action_state" && "$RULIAD_POLICY_PROMPT_CONTEXT" != "full_problem_suffix" ]]; then
+  echo "BURN_DRAGON_PC_PAPER_RULIAD_POLICY_PROMPT_CONTEXT must be local_action_state or full_problem_suffix; got $RULIAD_POLICY_PROMPT_CONTEXT" >&2
   exit 2
 fi
 if ! MAX_SYSTEM_MEMORY_FRACTION_BPS="$({
@@ -666,6 +705,81 @@ matrix_defaults() {
         TIMEOUT_SECONDS=3600
       fi
       ;;
+    local-verifier-semantic-exogenous)
+      : "${PROFILE:=config/language/experiments/predictive_coding/local-pc-verifier-1m-semantic-policy.toml}"
+      : "${SEEDS_CSV:=20261020,20261021,20261022}"
+      : "${ITERS_CSV:=512}"
+      : "${ARMS_CSV:=local_backprop_verifier_static_semantic_cf1,local_pc_fixed_verifier_static_semantic_cf1}"
+      : "${BATCH_SIZE:=32}"
+      if [[ -n "${BURN_DRAGON_PC_PAPER_SOURCE_SELECTION_FEEDBACK_UPDATES:-}"
+        && "$BURN_DRAGON_PC_PAPER_SOURCE_SELECTION_FEEDBACK_UPDATES" != "false" ]]; then
+        echo "local-verifier-semantic-exogenous requires source-selection feedback updates=false" >&2
+        exit 2
+      fi
+      SOURCE_SELECTION_FEEDBACK_UPDATES=false
+      CHECKPOINT_INTERVAL_ITERS="${BURN_DRAGON_PC_PAPER_CHECKPOINT_INTERVAL_ITERS:-128}"
+      TBPTT_CHUNK_SIZE="${BURN_DRAGON_PC_PAPER_TBPTT_CHUNK_SIZE:-64}"
+      TBPTT_PERSIST_ACROSS_STEPS="${TBPTT_PERSIST_ACROSS_STEPS:-true}"
+      SEQUENCE_BATCHING="${SEQUENCE_BATCHING:-streaming}"
+      SEQUENCE_STATE_PROBE="${SEQUENCE_STATE_PROBE:-true}"
+      RULIAD_CORRECTNESS_PROBE_EVERY_EPOCHS="${BURN_DRAGON_PC_PAPER_RULIAD_CORRECTNESS_PROBE_EVERY_EPOCHS:-1}"
+      RULIAD_POLICY_PROBE_EVERY_EPOCHS="${RULIAD_POLICY_PROBE_EVERY_EPOCHS:-1}"
+      RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS="${RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS:-1}"
+      MIN_CAPABILITY_FEEDBACK_ROUNDS="${BURN_DRAGON_PC_PAPER_MIN_CAPABILITY_FEEDBACK_ROUNDS:-0}"
+      if [[ "$TIMEOUT_SECONDS" == "0" ]]; then
+        TIMEOUT_SECONDS=3600
+      fi
+      ;;
+    local-verifier-semantic-nonexact)
+      : "${PROFILE:=config/language/experiments/predictive_coding/local-pc-verifier-1m-semantic-policy.toml}"
+      : "${SEEDS_CSV:=20261030,20261031,20261032}"
+      : "${ITERS_CSV:=128}"
+      : "${ARMS_CSV:=local_backprop_verifier_static_semantic_cf1,local_pc_fixed_verifier_static_semantic_cf1,local_pc_epc_verifier_static_semantic_cf1,local_pc_alm_verifier_static_semantic_cf1}"
+      : "${BATCH_SIZE:=32}"
+      if [[ -n "${BURN_DRAGON_PC_PAPER_SOURCE_SELECTION_FEEDBACK_UPDATES:-}"
+        && "$BURN_DRAGON_PC_PAPER_SOURCE_SELECTION_FEEDBACK_UPDATES" != "false" ]]; then
+        echo "local-verifier-semantic-nonexact requires source-selection feedback updates=false" >&2
+        exit 2
+      fi
+      SOURCE_SELECTION_FEEDBACK_UPDATES=false
+      CHECKPOINT_INTERVAL_ITERS="${BURN_DRAGON_PC_PAPER_CHECKPOINT_INTERVAL_ITERS:-128}"
+      TBPTT_CHUNK_SIZE="${BURN_DRAGON_PC_PAPER_TBPTT_CHUNK_SIZE:-64}"
+      TBPTT_PERSIST_ACROSS_STEPS="${TBPTT_PERSIST_ACROSS_STEPS:-true}"
+      SEQUENCE_BATCHING="${SEQUENCE_BATCHING:-streaming}"
+      SEQUENCE_STATE_PROBE="${SEQUENCE_STATE_PROBE:-true}"
+      RULIAD_CORRECTNESS_PROBE_EVERY_EPOCHS="${BURN_DRAGON_PC_PAPER_RULIAD_CORRECTNESS_PROBE_EVERY_EPOCHS:-1}"
+      RULIAD_POLICY_PROBE_EVERY_EPOCHS="${RULIAD_POLICY_PROBE_EVERY_EPOCHS:-1}"
+      RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS="${RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS:-1}"
+      MIN_CAPABILITY_FEEDBACK_ROUNDS="${BURN_DRAGON_PC_PAPER_MIN_CAPABILITY_FEEDBACK_ROUNDS:-0}"
+      if [[ "$TIMEOUT_SECONDS" == "0" ]]; then
+        TIMEOUT_SECONDS=3600
+      fi
+      ;;
+    local-verifier-typed-policy)
+      : "${PROFILE:=config/language/experiments/predictive_coding/local-pc-verifier-1m-semantic-policy.toml}"
+      : "${SEEDS_CSV:=20261040,20261041,20261042}"
+      : "${ITERS_CSV:=1024}"
+      : "${ARMS_CSV:=local_backprop_verifier_static_candidate,local_pc_fixed_verifier_static_candidate,local_pc_epc_verifier_static_candidate}"
+      : "${BATCH_SIZE:=64}"
+      if [[ -n "${BURN_DRAGON_PC_PAPER_SOURCE_SELECTION_FEEDBACK_UPDATES:-}"
+        && "$BURN_DRAGON_PC_PAPER_SOURCE_SELECTION_FEEDBACK_UPDATES" != "false" ]]; then
+        echo "local-verifier-typed-policy requires source-selection feedback updates=false" >&2
+        exit 2
+      fi
+      SOURCE_SELECTION_FEEDBACK_UPDATES=false
+      CHECKPOINT_INTERVAL_ITERS="${BURN_DRAGON_PC_PAPER_CHECKPOINT_INTERVAL_ITERS:-256}"
+      TBPTT_CHUNK_SIZE="${BURN_DRAGON_PC_PAPER_TBPTT_CHUNK_SIZE:-128}"
+      TBPTT_PERSIST_ACROSS_STEPS="${TBPTT_PERSIST_ACROSS_STEPS:-false}"
+      SEQUENCE_BATCHING="${SEQUENCE_BATCHING:-random}"
+      SEQUENCE_STATE_PROBE="${SEQUENCE_STATE_PROBE:-true}"
+      RULIAD_CORRECTNESS_PROBE_EVERY_EPOCHS="${BURN_DRAGON_PC_PAPER_RULIAD_CORRECTNESS_PROBE_EVERY_EPOCHS:-1}"
+      RULIAD_POLICY_PROBE_EVERY_EPOCHS="${RULIAD_POLICY_PROBE_EVERY_EPOCHS:-1}"
+      RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS="${RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS:-1}"
+      MIN_CAPABILITY_FEEDBACK_ROUNDS="${BURN_DRAGON_PC_PAPER_MIN_CAPABILITY_FEEDBACK_ROUNDS:-0}"
+      if [[ "$TIMEOUT_SECONDS" == "0" ]]; then
+        TIMEOUT_SECONDS=3600
+      fi
+      ;;
     local-verifier-nonexact)
       : "${PROFILE:=config/language/experiments/predictive_coding/local-pc-verifier-1m.toml}"
       : "${SEEDS_CSV:=20260910,20260911,20260912}"
@@ -714,6 +828,17 @@ matrix_defaults() {
 }
 
 matrix_defaults
+: "${CHECKPOINT_EVAL_BATCH_SIZE:=$BATCH_SIZE}"
+
+# Open-loop verifier matrices intentionally freeze source-policy feedback so the
+# optimizer is the only changing condition. A mastery-gated cold start cannot
+# release without that feedback, so expose the materialized frontier unless the
+# caller explicitly requests a cold-start ablation.
+if [[ "$MATRIX" == local-verifier-* \
+  && "$SOURCE_SELECTION_FEEDBACK_UPDATES" == "false" \
+  && -z "${BURN_DRAGON_PC_PAPER_RULIAD_COLD_START_ENABLED:-}" ]]; then
+  RULIAD_COLD_START_ENABLED=false
+fi
 
 if [[ "$DEFER_EXPENSIVE_RULIAD_PROBES" != "0" && "$DEFER_EXPENSIVE_RULIAD_PROBES" != "1" ]]; then
   echo "BURN_DRAGON_PC_PAPER_DEFER_EXPENSIVE_RULIAD_PROBES must be 0 or 1" >&2
@@ -759,6 +884,28 @@ fi
 if [[ ! "$MIN_CAPABILITY_FEEDBACK_ROUNDS" =~ ^[0-9]+$ ]]; then
   echo "BURN_DRAGON_PC_PAPER_MIN_CAPABILITY_FEEDBACK_ROUNDS must be a non-negative integer" >&2
   exit 2
+fi
+if [[ "$RULIAD_CONSOLIDATION" != "0" && "$RULIAD_CONSOLIDATION" != "1" ]]; then
+  echo "BURN_DRAGON_PC_PAPER_RULIAD_CONSOLIDATION must be 0 or 1" >&2
+  exit 2
+fi
+for consolidation_value in \
+  "$RULIAD_CONSOLIDATION_INITIAL_UNIQUE_STEPS" \
+  "$RULIAD_CONSOLIDATION_HOLD_STEPS" \
+  "$RULIAD_CONSOLIDATION_NOVELTY_INTERVAL_STEPS" \
+  "$RULIAD_CONSOLIDATION_SEED"; do
+  if [[ ! "$consolidation_value" =~ ^[0-9]+$ ]]; then
+    echo "Ruliad consolidation values must be non-negative integers; got $consolidation_value" >&2
+    exit 2
+  fi
+done
+if (( RULIAD_CONSOLIDATION == 1 )); then
+  if (( RULIAD_CONSOLIDATION_INITIAL_UNIQUE_STEPS == 0 \
+    || RULIAD_CONSOLIDATION_NOVELTY_INTERVAL_STEPS == 0 \
+    || RULIAD_CONSOLIDATION_HOLD_STEPS < RULIAD_CONSOLIDATION_INITIAL_UNIQUE_STEPS )); then
+    echo "Ruliad consolidation requires positive initial/novelty values and hold >= initial" >&2
+    exit 2
+  fi
 fi
 if (( MIN_CAPABILITY_FEEDBACK_ROUNDS > 0 )); then
   if [[ "$SOURCE_SELECTION_FEEDBACK_UPDATES" != "true" ]]; then
@@ -827,6 +974,40 @@ case "$RULIAD_PANEL_MODE" in
     ;;
 esac
 
+case "$CHECKPOINT_EVAL" in
+  0|1) ;;
+  *)
+    echo "BURN_DRAGON_PC_PAPER_CHECKPOINT_EVAL must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
+case "$CHECKPOINT_EVAL_POLICY_SCORING" in
+  completion_likelihood|semantic_energy|residual_energy) ;;
+  *)
+    echo "BURN_DRAGON_PC_PAPER_CHECKPOINT_EVAL_POLICY_SCORING must be completion_likelihood, semantic_energy, or residual_energy" >&2
+    exit 2
+    ;;
+esac
+for checkpoint_eval_positive in \
+  "$CHECKPOINT_EVAL_FREE_RUN_ITEMS" \
+  "$CHECKPOINT_EVAL_POLICY_ITEMS" \
+  "$CHECKPOINT_EVAL_DIFFICULTY_LEVELS" \
+  "$CHECKPOINT_EVAL_BATCH_SIZE" \
+  "$CHECKPOINT_EVAL_TIMEOUT_SECONDS"; do
+  if [[ ! "$checkpoint_eval_positive" =~ ^[1-9][0-9]*$ ]]; then
+    echo "checkpoint evaluation item, batch, difficulty, and timeout values must be positive integers; got $checkpoint_eval_positive" >&2
+    exit 2
+  fi
+done
+if [[ ! "$CHECKPOINT_EVAL_POLICY_MAX_STEPS" =~ ^[0-9]+$ ]]; then
+  echo "BURN_DRAGON_PC_PAPER_CHECKPOINT_EVAL_POLICY_MAX_STEPS must be a non-negative integer" >&2
+  exit 2
+fi
+if (( CHECKPOINT_EVAL == 1 )) && ! profile_extends_ruliad "$PROFILE"; then
+  echo "checkpoint Ruliad evaluation requires a universality_ruliad profile" >&2
+  exit 2
+fi
+
 : "${TBPTT_PERSIST_ACROSS_STEPS:=false}"
 : "${SEQUENCE_BATCHING:=auto}"
 : "${SEQUENCE_STATE_PROBE:=false}"
@@ -863,6 +1044,12 @@ if [[ "$TBPTT_PERSIST_ACROSS_STEPS" == "true" && "$SEQUENCE_BATCHING" == "random
   echo "persistent TBPTT requires auto or streaming sequence batching" >&2
   exit 2
 fi
+if [[ -n "$RULIAD_SOURCE_SELECTION_DOCUMENTS_PER_STEP" ]] &&
+  { ! [[ "$RULIAD_SOURCE_SELECTION_DOCUMENTS_PER_STEP" =~ ^[0-9]+$ ]] ||
+    (( RULIAD_SOURCE_SELECTION_DOCUMENTS_PER_STEP <= 0 )); }; then
+  echo "BURN_DRAGON_PC_PAPER_RULIAD_SOURCE_SELECTION_DOCUMENTS_PER_STEP must be positive when set" >&2
+  exit 2
+fi
 if [[ "$VALIDATION_OBJECTIVE" == "source_weighted" ]]; then
   if (( SOURCE_WEIGHTED_VALIDATION_BATCHES <= 0 )); then
     echo "source_weighted validation requires positive source-weighted validation batches" >&2
@@ -886,7 +1073,7 @@ if (( DRY_RUN == 1 && BUILD_RELEASE == 1 )); then
   BUILD_RELEASE=0
 fi
 
-mkdir -p "$OUT_DIR/overlays" "$OUT_DIR/logs" "$OUT_DIR/manifests" "$OUT_DIR/run_roots" "$OUT_DIR/gpu"
+mkdir -p "$OUT_DIR/overlays" "$OUT_DIR/logs" "$OUT_DIR/manifests" "$OUT_DIR/run_roots" "$OUT_DIR/gpu" "$OUT_DIR/checkpoint_evaluations"
 RULIAD_PANEL_PATH="$OUT_DIR/panels/ruliad-validation-panel.json"
 RUN_INDEX="$OUT_DIR/run-index.tsv"
 if [[ ! -f "$RUN_INDEX" ]]; then
@@ -894,16 +1081,26 @@ if [[ ! -f "$RUN_INDEX" ]]; then
 fi
 
 if (( BUILD_RELEASE == 1 )); then
-  echo "building release train_language example"
+  echo "building release experiment examples"
   (
     cd "$ROOT_DIR"
     export RUSTC="$RUSTUP_RUSTC"
     export CARGO="$RUSTUP_CARGO"
-    "$RUSTUP_CARGO" build --release -p burn_dragon_language --example train_language --features "$FEATURES"
+    build_examples=(--example train_language)
+    if (( CHECKPOINT_EVAL == 1 )); then
+      build_examples+=(--example evaluate_ruliad_checkpoint)
+    fi
+    "$RUSTUP_CARGO" build --release -p burn_dragon_language "${build_examples[@]}" --features "$FEATURES"
   )
 fi
 if (( DRY_RUN == 0 )) && [[ ! -x "$TRAIN_BINARY" ]]; then
   echo "release train_language executable is missing: $TRAIN_BINARY" >&2
+  echo "rerun without --no-build" >&2
+  exit 2
+fi
+EVAL_BINARY="${BURN_DRAGON_PC_PAPER_EVAL_BINARY:-$ROOT_DIR/target/release/examples/evaluate_ruliad_checkpoint}"
+if (( DRY_RUN == 0 && CHECKPOINT_EVAL == 1 )) && [[ ! -x "$EVAL_BINARY" ]]; then
+  echo "release evaluate_ruliad_checkpoint executable is missing: $EVAL_BINARY" >&2
   echo "rerun without --no-build" >&2
   exit 2
 fi
@@ -942,6 +1139,12 @@ MONITOR_STATUS="not_started"
 MONITOR_PEAK_USED_MB=0
 MONITOR_MIN_AVAILABLE_MB=0
 MONITOR_ELAPSED_SECONDS=0
+CHECKPOINT_EVAL_PATH_CURRENT=""
+CHECKPOINT_EVAL_LOG_CURRENT=""
+CHECKPOINT_EVAL_STATUS_CURRENT="disabled"
+CHECKPOINT_EVAL_ELAPSED_SECONDS_CURRENT=0
+CHECKPOINT_EVAL_PEAK_USED_MB_CURRENT=0
+CHECKPOINT_EVAL_MIN_AVAILABLE_MB_CURRENT=0
 
 monitor_process() {
   local pid="$1"
@@ -1022,6 +1225,136 @@ monitor_process() {
   MONITOR_ELAPSED_SECONDS="$elapsed"
 }
 
+run_checkpoint_evaluation() {
+  local trial_key="$1"
+  local arm="$2"
+  local seed="$3"
+  local iters="$4"
+  local run_dir="$5"
+  local output_dir="$OUT_DIR/checkpoint_evaluations/iters${iters}"
+  local output_path="$output_dir/${arm}-seed${seed}.json"
+  local log_path="$OUT_DIR/logs/${trial_key}.checkpoint-eval.log"
+
+  CHECKPOINT_EVAL_PATH_CURRENT="$output_path"
+  CHECKPOINT_EVAL_LOG_CURRENT="$log_path"
+  CHECKPOINT_EVAL_STATUS_CURRENT="not_started"
+  CHECKPOINT_EVAL_ELAPSED_SECONDS_CURRENT=0
+  CHECKPOINT_EVAL_PEAK_USED_MB_CURRENT=0
+  CHECKPOINT_EVAL_MIN_AVAILABLE_MB_CURRENT=0
+
+  if [[ -z "$run_dir" || ! -d "$run_dir" ]]; then
+    CHECKPOINT_EVAL_STATUS_CURRENT="missing_run_dir"
+    printf "checkpoint evaluation cannot locate run directory: %s\n" "$run_dir" > "$log_path"
+    return 1
+  fi
+
+  mkdir -p "$output_dir"
+  local cmd=(
+    "$EVAL_BINARY"
+    --backend "$BACKEND"
+    --checkpoint "$run_dir"
+    --output "$output_path"
+    --free-run-items "$CHECKPOINT_EVAL_FREE_RUN_ITEMS"
+    --policy-items "$CHECKPOINT_EVAL_POLICY_ITEMS"
+    --difficulty-levels "$CHECKPOINT_EVAL_DIFFICULTY_LEVELS"
+    --batch-size "$CHECKPOINT_EVAL_BATCH_SIZE"
+    --policy-scoring "$CHECKPOINT_EVAL_POLICY_SCORING"
+    --policy-max-steps "$CHECKPOINT_EVAL_POLICY_MAX_STEPS"
+  )
+  printf "command:" > "$log_path"
+  printf " %q" "${cmd[@]}" >> "$log_path"
+  printf "\n" >> "$log_path"
+
+  (
+    cd "$ROOT_DIR"
+    exec "${cmd[@]}"
+  ) >> "$log_path" 2>&1 &
+  local pid=$!
+  local training_timeout="$TIMEOUT_SECONDS"
+  local training_wall_clock="$WALL_CLOCK_SECONDS"
+  TIMEOUT_SECONDS="$CHECKPOINT_EVAL_TIMEOUT_SECONDS"
+  WALL_CLOCK_SECONDS=0
+  monitor_process "$pid" "$log_path" ""
+  TIMEOUT_SECONDS="$training_timeout"
+  WALL_CLOCK_SECONDS="$training_wall_clock"
+
+  CHECKPOINT_EVAL_STATUS_CURRENT="$MONITOR_STATUS"
+  CHECKPOINT_EVAL_ELAPSED_SECONDS_CURRENT="$MONITOR_ELAPSED_SECONDS"
+  CHECKPOINT_EVAL_PEAK_USED_MB_CURRENT="$MONITOR_PEAK_USED_MB"
+  CHECKPOINT_EVAL_MIN_AVAILABLE_MB_CURRENT="$MONITOR_MIN_AVAILABLE_MB"
+  if [[ "$CHECKPOINT_EVAL_STATUS_CURRENT" != "ok" ]]; then
+    return 1
+  fi
+  if [[ ! -s "$output_path" ]]; then
+    CHECKPOINT_EVAL_STATUS_CURRENT="missing_report"
+    echo "checkpoint evaluator completed without a report: $output_path" >> "$log_path"
+    return 1
+  fi
+  if ! python3 - "$output_path" "$CHECKPOINT_EVAL_FREE_RUN_ITEMS" "$CHECKPOINT_EVAL_POLICY_ITEMS" "$CHECKPOINT_EVAL_DIFFICULTY_LEVELS" >> "$log_path" <<'PY'
+import json
+import math
+import sys
+
+path, raw_free_items, raw_policy_items, raw_difficulty_levels = sys.argv[1:]
+free_items = int(raw_free_items)
+policy_items = int(raw_policy_items)
+difficulty_levels = int(raw_difficulty_levels)
+with open(path, encoding="utf-8") as stream:
+    document = json.load(stream)
+evaluation = document.get("evaluation")
+if not isinstance(evaluation, dict):
+    raise SystemExit("checkpoint evaluation is missing its evaluation object")
+fingerprint = evaluation.get("panel_fingerprint_sha256")
+if not isinstance(fingerprint, str) or len(fingerprint) != 64:
+    raise SystemExit("checkpoint evaluation is missing a SHA-256 panel fingerprint")
+free = evaluation.get("free_run", {}).get("report", {})
+policy_context_free = evaluation.get("policy_context_free_run", {}).get("report", {})
+structured = evaluation.get("structured_policy_decode", {}).get("report", {})
+policy = evaluation.get("constrained_policy")
+rollout = evaluation.get("closed_loop_rollout")
+if free.get("scored_count") != free_items:
+    raise SystemExit(f"free-run item mismatch: {free.get('scored_count')} != {free_items}")
+if not isinstance(policy_context_free, dict) or policy_context_free.get("scored_count") != policy_items:
+    raise SystemExit("policy-context free-run report is missing or has the wrong item count")
+if not isinstance(structured, dict) or structured.get("scored_count") != policy_items:
+    raise SystemExit("structured-policy report is missing or has the wrong item count")
+if not isinstance(policy, dict) or policy.get("items") != policy_items:
+    raise SystemExit("constrained-policy report is missing or has the wrong item count")
+if not isinstance(rollout, dict) or rollout.get("items") != policy_items:
+    raise SystemExit("closed-loop rollout is missing or has the wrong item count")
+by_difficulty = evaluation.get("rollout_by_difficulty")
+expected_difficulties = {str(level) for level in range(difficulty_levels)}
+if not isinstance(by_difficulty, dict) or set(by_difficulty) != expected_difficulties:
+    raise SystemExit(
+        f"rollout difficulty coverage mismatch: {sorted(by_difficulty or {})} "
+        f"!= {sorted(expected_difficulties)}"
+    )
+if sum(int(row.get("items", 0)) for row in by_difficulty.values()) != policy_items:
+    raise SystemExit("rollout difficulty item counts do not sum to the policy panel")
+for section, keys in (
+    (free, ("verifier_accuracy", "partial_credit_rate")),
+    (policy_context_free, ("verifier_accuracy", "partial_credit_rate")),
+    (structured, ("verifier_accuracy", "partial_credit_rate")),
+    (policy, ("equivalent_top1_rate", "equivalent_nll", "valid_invalid_margin")),
+    (rollout, ("solve_rate", "goal_completion_rate", "valid_action_rate", "top1_expert_rate")),
+):
+    for key in keys:
+        value = section.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise SystemExit(f"checkpoint evaluation metric is missing/non-finite: {key}={value!r}")
+print(
+    "checkpoint evaluation contract passed: "
+    f"panel={fingerprint} free_items={free_items} policy_items={policy_items} "
+    f"difficulty_levels={difficulty_levels} solve_rate={rollout['solve_rate']}"
+)
+PY
+  then
+    CHECKPOINT_EVAL_STATUS_CURRENT="failed_report_contract"
+    return 1
+  fi
+  return 0
+}
+
 write_pc_block() {
   local path="$1"
   local enabled="$2"
@@ -1060,6 +1393,19 @@ write_pc_block() {
   } >> "$path"
 }
 
+effective_tbptt_chunk_size_for_arm() {
+  local arm="$1"
+  if [[ "$arm" == local_backprop* && "$arm" == *joint* && "$TBPTT_PERSIST_ACROSS_STEPS" == "true" ]]; then
+    if [[ -z "$BLOCK_SIZE" ]]; then
+      echo "joint persistent-backprop arms require BURN_DRAGON_PC_PAPER_BLOCK_SIZE so the full temporal window is explicit" >&2
+      return 2
+    fi
+    printf '%s\n' "$BLOCK_SIZE"
+  else
+    printf '%s\n' "$TBPTT_CHUNK_SIZE"
+  fi
+}
+
 write_overlay() {
   local path="$1"
   local arm="$2"
@@ -1077,11 +1423,16 @@ write_overlay() {
   local lr_schedule="constant"
   local verifier_every_steps=4
   local policy_scoring="completion_likelihood"
+  local policy_decoder_calibration_steps=0
+  local policy_prompt_context="$RULIAD_POLICY_PROMPT_CONTEXT"
+  local policy_target="expert_set"
   local policy_normalization="prefix_conditional"
   local policy_gradient_scope="full_model"
+  local policy_gradient_scope_override=""
   local policy_candidate_symmetry="balanced_rotation"
   local policy_presentation_risk="mean"
   local policy_counterfactual_targets=0
+  local policy_counterfactual_objective="independent"
   local policy_probe_scoring=""
   local policy_probe_normalization="candidate_conditional"
   local policy_sequence_score_head=false
@@ -1091,8 +1442,62 @@ write_overlay() {
   local policy_dynamic_max_rows_per_update=16
   local policy_dynamic_max_presentation_rows_per_update=128
   local model_sequence_executor="dense_score_short_context"
+  local verifier_terminal_criterion="ruliad_verifier_set"
+  local pc_inference_steps=1
+  local pc_step_size=0.1
+  local pc_prediction_precision=10.0
+  local pc_hparams_encoded=false
+  local pc_next_token_solver=""
+  local pc_objective_routing_block=""
+  local effective_tbptt_chunk_size
+  effective_tbptt_chunk_size="$(effective_tbptt_chunk_size_for_arm "$arm")" || return
 
   while true; do
+    if [[ "$behavior_arm" =~ ^(.+)_fullctx$ ]]; then
+      behavior_arm="${BASH_REMATCH[1]}"
+      policy_prompt_context="full_problem_suffix"
+      continue
+    fi
+    if [[ "$behavior_arm" =~ ^(.+)_localctx$ ]]; then
+      behavior_arm="${BASH_REMATCH[1]}"
+      policy_prompt_context="local_action_state"
+      continue
+    fi
+    if [[ "$behavior_arm" =~ ^(.+)_progress$ ]]; then
+      behavior_arm="${BASH_REMATCH[1]}"
+      policy_target="verified_progress_distribution"
+      continue
+    fi
+    if [[ "$behavior_arm" =~ ^(.+)_targetgroup$ ]]; then
+      behavior_arm="${BASH_REMATCH[1]}"
+      policy_counterfactual_objective="target_group_conditional"
+      continue
+    fi
+    if [[ "$behavior_arm" =~ ^(.+)_targetjoint$ ]]; then
+      behavior_arm="${BASH_REMATCH[1]}"
+      policy_counterfactual_objective="target_group_joint"
+      continue
+    fi
+    if [[ "$behavior_arm" =~ ^(.+)_factorjoint$ ]]; then
+      behavior_arm="${BASH_REMATCH[1]}"
+      policy_counterfactual_objective="factorized_joint"
+      continue
+    fi
+    if [[ "$behavior_arm" =~ ^(.+)_decodercoupled$ ]]; then
+      behavior_arm="${BASH_REMATCH[1]}"
+      policy_counterfactual_objective="decoder_coupled_joint"
+      continue
+    fi
+    if [[ "$behavior_arm" =~ ^(.+)_policypath$ ]]; then
+      behavior_arm="${BASH_REMATCH[1]}"
+      policy_gradient_scope_override="policy_path"
+      continue
+    fi
+    if [[ "$behavior_arm" =~ ^(.+)_deccal([1-9][0-9]*)$ ]]; then
+      behavior_arm="${BASH_REMATCH[1]}"
+      policy_decoder_calibration_steps="${BASH_REMATCH[2]}"
+      continue
+    fi
     if [[ "$behavior_arm" =~ ^(.+)_cosine$ ]]; then
       behavior_arm="${BASH_REMATCH[1]}"
       lr_schedule="cosine"
@@ -1103,10 +1508,35 @@ write_overlay() {
       verifier_every_steps="${BASH_REMATCH[2]}"
       continue
     fi
+    if [[ "$behavior_arm" =~ ^(.+)_routefixed$ ]]; then
+      behavior_arm="${BASH_REMATCH[1]}"
+      pc_next_token_solver="fixed_prediction"
+      pc_objective_routing_block=$'\n[training.local_predictive_coding.objective_routing]\nnext_token_solver = "fixed_prediction"\n'
+      continue
+    fi
+    if [[ "$behavior_arm" =~ ^(.+_verifier[^[:space:]]*)_pcsteps(1|2|4|5|6|8|16)_eta(001|003|005|01|03|05|10|20)_prec(1|3|10|30)$ ]]; then
+      behavior_arm="${BASH_REMATCH[1]}"
+      pc_inference_steps="${BASH_REMATCH[2]}"
+      case "${BASH_REMATCH[3]}" in
+        001) pc_step_size=0.001 ;;
+        003) pc_step_size=0.003 ;;
+        005) pc_step_size=0.005 ;;
+        01) pc_step_size=0.01 ;;
+        03) pc_step_size=0.03 ;;
+        05) pc_step_size=0.05 ;;
+        10) pc_step_size=0.1 ;;
+        20) pc_step_size=0.2 ;;
+      esac
+      pc_prediction_precision="${BASH_REMATCH[4]}.0"
+      pc_hparams_encoded=true
+      continue
+    fi
     break
   done
-  if [[ "$lr_schedule" == "cosine" && "$behavior_arm" != "local_backprop" && "$behavior_arm" != "local_pc_fixed_prediction" ]]; then
-    echo "cosine schedule decorator currently supports local_backprop and local_pc_fixed_prediction only: arm=$arm" >&2
+  if [[ "$lr_schedule" == "cosine"
+    && "$behavior_arm" != local_backprop*
+    && "$behavior_arm" != local_pc* ]]; then
+    echo "cosine schedule decorator requires a gradient-training arm: arm=$arm" >&2
     return 2
   fi
   if [[ "$behavior_arm" == "local_pc_fixed_verifier_dagger_recurrent" ]]; then
@@ -1130,6 +1560,373 @@ write_overlay() {
       behavior_arm="local_pc_fixed_verifier"
       policy_normalization="prefix_conditional"
       policy_counterfactual_targets=1
+      ;;
+    local_backprop_verifier_static_semantic_cf1)
+      behavior_arm="local_backprop_verifier"
+      policy_scoring="semantic_energy"
+      policy_normalization="candidate_conditional"
+      policy_counterfactual_targets=1
+      policy_probe_scoring="semantic_energy"
+      policy_sequence_score_head=true
+      ;;
+    local_pc_fixed_verifier_static_semantic_cf1)
+      behavior_arm="local_pc_fixed_verifier"
+      policy_scoring="semantic_energy"
+      policy_normalization="candidate_conditional"
+      policy_counterfactual_targets=1
+      policy_probe_scoring="semantic_energy"
+      policy_sequence_score_head=true
+      ;;
+    local_backprop_verifier_static_semantic_joint_cf1)
+      behavior_arm="local_backprop_verifier"
+      verifier_terminal_criterion="ruliad_verifier_set_joint"
+      policy_scoring="semantic_energy"
+      policy_normalization="candidate_conditional"
+      policy_counterfactual_targets=1
+      policy_probe_scoring="semantic_energy"
+      policy_sequence_score_head=true
+      ;;
+    local_pc_fixed_verifier_static_semantic_joint_cf1)
+      behavior_arm="local_pc_fixed_verifier"
+      verifier_terminal_criterion="ruliad_verifier_set_joint"
+      policy_scoring="semantic_energy"
+      policy_normalization="candidate_conditional"
+      policy_counterfactual_targets=1
+      policy_probe_scoring="semantic_energy"
+      policy_sequence_score_head=true
+      ;;
+    local_backprop_verifier_static_semantic_joint_head_cf1)
+      behavior_arm="local_backprop_verifier"
+      verifier_terminal_criterion="ruliad_verifier_set_joint"
+      policy_scoring="semantic_energy"
+      policy_normalization="candidate_conditional"
+      policy_gradient_scope="score_head_only"
+      policy_counterfactual_targets=1
+      policy_probe_scoring="semantic_energy"
+      policy_sequence_score_head=true
+      ;;
+    local_pc_fixed_verifier_static_semantic_joint_head_cf1)
+      behavior_arm="local_pc_fixed_verifier"
+      verifier_terminal_criterion="ruliad_verifier_set_joint"
+      policy_scoring="semantic_energy"
+      policy_normalization="candidate_conditional"
+      policy_gradient_scope="score_head_only"
+      policy_counterfactual_targets=1
+      policy_probe_scoring="semantic_energy"
+      policy_sequence_score_head=true
+      ;;
+    local_backprop_verifier_static_residual_joint_head_cf1)
+      behavior_arm="local_backprop_verifier"
+      verifier_terminal_criterion="ruliad_verifier_set_joint"
+      policy_scoring="residual_energy"
+      policy_normalization="candidate_conditional"
+      policy_gradient_scope="score_head_only"
+      policy_counterfactual_targets=1
+      policy_probe_scoring="residual_energy"
+      policy_sequence_score_head=true
+      ;;
+    local_pc_fixed_verifier_static_residual_joint_head_cf1)
+      behavior_arm="local_pc_fixed_verifier"
+      verifier_terminal_criterion="ruliad_verifier_set_joint"
+      policy_scoring="residual_energy"
+      policy_normalization="candidate_conditional"
+      policy_gradient_scope="score_head_only"
+      policy_counterfactual_targets=1
+      policy_probe_scoring="residual_energy"
+      policy_sequence_score_head=true
+      ;;
+    local_backprop_verifier_paired_dagger_residual_joint_head_cf1_rows32)
+      behavior_arm="local_backprop_verifier_paired_dagger"
+      verifier_terminal_criterion="ruliad_verifier_set_joint"
+      policy_scoring="residual_energy"
+      policy_normalization="candidate_conditional"
+      policy_gradient_scope="score_head_only"
+      policy_counterfactual_targets=1
+      policy_probe_scoring="residual_energy"
+      policy_sequence_score_head=true
+      policy_dynamic_max_rows_per_update=32
+      policy_dynamic_max_presentation_rows_per_update=32
+      ;;
+    local_pc_fixed_verifier_paired_dagger_residual_joint_head_cf1_rows32)
+      behavior_arm="local_pc_fixed_verifier_paired_dagger"
+      verifier_terminal_criterion="ruliad_verifier_set_joint"
+      policy_scoring="residual_energy"
+      policy_normalization="candidate_conditional"
+      policy_gradient_scope="score_head_only"
+      policy_counterfactual_targets=1
+      policy_probe_scoring="residual_energy"
+      policy_sequence_score_head=true
+      policy_dynamic_max_rows_per_update=32
+      policy_dynamic_max_presentation_rows_per_update=32
+      ;;
+    local_pc_fixed_verifier_paired_dagger_residual_joint_head_cf1_rows32_temporal_k2|local_pc_fixed_verifier_paired_dagger_residual_joint_head_cf1_rows32_temporal_k4|local_pc_fixed_verifier_paired_dagger_residual_joint_head_cf1_rows32_temporal_k8)
+      local temporal_window="${behavior_arm##*_temporal_k}"
+      behavior_arm="local_pc_fixed_verifier_paired_dagger_temporal_k${temporal_window}"
+      verifier_terminal_criterion="ruliad_verifier_set_joint"
+      policy_scoring="residual_energy"
+      policy_normalization="candidate_conditional"
+      policy_gradient_scope="score_head_only"
+      policy_counterfactual_targets=1
+      policy_probe_scoring="residual_energy"
+      policy_sequence_score_head=true
+      policy_dynamic_max_rows_per_update=32
+      policy_dynamic_max_presentation_rows_per_update=32
+      ;;
+    local_pc_epc_verifier_paired_dagger_residual_joint_head_cf1_rows32)
+      behavior_arm="local_pc_epc_verifier_paired_dagger"
+      verifier_terminal_criterion="ruliad_verifier_set_joint"
+      policy_scoring="residual_energy"
+      policy_normalization="candidate_conditional"
+      policy_gradient_scope="score_head_only"
+      policy_counterfactual_targets=1
+      policy_probe_scoring="residual_energy"
+      policy_sequence_score_head=true
+      policy_dynamic_max_rows_per_update=32
+      policy_dynamic_max_presentation_rows_per_update=32
+      ;;
+    local_pc_alm_verifier_paired_dagger_residual_joint_head_cf1_rows32)
+      behavior_arm="local_pc_alm_verifier_paired_dagger"
+      verifier_terminal_criterion="ruliad_verifier_set_joint"
+      policy_scoring="residual_energy"
+      policy_normalization="candidate_conditional"
+      policy_gradient_scope="score_head_only"
+      policy_counterfactual_targets=1
+      policy_probe_scoring="residual_energy"
+      policy_sequence_score_head=true
+      policy_dynamic_max_rows_per_update=32
+      policy_dynamic_max_presentation_rows_per_update=32
+      ;;
+    local_backprop_verifier_paired_dagger_residual_joint_full_cf1_rows32|local_backprop_verifier_paired_dagger_residual_policy_full_cf1_rows32)
+      if [[ "$behavior_arm" == *"_joint_"* ]]; then
+        verifier_terminal_criterion="ruliad_verifier_set_joint"
+      fi
+      behavior_arm="local_backprop_verifier_paired_dagger"
+      policy_scoring="residual_energy"
+      policy_normalization="candidate_conditional"
+      policy_gradient_scope="full_model"
+      policy_counterfactual_targets=1
+      policy_probe_scoring="residual_energy"
+      policy_sequence_score_head=true
+      policy_dynamic_max_rows_per_update=32
+      policy_dynamic_max_presentation_rows_per_update=32
+      ;;
+    local_pc_fixed_verifier_paired_dagger_residual_joint_full_cf1_rows32|local_pc_fixed_verifier_paired_dagger_residual_policy_full_cf1_rows32)
+      if [[ "$behavior_arm" == *"_joint_"* ]]; then
+        verifier_terminal_criterion="ruliad_verifier_set_joint"
+      fi
+      behavior_arm="local_pc_fixed_verifier_paired_dagger"
+      policy_scoring="residual_energy"
+      policy_normalization="candidate_conditional"
+      policy_gradient_scope="full_model"
+      policy_counterfactual_targets=1
+      policy_probe_scoring="residual_energy"
+      policy_sequence_score_head=true
+      policy_dynamic_max_rows_per_update=32
+      policy_dynamic_max_presentation_rows_per_update=32
+      ;;
+    local_pc_layer_verifier_paired_dagger_residual_joint_full_cf1_rows32|local_pc_layer_verifier_paired_dagger_residual_policy_full_cf1_rows32)
+      if [[ "$behavior_arm" == *"_joint_"* ]]; then
+        verifier_terminal_criterion="ruliad_verifier_set_joint"
+      fi
+      behavior_arm="local_pc_layer_verifier_paired_dagger"
+      policy_scoring="residual_energy"
+      policy_normalization="candidate_conditional"
+      policy_gradient_scope="full_model"
+      policy_counterfactual_targets=1
+      policy_probe_scoring="residual_energy"
+      policy_sequence_score_head=true
+      policy_dynamic_max_rows_per_update=32
+      policy_dynamic_max_presentation_rows_per_update=32
+      ;;
+    local_pc_fixed_verifier_paired_dagger_residual_joint_full_cf1_rows32_temporal_k2|local_pc_fixed_verifier_paired_dagger_residual_joint_full_cf1_rows32_temporal_k4|local_pc_fixed_verifier_paired_dagger_residual_joint_full_cf1_rows32_temporal_k8|local_pc_fixed_verifier_paired_dagger_residual_policy_full_cf1_rows32_temporal_k2|local_pc_fixed_verifier_paired_dagger_residual_policy_full_cf1_rows32_temporal_k4|local_pc_fixed_verifier_paired_dagger_residual_policy_full_cf1_rows32_temporal_k8)
+      local temporal_window="${behavior_arm##*_temporal_k}"
+      if [[ "$behavior_arm" == *"_joint_"* ]]; then
+        verifier_terminal_criterion="ruliad_verifier_set_joint"
+      fi
+      behavior_arm="local_pc_fixed_verifier_paired_dagger_temporal_k${temporal_window}"
+      policy_scoring="residual_energy"
+      policy_normalization="candidate_conditional"
+      policy_gradient_scope="full_model"
+      policy_counterfactual_targets=1
+      policy_probe_scoring="residual_energy"
+      policy_sequence_score_head=true
+      policy_dynamic_max_rows_per_update=32
+      policy_dynamic_max_presentation_rows_per_update=32
+      ;;
+    local_pc_epc_verifier_paired_dagger_residual_joint_full_cf1_rows32)
+      behavior_arm="local_pc_epc_verifier_paired_dagger"
+      verifier_terminal_criterion="ruliad_verifier_set_joint"
+      policy_scoring="residual_energy"
+      policy_normalization="candidate_conditional"
+      policy_gradient_scope="full_model"
+      policy_counterfactual_targets=1
+      policy_probe_scoring="residual_energy"
+      policy_sequence_score_head=true
+      policy_dynamic_max_rows_per_update=32
+      policy_dynamic_max_presentation_rows_per_update=32
+      ;;
+    local_pc_sync_verifier_paired_dagger_residual_joint_full_cf1_rows32)
+      behavior_arm="local_pc_sync_verifier_paired_dagger"
+      verifier_terminal_criterion="ruliad_verifier_set_joint"
+      policy_scoring="residual_energy"
+      policy_normalization="candidate_conditional"
+      policy_gradient_scope="full_model"
+      policy_counterfactual_targets=1
+      policy_probe_scoring="residual_energy"
+      policy_sequence_score_head=true
+      policy_dynamic_max_rows_per_update=32
+      policy_dynamic_max_presentation_rows_per_update=32
+      ;;
+    local_pc_rgs_verifier_paired_dagger_residual_joint_full_cf1_rows32)
+      behavior_arm="local_pc_rgs_verifier_paired_dagger"
+      verifier_terminal_criterion="ruliad_verifier_set_joint"
+      policy_scoring="residual_energy"
+      policy_normalization="candidate_conditional"
+      policy_gradient_scope="full_model"
+      policy_counterfactual_targets=1
+      policy_probe_scoring="residual_energy"
+      policy_sequence_score_head=true
+      policy_dynamic_max_rows_per_update=32
+      policy_dynamic_max_presentation_rows_per_update=32
+      ;;
+    local_pc_alm_verifier_paired_dagger_residual_joint_full_cf1_rows32)
+      behavior_arm="local_pc_alm_verifier_paired_dagger"
+      verifier_terminal_criterion="ruliad_verifier_set_joint"
+      policy_scoring="residual_energy"
+      policy_normalization="candidate_conditional"
+      policy_gradient_scope="full_model"
+      policy_counterfactual_targets=1
+      policy_probe_scoring="residual_energy"
+      policy_sequence_score_head=true
+      policy_dynamic_max_rows_per_update=32
+      policy_dynamic_max_presentation_rows_per_update=32
+      ;;
+    local_backprop_verifier_static_semantic_target_group_cf1)
+      behavior_arm="local_backprop_verifier"
+      policy_scoring="semantic_energy"
+      policy_normalization="candidate_conditional"
+      policy_counterfactual_targets=1
+      policy_counterfactual_objective="target_group_conditional"
+      policy_probe_scoring="semantic_energy"
+      policy_sequence_score_head=true
+      ;;
+    local_pc_fixed_verifier_static_semantic_target_group_cf1)
+      behavior_arm="local_pc_fixed_verifier"
+      policy_scoring="semantic_energy"
+      policy_normalization="candidate_conditional"
+      policy_counterfactual_targets=1
+      policy_counterfactual_objective="target_group_conditional"
+      policy_probe_scoring="semantic_energy"
+      policy_sequence_score_head=true
+      ;;
+    local_backprop_verifier_static_semantic_target_group_joint_cf1)
+      behavior_arm="local_backprop_verifier"
+      verifier_terminal_criterion="ruliad_verifier_set_joint"
+      policy_scoring="semantic_energy"
+      policy_normalization="candidate_conditional"
+      policy_counterfactual_targets=1
+      policy_counterfactual_objective="target_group_conditional"
+      policy_probe_scoring="semantic_energy"
+      policy_sequence_score_head=true
+      ;;
+    local_pc_fixed_verifier_static_semantic_target_group_joint_cf1)
+      behavior_arm="local_pc_fixed_verifier"
+      verifier_terminal_criterion="ruliad_verifier_set_joint"
+      policy_scoring="semantic_energy"
+      policy_normalization="candidate_conditional"
+      policy_counterfactual_targets=1
+      policy_counterfactual_objective="target_group_conditional"
+      policy_probe_scoring="semantic_energy"
+      policy_sequence_score_head=true
+      ;;
+    local_backprop_verifier_static_semantic_target_group_head_cf1)
+      behavior_arm="local_backprop_verifier"
+      policy_scoring="semantic_energy"
+      policy_normalization="candidate_conditional"
+      policy_gradient_scope="score_head_only"
+      policy_counterfactual_targets=1
+      policy_counterfactual_objective="target_group_conditional"
+      policy_probe_scoring="semantic_energy"
+      policy_sequence_score_head=true
+      ;;
+    local_pc_fixed_verifier_static_semantic_target_group_head_cf1)
+      behavior_arm="local_pc_fixed_verifier"
+      policy_scoring="semantic_energy"
+      policy_normalization="candidate_conditional"
+      policy_gradient_scope="score_head_only"
+      policy_counterfactual_targets=1
+      policy_counterfactual_objective="target_group_conditional"
+      policy_probe_scoring="semantic_energy"
+      policy_sequence_score_head=true
+      ;;
+    local_pc_epc_verifier_static_semantic_cf1)
+      behavior_arm="local_pc_epc_verifier"
+      policy_scoring="semantic_energy"
+      policy_normalization="candidate_conditional"
+      policy_counterfactual_targets=1
+      policy_probe_scoring="semantic_energy"
+      policy_sequence_score_head=true
+      ;;
+    local_pc_alm_verifier_static_semantic_cf1)
+      behavior_arm="local_pc_alm_verifier"
+      policy_scoring="semantic_energy"
+      policy_normalization="candidate_conditional"
+      policy_counterfactual_targets=1
+      policy_probe_scoring="semantic_energy"
+      policy_sequence_score_head=true
+      ;;
+    local_backprop_verifier_static_candidate)
+      behavior_arm="local_backprop_verifier"
+      policy_scoring="completion_likelihood"
+      policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      ;;
+    local_pc_fixed_verifier_static_candidate)
+      behavior_arm="local_pc_fixed_verifier"
+      policy_scoring="completion_likelihood"
+      policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      ;;
+    local_pc_epc_verifier_static_candidate)
+      behavior_arm="local_pc_epc_verifier"
+      policy_scoring="completion_likelihood"
+      policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      ;;
+    local_backprop_verifier_static_candidate_cf1)
+      behavior_arm="local_backprop_verifier"
+      policy_scoring="completion_likelihood"
+      policy_normalization="candidate_conditional"
+      policy_counterfactual_targets=1
+      policy_probe_normalization="candidate_conditional"
+      ;;
+    local_pc_fixed_verifier_static_candidate_cf1)
+      behavior_arm="local_pc_fixed_verifier"
+      policy_scoring="completion_likelihood"
+      policy_normalization="candidate_conditional"
+      policy_counterfactual_targets=1
+      policy_probe_normalization="candidate_conditional"
+      ;;
+    local_pc_epc_verifier_static_candidate_cf1)
+      behavior_arm="local_pc_epc_verifier"
+      policy_scoring="completion_likelihood"
+      policy_normalization="candidate_conditional"
+      policy_counterfactual_targets=1
+      policy_probe_normalization="candidate_conditional"
+      ;;
+    local_backprop_verifier_static_target_group_cf1)
+      behavior_arm="local_backprop_verifier"
+      policy_normalization="candidate_conditional"
+      policy_counterfactual_targets=1
+      policy_counterfactual_objective="target_group_conditional"
+      policy_probe_normalization="candidate_conditional"
+      ;;
+    local_pc_fixed_verifier_static_target_group_cf1)
+      behavior_arm="local_pc_fixed_verifier"
+      policy_normalization="candidate_conditional"
+      policy_counterfactual_targets=1
+      policy_counterfactual_objective="target_group_conditional"
+      policy_probe_normalization="candidate_conditional"
       ;;
     local_backprop_verifier_static_cf1_temporal_k2)
       behavior_arm="local_backprop_verifier_temporal_k2"
@@ -1233,6 +2030,17 @@ write_overlay() {
       policy_dynamic_max_rows_per_update=128
       policy_dynamic_max_presentation_rows_per_update=128
       ;;
+    local_pc_fixed_verifier_paired_dagger_residual_cf1_rows128_temporal_k2)
+      behavior_arm="local_pc_fixed_verifier_paired_dagger_temporal_k2"
+      policy_scoring="residual_energy"
+      policy_normalization="candidate_conditional"
+      policy_gradient_scope="score_head_only"
+      policy_counterfactual_targets=1
+      policy_probe_scoring="residual_energy"
+      policy_sequence_score_head=true
+      policy_dynamic_max_rows_per_update=128
+      policy_dynamic_max_presentation_rows_per_update=128
+      ;;
     local_backprop_verifier_paired_dagger_residual_full_cf1_rows128_temporal_k2)
       behavior_arm="local_backprop_verifier_paired_dagger_temporal_k2"
       policy_scoring="residual_energy"
@@ -1312,6 +2120,9 @@ write_overlay() {
       policy_semantic_refresh_counterfactual_targets=1
       ;;
   esac
+  if [[ -n "$policy_gradient_scope_override" ]]; then
+    policy_gradient_scope="$policy_gradient_scope_override"
+  fi
   if [[ "$behavior_arm" == *verifier* ]]; then
     policy_probe_normalization="$policy_normalization"
   fi
@@ -1324,8 +2135,8 @@ write_overlay() {
       algorithm_line='algorithm = "predictive_coding"'
       ;;
   esac
-  if (( TBPTT_CHUNK_SIZE > 0 )); then
-    tbptt_line="tbptt_chunk_size = $TBPTT_CHUNK_SIZE"
+  if (( effective_tbptt_chunk_size > 0 )); then
+    tbptt_line="tbptt_chunk_size = $effective_tbptt_chunk_size"
   fi
   if [[ -n "$BLOCK_SIZE" ]]; then
     block_size_line="block_size = $BLOCK_SIZE"
@@ -1341,7 +2152,7 @@ write_overlay() {
     tbptt_persist_line="tbptt_persist_across_steps = true"
   fi
   : > "$path"
-  if [[ -n "$SOURCE_SELECTION_FEEDBACK_UPDATES" || -n "$RULIAD_COLD_START_ENABLED" ]]; then
+  if [[ -n "$SOURCE_SELECTION_FEEDBACK_UPDATES" || -n "$RULIAD_COLD_START_ENABLED" || -n "$RULIAD_SOURCE_SELECTION_DOCUMENTS_PER_STEP" ]]; then
     if [[ "$SOURCE_SELECTION_FEEDBACK_UPDATES" != "true" && "$SOURCE_SELECTION_FEEDBACK_UPDATES" != "false" ]]; then
       if [[ -n "$SOURCE_SELECTION_FEEDBACK_UPDATES" ]]; then
         echo "BURN_DRAGON_PC_PAPER_SOURCE_SELECTION_FEEDBACK_UPDATES must be true or false" >&2
@@ -1356,6 +2167,9 @@ EOF
     fi
     if [[ -n "$RULIAD_COLD_START_ENABLED" ]]; then
       echo "ruliad_source_selection_cold_start_enabled = $RULIAD_COLD_START_ENABLED" >> "$path"
+    fi
+    if [[ -n "$RULIAD_SOURCE_SELECTION_DOCUMENTS_PER_STEP" ]]; then
+      echo "ruliad_source_selection_documents_per_step = $RULIAD_SOURCE_SELECTION_DOCUMENTS_PER_STEP" >> "$path"
     fi
     echo >> "$path"
   fi
@@ -1463,11 +2277,11 @@ learning_rate = $LOCAL_LEARNING_RATE
 weight_decay = 0.01
 
 [training.local_predictive_coding]
-terminal_criterion = "ruliad_verifier_set"
+terminal_criterion = "$verifier_terminal_criterion"
 
 EOF
       ;;
-    local_pc_fixed_verifier|local_pc_fixed_verifier_temporal_k2|local_pc_fixed_verifier_dagger|local_pc_fixed_verifier_dagger_temporal_k2|local_pc_fixed_verifier_paired_dagger|local_pc_fixed_verifier_paired_dagger_temporal_k2)
+    local_pc_fixed_verifier|local_pc_fixed_verifier_temporal_k2|local_pc_fixed_verifier_temporal_k4|local_pc_fixed_verifier_temporal_k8|local_pc_fixed_verifier_dagger|local_pc_fixed_verifier_dagger_temporal_k2|local_pc_fixed_verifier_dagger_temporal_k4|local_pc_fixed_verifier_dagger_temporal_k8|local_pc_fixed_verifier_paired_dagger|local_pc_fixed_verifier_paired_dagger_temporal_k2|local_pc_fixed_verifier_paired_dagger_temporal_k4|local_pc_fixed_verifier_paired_dagger_temporal_k8)
       local verifier_temporal_block=""
       if [[ "$behavior_arm" =~ ^local_pc_fixed_verifier(_(dagger|paired_dagger))?_temporal_k(2|4|8)$ ]]; then
         verifier_temporal_block=$'\n[training.local_predictive_coding.temporal_credit]\nmode = "exact_window"\nwindow_chunks = '"${BASH_REMATCH[3]}"$'\n'
@@ -1480,8 +2294,23 @@ weight_decay = 0.01
 
 [training.local_predictive_coding]
 solver = "fixed_prediction"
-terminal_criterion = "ruliad_verifier_set"
+terminal_criterion = "$verifier_terminal_criterion"
 $verifier_temporal_block
+
+EOF
+      ;;
+    local_pc_layer_verifier_paired_dagger)
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = $LOCAL_LEARNING_RATE
+weight_decay = 0.01
+
+[training.local_predictive_coding]
+solver = "layer_local_prediction"
+factor_reduction = "mean"
+sync_diagnostics = false
+terminal_criterion = "$verifier_terminal_criterion"
 
 EOF
       ;;
@@ -1494,19 +2323,74 @@ weight_decay = 0.01
 
 [training.local_predictive_coding]
 solver = "error_equilibrium"
-terminal_criterion = "ruliad_verifier_set"
+terminal_criterion = "$verifier_terminal_criterion"
 parameterization = "standard"
 shared_reuse_reduction = "root_mean_square"
-prediction_precision = 10.0
+prediction_precision = $pc_prediction_precision
 
 [training.local_predictive_coding.inference]
-steps = 1
-step_size = 0.1
+steps = $pc_inference_steps
+step_size = $pc_step_size
+max_grad_norm = 1000000.0
+$pc_objective_routing_block
+
+EOF
+      ;;
+    local_pc_sync_verifier|local_pc_sync_verifier_paired_dagger)
+      if [[ "$pc_hparams_encoded" == "false" ]]; then
+        pc_inference_steps=5
+        pc_step_size=0.05
+        pc_prediction_precision=1.0
+      fi
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = $LOCAL_LEARNING_RATE
+weight_decay = 0.01
+
+[training.local_predictive_coding]
+solver = "synchronous_equilibrium"
+terminal_criterion = "$verifier_terminal_criterion"
+parameterization = "standard"
+prediction_precision = $pc_prediction_precision
+factor_reduction = "sum"
+sync_diagnostics = false
+
+[training.local_predictive_coding.inference]
+steps = $pc_inference_steps
+step_size = $pc_step_size
 max_grad_norm = 1000000.0
 
 EOF
       ;;
-    local_pc_alm_verifier_paired_dagger)
+    local_pc_rgs_verifier|local_pc_rgs_verifier_paired_dagger)
+      if [[ "$pc_hparams_encoded" == "false" ]]; then
+        pc_inference_steps=1
+        pc_step_size=0.1
+        pc_prediction_precision=1.0
+      fi
+      cat >> "$path" <<EOF
+[optimizer]
+name = "adamw"
+learning_rate = $LOCAL_LEARNING_RATE
+weight_decay = 0.01
+
+[training.local_predictive_coding]
+solver = "reverse_gauss_seidel"
+terminal_criterion = "$verifier_terminal_criterion"
+parameterization = "standard"
+prediction_precision = $pc_prediction_precision
+factor_reduction = "sum"
+sync_diagnostics = false
+
+[training.local_predictive_coding.inference]
+steps = $pc_inference_steps
+step_size = $pc_step_size
+max_grad_norm = 1000000.0
+
+EOF
+      ;;
+    local_pc_alm_verifier|local_pc_alm_verifier_paired_dagger)
       cat >> "$path" <<EOF
 [optimizer]
 name = "adamw"
@@ -1515,14 +2399,14 @@ weight_decay = 0.01
 
 [training.local_predictive_coding]
 solver = "augmented_lagrangian"
-terminal_criterion = "ruliad_verifier_set"
+terminal_criterion = "$verifier_terminal_criterion"
 parameterization = "standard"
 prediction_precision = 1.0
 factor_reduction = "sum"
 sync_diagnostics = false
 
 [training.local_predictive_coding.augmented_lagrangian]
-steps = 4
+steps = 8
 primal_step_size = 0.02
 dual_step_size = 0.1
 penalty = 1.0
@@ -2382,12 +3266,16 @@ EOF
   fi
 
   case "$behavior_arm" in
-    local_backprop_verifier|local_backprop_verifier_temporal_k2|local_pc_fixed_verifier|local_pc_fixed_verifier_temporal_k2|local_pc_epc_verifier)
+    local_backprop_verifier|local_backprop_verifier_temporal_k2|local_pc_fixed_verifier|local_pc_fixed_verifier_temporal_k2|local_pc_fixed_verifier_temporal_k4|local_pc_fixed_verifier_temporal_k8|local_pc_epc_verifier|local_pc_sync_verifier|local_pc_rgs_verifier|local_pc_alm_verifier)
       cat >> "$path" <<EOF
 [training.ruliad_supervision.proof_policy]
 enabled = true
+require_scheduled_update = true
 mode = "static_expert"
-scoring = "completion_likelihood"
+scoring = "$policy_scoring"
+decoder_calibration_steps = $policy_decoder_calibration_steps
+prompt_context = "$policy_prompt_context"
+target = "$policy_target"
 gradient_scope = "$policy_gradient_scope"
 normalization = "$policy_normalization"
 candidate_symmetry = "$policy_candidate_symmetry"
@@ -2401,21 +3289,26 @@ rollout_steps = 1
 max_rows_per_update = 8
 max_presentation_rows_per_update = 64
 counterfactual_targets_per_state = $policy_counterfactual_targets
+counterfactual_objective = "$policy_counterfactual_objective"
 candidates = 4
 max_completion_tokens = 128
 
 EOF
       ;;
-    local_backprop_verifier_dagger_temporal_k2|local_backprop_verifier_paired_dagger|local_backprop_verifier_paired_dagger_temporal_k2|local_pc_fixed_verifier_dagger|local_pc_fixed_verifier_dagger_temporal_k2|local_pc_fixed_verifier_paired_dagger|local_pc_fixed_verifier_paired_dagger_temporal_k2|local_pc_epc_verifier_paired_dagger|local_pc_alm_verifier_paired_dagger)
+    local_backprop_verifier_dagger_temporal_k2|local_backprop_verifier_paired_dagger|local_backprop_verifier_paired_dagger_temporal_k2|local_pc_fixed_verifier_dagger|local_pc_fixed_verifier_dagger_temporal_k2|local_pc_fixed_verifier_dagger_temporal_k4|local_pc_fixed_verifier_dagger_temporal_k8|local_pc_fixed_verifier_paired_dagger|local_pc_fixed_verifier_paired_dagger_temporal_k2|local_pc_fixed_verifier_paired_dagger_temporal_k4|local_pc_fixed_verifier_paired_dagger_temporal_k8|local_pc_layer_verifier_paired_dagger|local_pc_epc_verifier_paired_dagger|local_pc_sync_verifier_paired_dagger|local_pc_rgs_verifier_paired_dagger|local_pc_alm_verifier_paired_dagger)
       local policy_mode="dagger"
-      if [[ "$behavior_arm" == "local_backprop_verifier_paired_dagger" || "$behavior_arm" == "local_backprop_verifier_paired_dagger_temporal_k2" || "$behavior_arm" == "local_pc_fixed_verifier_paired_dagger" || "$behavior_arm" == "local_pc_fixed_verifier_paired_dagger_temporal_k2" || "$behavior_arm" == "local_pc_epc_verifier_paired_dagger" || "$behavior_arm" == "local_pc_alm_verifier_paired_dagger" ]]; then
+      if [[ "$behavior_arm" == "local_backprop_verifier_paired_dagger" || "$behavior_arm" == "local_backprop_verifier_paired_dagger_temporal_k2" || "$behavior_arm" == "local_pc_fixed_verifier_paired_dagger" || "$behavior_arm" =~ ^local_pc_fixed_verifier_paired_dagger_temporal_k(2|4|8)$ || "$behavior_arm" == "local_pc_layer_verifier_paired_dagger" || "$behavior_arm" == "local_pc_epc_verifier_paired_dagger" || "$behavior_arm" == "local_pc_sync_verifier_paired_dagger" || "$behavior_arm" == "local_pc_rgs_verifier_paired_dagger" || "$behavior_arm" == "local_pc_alm_verifier_paired_dagger" ]]; then
         policy_mode="static_then_paired_dagger"
       fi
       cat >> "$path" <<EOF
 [training.ruliad_supervision.proof_policy]
 enabled = true
+require_scheduled_update = true
 mode = "$policy_mode"
 scoring = "$policy_scoring"
+decoder_calibration_steps = $policy_decoder_calibration_steps
+prompt_context = "$policy_prompt_context"
+target = "$policy_target"
 gradient_scope = "$policy_gradient_scope"
 normalization = "$policy_normalization"
 candidate_symmetry = "$policy_candidate_symmetry"
@@ -2429,12 +3322,25 @@ rollout_steps = 4
 max_rows_per_update = $policy_dynamic_max_rows_per_update
 max_presentation_rows_per_update = $policy_dynamic_max_presentation_rows_per_update
 counterfactual_targets_per_state = $policy_counterfactual_targets
+counterfactual_objective = "$policy_counterfactual_objective"
 candidates = 4
 max_completion_tokens = 128
 
 EOF
       ;;
   esac
+
+  if (( RULIAD_CONSOLIDATION == 1 )); then
+    cat >> "$path" <<EOF
+[training.ruliad_supervision.consolidation]
+enabled = true
+initial_unique_steps = $RULIAD_CONSOLIDATION_INITIAL_UNIQUE_STEPS
+hold_steps = $RULIAD_CONSOLIDATION_HOLD_STEPS
+novelty_interval_steps = $RULIAD_CONSOLIDATION_NOVELTY_INTERVAL_STEPS
+seed = $RULIAD_CONSOLIDATION_SEED
+
+EOF
+  fi
 
   if [[ "$policy_semantic_refresh" == "true" ]]; then
     cat >> "$path" <<EOF
@@ -2461,6 +3367,7 @@ EOF
     cat >> "$path" <<EOF
 [training.ruliad_policy_probe]
 EOF
+    echo "prompt_context = \"$policy_prompt_context\"" >> "$path"
     echo "normalization = \"$policy_probe_normalization\"" >> "$path"
     if [[ -n "$RULIAD_POLICY_PROBE_EVERY_EPOCHS" ]]; then
       echo "every_epochs = $RULIAD_POLICY_PROBE_EVERY_EPOCHS" >> "$path"
@@ -2474,6 +3381,12 @@ closed_loop_every_epochs = $RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS
 EOF
     fi
     echo >> "$path"
+  elif [[ "$arm" == *verifier* ]]; then
+    cat >> "$path" <<EOF
+[training.ruliad_policy_probe]
+prompt_context = "$policy_prompt_context"
+
+EOF
   fi
 }
 
@@ -2494,34 +3407,109 @@ write_manifest() {
   local min_available_mb="${14}"
   local exit_note="${15:-}"
   local gpu_path="${16:-}"
+  local checkpoint_eval_path="${17:-}"
+  local checkpoint_eval_log_path="${18:-}"
+  local checkpoint_eval_status="${19:-disabled}"
+  local checkpoint_eval_elapsed="${20:-0}"
+  local checkpoint_eval_peak_used_mb="${21:-0}"
+  local checkpoint_eval_min_available_mb="${22:-0}"
   local git_sha
   local git_branch
   local dirty
   local train_binary_sha256
+  local eval_binary_sha256
   local runner_sha256
   local source_feedback_json="null"
   local source_cold_start_json="null"
+  local source_documents_per_step_json="null"
   local closed_loop_cadence_json="null"
   local block_size_json="null"
   local tbptt_credit_window_chunks=1
   local behavior_arm="$arm"
   local verifier_every_steps_json="null"
   local proof_policy_scoring="completion_likelihood"
+  local proof_policy_decoder_calibration_steps=0
+  local proof_policy_prompt_context="$RULIAD_POLICY_PROMPT_CONTEXT"
+  local proof_policy_target="expert_set"
   local proof_policy_mode="static_expert"
   local proof_policy_gradient_scope="full_model"
+  local proof_policy_gradient_scope_override=""
   local proof_policy_normalization="prefix_conditional"
   local proof_policy_candidate_symmetry="balanced_rotation"
   local proof_policy_presentation_risk="mean"
+  local policy_probe_scoring="completion_likelihood"
   local policy_probe_normalization="candidate_conditional"
   local policy_probe_candidate_symmetry="cyclic_orbit_average"
   local proof_policy_counterfactual_targets=0
+  local proof_policy_counterfactual_objective="independent"
   local proof_policy_semantic_refresh_every=0
   local proof_policy_semantic_refresh_counterfactual_targets=0
   local proof_policy_max_rows_per_update_json=""
   local proof_policy_max_presentation_rows_per_update_json=""
   local model_sequence_executor="dense_score_short_context"
+  local terminal_criterion="next_token"
   local lr_schedule="constant"
+  local pc_inference_steps_json="null"
+  local pc_step_size_json="null"
+  local pc_prediction_precision_json="null"
+  local pc_next_token_solver=""
+  local ruliad_consolidation_json=false
+  local effective_tbptt_chunk_size
+  effective_tbptt_chunk_size="$(effective_tbptt_chunk_size_for_arm "$arm")" || return
+  if (( RULIAD_CONSOLIDATION == 1 )); then
+    ruliad_consolidation_json=true
+  fi
+  if [[ "$arm" == *residual* ]]; then
+    policy_probe_scoring="residual_energy"
+  elif [[ "$arm" == *semantic* ]]; then
+    policy_probe_scoring="semantic_energy"
+  fi
   while true; do
+    if [[ "$behavior_arm" =~ ^(.+)_fullctx$ ]]; then
+      behavior_arm="${BASH_REMATCH[1]}"
+      proof_policy_prompt_context="full_problem_suffix"
+      continue
+    fi
+    if [[ "$behavior_arm" =~ ^(.+)_localctx$ ]]; then
+      behavior_arm="${BASH_REMATCH[1]}"
+      proof_policy_prompt_context="local_action_state"
+      continue
+    fi
+    if [[ "$behavior_arm" =~ ^(.+)_progress$ ]]; then
+      behavior_arm="${BASH_REMATCH[1]}"
+      proof_policy_target="verified_progress_distribution"
+      continue
+    fi
+    if [[ "$behavior_arm" =~ ^(.+)_targetgroup$ ]]; then
+      behavior_arm="${BASH_REMATCH[1]}"
+      proof_policy_counterfactual_objective="target_group_conditional"
+      continue
+    fi
+    if [[ "$behavior_arm" =~ ^(.+)_targetjoint$ ]]; then
+      behavior_arm="${BASH_REMATCH[1]}"
+      proof_policy_counterfactual_objective="target_group_joint"
+      continue
+    fi
+    if [[ "$behavior_arm" =~ ^(.+)_factorjoint$ ]]; then
+      behavior_arm="${BASH_REMATCH[1]}"
+      proof_policy_counterfactual_objective="factorized_joint"
+      continue
+    fi
+    if [[ "$behavior_arm" =~ ^(.+)_decodercoupled$ ]]; then
+      behavior_arm="${BASH_REMATCH[1]}"
+      proof_policy_counterfactual_objective="decoder_coupled_joint"
+      continue
+    fi
+    if [[ "$behavior_arm" =~ ^(.+)_policypath$ ]]; then
+      behavior_arm="${BASH_REMATCH[1]}"
+      proof_policy_gradient_scope_override="policy_path"
+      continue
+    fi
+    if [[ "$behavior_arm" =~ ^(.+)_deccal([1-9][0-9]*)$ ]]; then
+      behavior_arm="${BASH_REMATCH[1]}"
+      proof_policy_decoder_calibration_steps="${BASH_REMATCH[2]}"
+      continue
+    fi
     if [[ "$behavior_arm" =~ ^(.+)_cosine$ ]]; then
       behavior_arm="${BASH_REMATCH[1]}"
       lr_schedule="cosine"
@@ -2532,10 +3520,44 @@ write_manifest() {
       verifier_every_steps_json="${BASH_REMATCH[2]}"
       continue
     fi
+    if [[ "$behavior_arm" =~ ^(.+)_routefixed$ ]]; then
+      behavior_arm="${BASH_REMATCH[1]}"
+      pc_next_token_solver="fixed_prediction"
+      continue
+    fi
+    if [[ "$behavior_arm" =~ ^(.+_verifier[^[:space:]]*)_pcsteps(1|2|4|5|6|8|16)_eta(001|003|005|01|03|05|10|20)_prec(1|3|10|30)$ ]]; then
+      behavior_arm="${BASH_REMATCH[1]}"
+      pc_inference_steps_json="${BASH_REMATCH[2]}"
+      case "${BASH_REMATCH[3]}" in
+        001) pc_step_size_json=0.001 ;;
+        003) pc_step_size_json=0.003 ;;
+        005) pc_step_size_json=0.005 ;;
+        01) pc_step_size_json=0.01 ;;
+        03) pc_step_size_json=0.03 ;;
+        05) pc_step_size_json=0.05 ;;
+        10) pc_step_size_json=0.1 ;;
+        20) pc_step_size_json=0.2 ;;
+      esac
+      pc_prediction_precision_json="${BASH_REMATCH[4]}.0"
+      continue
+    fi
     break
   done
   if [[ "$arm" == *verifier* && "$verifier_every_steps_json" == "null" ]]; then
     verifier_every_steps_json=4
+  fi
+  if [[ "$arm" == local_pc_epc* && "$pc_inference_steps_json" == "null" ]]; then
+    pc_inference_steps_json=1
+    pc_step_size_json=0.1
+    pc_prediction_precision_json=10.0
+  elif [[ "$arm" == local_pc_sync* && "$pc_inference_steps_json" == "null" ]]; then
+    pc_inference_steps_json=5
+    pc_step_size_json=0.05
+    pc_prediction_precision_json=1.0
+  elif [[ "$arm" == local_pc_rgs* && "$pc_inference_steps_json" == "null" ]]; then
+    pc_inference_steps_json=1
+    pc_step_size_json=0.1
+    pc_prediction_precision_json=1.0
   fi
   if [[ "$behavior_arm" == "local_pc_fixed_verifier_dagger_recurrent" ]]; then
     behavior_arm="local_pc_fixed_verifier_dagger"
@@ -2550,9 +3572,312 @@ write_manifest() {
       behavior_arm="local_backprop_verifier"
       proof_policy_counterfactual_targets=1
       ;;
+    local_backprop_verifier_static_residual_joint_head_cf1)
+      behavior_arm="local_backprop_verifier"
+      proof_policy_scoring="residual_energy"
+      proof_policy_gradient_scope="score_head_only"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      ;;
+    local_pc_fixed_verifier_static_residual_joint_head_cf1)
+      behavior_arm="local_pc_fixed_verifier"
+      proof_policy_scoring="residual_energy"
+      proof_policy_gradient_scope="score_head_only"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      ;;
+    local_backprop_verifier_paired_dagger_residual_joint_head_cf1_rows32)
+      behavior_arm="local_backprop_verifier_paired_dagger"
+      proof_policy_scoring="residual_energy"
+      proof_policy_gradient_scope="score_head_only"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      proof_policy_max_rows_per_update_json=32
+      proof_policy_max_presentation_rows_per_update_json=32
+      ;;
+    local_pc_layer_verifier_paired_dagger_residual_joint_full_cf1_rows32|local_pc_layer_verifier_paired_dagger_residual_policy_full_cf1_rows32)
+      behavior_arm="local_pc_layer_verifier_paired_dagger"
+      proof_policy_scoring="residual_energy"
+      proof_policy_gradient_scope="full_model"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      proof_policy_max_rows_per_update_json=32
+      proof_policy_max_presentation_rows_per_update_json=32
+      ;;
+    local_pc_fixed_verifier_paired_dagger_residual_joint_head_cf1_rows32)
+      behavior_arm="local_pc_fixed_verifier_paired_dagger"
+      proof_policy_scoring="residual_energy"
+      proof_policy_gradient_scope="score_head_only"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      proof_policy_max_rows_per_update_json=32
+      proof_policy_max_presentation_rows_per_update_json=32
+      ;;
+    local_pc_fixed_verifier_paired_dagger_residual_joint_head_cf1_rows32_temporal_k2|local_pc_fixed_verifier_paired_dagger_residual_joint_head_cf1_rows32_temporal_k4|local_pc_fixed_verifier_paired_dagger_residual_joint_head_cf1_rows32_temporal_k8)
+      local temporal_window="${behavior_arm##*_temporal_k}"
+      behavior_arm="local_pc_fixed_verifier_paired_dagger_temporal_k${temporal_window}"
+      proof_policy_scoring="residual_energy"
+      proof_policy_gradient_scope="score_head_only"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      proof_policy_max_rows_per_update_json=32
+      proof_policy_max_presentation_rows_per_update_json=32
+      ;;
+    local_pc_epc_verifier_paired_dagger_residual_joint_head_cf1_rows32)
+      behavior_arm="local_pc_epc_verifier_paired_dagger"
+      proof_policy_scoring="residual_energy"
+      proof_policy_gradient_scope="score_head_only"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      proof_policy_max_rows_per_update_json=32
+      proof_policy_max_presentation_rows_per_update_json=32
+      ;;
+    local_pc_alm_verifier_paired_dagger_residual_joint_head_cf1_rows32)
+      behavior_arm="local_pc_alm_verifier_paired_dagger"
+      proof_policy_scoring="residual_energy"
+      proof_policy_gradient_scope="score_head_only"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      proof_policy_max_rows_per_update_json=32
+      proof_policy_max_presentation_rows_per_update_json=32
+      ;;
+    local_backprop_verifier_paired_dagger_residual_joint_full_cf1_rows32|local_backprop_verifier_paired_dagger_residual_policy_full_cf1_rows32)
+      behavior_arm="local_backprop_verifier_paired_dagger"
+      proof_policy_scoring="residual_energy"
+      proof_policy_gradient_scope="full_model"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      proof_policy_max_rows_per_update_json=32
+      proof_policy_max_presentation_rows_per_update_json=32
+      ;;
+    local_pc_fixed_verifier_paired_dagger_residual_joint_full_cf1_rows32|local_pc_fixed_verifier_paired_dagger_residual_policy_full_cf1_rows32)
+      behavior_arm="local_pc_fixed_verifier_paired_dagger"
+      proof_policy_scoring="residual_energy"
+      proof_policy_gradient_scope="full_model"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      proof_policy_max_rows_per_update_json=32
+      proof_policy_max_presentation_rows_per_update_json=32
+      ;;
+    local_pc_fixed_verifier_paired_dagger_residual_joint_full_cf1_rows32_temporal_k2|local_pc_fixed_verifier_paired_dagger_residual_joint_full_cf1_rows32_temporal_k4|local_pc_fixed_verifier_paired_dagger_residual_joint_full_cf1_rows32_temporal_k8|local_pc_fixed_verifier_paired_dagger_residual_policy_full_cf1_rows32_temporal_k2|local_pc_fixed_verifier_paired_dagger_residual_policy_full_cf1_rows32_temporal_k4|local_pc_fixed_verifier_paired_dagger_residual_policy_full_cf1_rows32_temporal_k8)
+      local temporal_window="${behavior_arm##*_temporal_k}"
+      behavior_arm="local_pc_fixed_verifier_paired_dagger_temporal_k${temporal_window}"
+      proof_policy_scoring="residual_energy"
+      proof_policy_gradient_scope="full_model"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      proof_policy_max_rows_per_update_json=32
+      proof_policy_max_presentation_rows_per_update_json=32
+      ;;
+    local_pc_epc_verifier_paired_dagger_residual_joint_full_cf1_rows32)
+      behavior_arm="local_pc_epc_verifier_paired_dagger"
+      proof_policy_scoring="residual_energy"
+      proof_policy_gradient_scope="full_model"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      proof_policy_max_rows_per_update_json=32
+      proof_policy_max_presentation_rows_per_update_json=32
+      ;;
+    local_pc_sync_verifier_paired_dagger_residual_joint_full_cf1_rows32)
+      behavior_arm="local_pc_sync_verifier_paired_dagger"
+      proof_policy_scoring="residual_energy"
+      proof_policy_gradient_scope="full_model"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      proof_policy_max_rows_per_update_json=32
+      proof_policy_max_presentation_rows_per_update_json=32
+      ;;
+    local_pc_rgs_verifier_paired_dagger_residual_joint_full_cf1_rows32)
+      behavior_arm="local_pc_rgs_verifier_paired_dagger"
+      proof_policy_scoring="residual_energy"
+      proof_policy_gradient_scope="full_model"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      proof_policy_max_rows_per_update_json=32
+      proof_policy_max_presentation_rows_per_update_json=32
+      ;;
+    local_pc_alm_verifier_paired_dagger_residual_joint_full_cf1_rows32)
+      behavior_arm="local_pc_alm_verifier_paired_dagger"
+      proof_policy_scoring="residual_energy"
+      proof_policy_gradient_scope="full_model"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      proof_policy_max_rows_per_update_json=32
+      proof_policy_max_presentation_rows_per_update_json=32
+      ;;
     local_pc_fixed_verifier_static_cf1)
       behavior_arm="local_pc_fixed_verifier"
       proof_policy_counterfactual_targets=1
+      ;;
+    local_backprop_verifier_static_semantic_cf1)
+      behavior_arm="local_backprop_verifier"
+      proof_policy_scoring="semantic_energy"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      ;;
+    local_pc_fixed_verifier_static_semantic_cf1)
+      behavior_arm="local_pc_fixed_verifier"
+      proof_policy_scoring="semantic_energy"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      ;;
+    local_backprop_verifier_static_semantic_joint_cf1)
+      behavior_arm="local_backprop_verifier"
+      proof_policy_scoring="semantic_energy"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      ;;
+    local_pc_fixed_verifier_static_semantic_joint_cf1)
+      behavior_arm="local_pc_fixed_verifier"
+      proof_policy_scoring="semantic_energy"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      ;;
+    local_backprop_verifier_static_semantic_joint_head_cf1)
+      behavior_arm="local_backprop_verifier"
+      proof_policy_scoring="semantic_energy"
+      proof_policy_gradient_scope="score_head_only"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      ;;
+    local_pc_fixed_verifier_static_semantic_joint_head_cf1)
+      behavior_arm="local_pc_fixed_verifier"
+      proof_policy_scoring="semantic_energy"
+      proof_policy_gradient_scope="score_head_only"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      ;;
+    local_backprop_verifier_static_semantic_target_group_cf1)
+      behavior_arm="local_backprop_verifier"
+      proof_policy_scoring="semantic_energy"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      proof_policy_counterfactual_objective="target_group_conditional"
+      ;;
+    local_backprop_verifier_static_semantic_target_group_joint_cf1)
+      behavior_arm="local_backprop_verifier"
+      proof_policy_scoring="semantic_energy"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      proof_policy_counterfactual_objective="target_group_conditional"
+      ;;
+    local_pc_fixed_verifier_static_semantic_target_group_joint_cf1)
+      behavior_arm="local_pc_fixed_verifier"
+      proof_policy_scoring="semantic_energy"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      proof_policy_counterfactual_objective="target_group_conditional"
+      ;;
+    local_pc_fixed_verifier_static_semantic_target_group_cf1)
+      behavior_arm="local_pc_fixed_verifier"
+      proof_policy_scoring="semantic_energy"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      proof_policy_counterfactual_objective="target_group_conditional"
+      ;;
+    local_backprop_verifier_static_semantic_target_group_head_cf1)
+      behavior_arm="local_backprop_verifier"
+      proof_policy_scoring="semantic_energy"
+      proof_policy_gradient_scope="score_head_only"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      proof_policy_counterfactual_objective="target_group_conditional"
+      ;;
+    local_pc_fixed_verifier_static_semantic_target_group_head_cf1)
+      behavior_arm="local_pc_fixed_verifier"
+      proof_policy_scoring="semantic_energy"
+      proof_policy_gradient_scope="score_head_only"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      proof_policy_counterfactual_objective="target_group_conditional"
+      ;;
+    local_pc_epc_verifier_static_semantic_cf1)
+      behavior_arm="local_pc_epc_verifier"
+      proof_policy_scoring="semantic_energy"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      ;;
+    local_pc_alm_verifier_static_semantic_cf1)
+      behavior_arm="local_pc_alm_verifier"
+      proof_policy_scoring="semantic_energy"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      ;;
+    local_backprop_verifier_static_candidate)
+      behavior_arm="local_backprop_verifier"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      ;;
+    local_pc_fixed_verifier_static_candidate)
+      behavior_arm="local_pc_fixed_verifier"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      ;;
+    local_pc_epc_verifier_static_candidate)
+      behavior_arm="local_pc_epc_verifier"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      ;;
+    local_backprop_verifier_static_candidate_cf1)
+      behavior_arm="local_backprop_verifier"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      ;;
+    local_pc_fixed_verifier_static_candidate_cf1)
+      behavior_arm="local_pc_fixed_verifier"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      ;;
+    local_pc_epc_verifier_static_candidate_cf1)
+      behavior_arm="local_pc_epc_verifier"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      ;;
+    local_backprop_verifier_static_target_group_cf1)
+      behavior_arm="local_backprop_verifier"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      proof_policy_counterfactual_objective="target_group_conditional"
+      ;;
+    local_pc_fixed_verifier_static_target_group_cf1)
+      behavior_arm="local_pc_fixed_verifier"
+      proof_policy_normalization="candidate_conditional"
+      policy_probe_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      proof_policy_counterfactual_objective="target_group_conditional"
       ;;
     local_backprop_verifier_static_cf1_temporal_k2)
       behavior_arm="local_backprop_verifier_temporal_k2"
@@ -2619,6 +3944,15 @@ write_manifest() {
       ;;
     local_backprop_verifier_paired_dagger_residual_cf1_rows128_temporal_k2)
       behavior_arm="local_backprop_verifier_paired_dagger_temporal_k2"
+      proof_policy_scoring="residual_energy"
+      proof_policy_gradient_scope="score_head_only"
+      proof_policy_normalization="candidate_conditional"
+      proof_policy_counterfactual_targets=1
+      proof_policy_max_rows_per_update_json=128
+      proof_policy_max_presentation_rows_per_update_json=128
+      ;;
+    local_pc_fixed_verifier_paired_dagger_residual_cf1_rows128_temporal_k2)
+      behavior_arm="local_pc_fixed_verifier_paired_dagger_temporal_k2"
       proof_policy_scoring="residual_energy"
       proof_policy_gradient_scope="score_head_only"
       proof_policy_normalization="candidate_conditional"
@@ -2700,19 +4034,26 @@ write_manifest() {
       proof_policy_semantic_refresh_counterfactual_targets=1
       ;;
   esac
+  if [[ -n "$proof_policy_gradient_scope_override" ]]; then
+    proof_policy_gradient_scope="$proof_policy_gradient_scope_override"
+  fi
   case "$behavior_arm" in
     *paired_dagger*) proof_policy_mode="static_then_paired_dagger" ;;
     *verifier_dagger*) proof_policy_mode="dagger" ;;
   esac
   if [[ "$behavior_arm" == *verifier* ]]; then
     policy_probe_normalization="$proof_policy_normalization"
+    terminal_criterion="ruliad_verifier_set"
+  fi
+  if [[ "$arm" == *"_joint_"* || "$arm" == *"_joint" ]]; then
+    terminal_criterion="ruliad_verifier_set_joint"
   fi
   case "$behavior_arm" in
-    local_backprop_verifier|local_backprop_verifier_temporal_k2|local_pc_fixed_verifier|local_pc_fixed_verifier_temporal_k2|local_pc_epc_verifier)
+    local_backprop_verifier|local_backprop_verifier_temporal_k2|local_pc_fixed_verifier|local_pc_fixed_verifier_temporal_k2|local_pc_fixed_verifier_temporal_k4|local_pc_fixed_verifier_temporal_k8|local_pc_epc_verifier|local_pc_sync_verifier|local_pc_rgs_verifier|local_pc_alm_verifier)
       : "${proof_policy_max_rows_per_update_json:=8}"
       : "${proof_policy_max_presentation_rows_per_update_json:=64}"
       ;;
-    local_backprop_verifier_dagger_temporal_k2|local_backprop_verifier_paired_dagger|local_backprop_verifier_paired_dagger_temporal_k2|local_pc_fixed_verifier_dagger|local_pc_fixed_verifier_dagger_temporal_k2|local_pc_fixed_verifier_paired_dagger|local_pc_fixed_verifier_paired_dagger_temporal_k2|local_pc_epc_verifier_paired_dagger|local_pc_alm_verifier_paired_dagger)
+    local_backprop_verifier_dagger_temporal_k2|local_backprop_verifier_paired_dagger|local_backprop_verifier_paired_dagger_temporal_k2|local_pc_fixed_verifier_dagger|local_pc_fixed_verifier_dagger_temporal_k2|local_pc_fixed_verifier_dagger_temporal_k4|local_pc_fixed_verifier_dagger_temporal_k8|local_pc_fixed_verifier_paired_dagger|local_pc_fixed_verifier_paired_dagger_temporal_k2|local_pc_fixed_verifier_paired_dagger_temporal_k4|local_pc_fixed_verifier_paired_dagger_temporal_k8|local_pc_layer_verifier_paired_dagger|local_pc_epc_verifier_paired_dagger|local_pc_alm_verifier_paired_dagger)
       : "${proof_policy_max_rows_per_update_json:=16}"
       : "${proof_policy_max_presentation_rows_per_update_json:=128}"
       ;;
@@ -2722,6 +4063,7 @@ write_manifest() {
   git_sha="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || true)"
   git_branch="$(git -C "$ROOT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
   train_binary_sha256="$(sha256_file "$TRAIN_BINARY")"
+  eval_binary_sha256="$(sha256_file "$EVAL_BINARY")"
   runner_sha256="$(sha256_file "$ROOT_DIR/scripts/pc_paper_experiments.sh")"
   if [[ -z "$(git -C "$ROOT_DIR" status --porcelain 2>/dev/null)" ]]; then
     dirty=false
@@ -2733,6 +4075,9 @@ write_manifest() {
   fi
   if [[ -n "$RULIAD_COLD_START_ENABLED" ]]; then
     source_cold_start_json="$RULIAD_COLD_START_ENABLED"
+  fi
+  if [[ -n "$RULIAD_SOURCE_SELECTION_DOCUMENTS_PER_STEP" ]]; then
+    source_documents_per_step_json="$RULIAD_SOURCE_SELECTION_DOCUMENTS_PER_STEP"
   fi
   if [[ -n "$RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS" ]]; then
     closed_loop_cadence_json="$RULIAD_POLICY_PROBE_CLOSED_LOOP_EVERY_EPOCHS"
@@ -2765,22 +4110,34 @@ write_manifest() {
   "checkpoint_interval_iters": $CHECKPOINT_INTERVAL_ITERS,
   "block_size": $block_size_json,
   "local_learning_rate": $LOCAL_LEARNING_RATE,
+  "pc_inference_steps": $pc_inference_steps_json,
+  "pc_step_size": $pc_step_size_json,
+  "pc_prediction_precision": $pc_prediction_precision_json,
+  "pc_next_token_solver": $(json_escape "$pc_next_token_solver"),
   "learning_rate_schedule": $(json_escape "$lr_schedule"),
   "cosine_min_lr": $COSINE_MIN_LR,
   "cosine_warmup_steps": $COSINE_WARMUP_STEPS,
-  "tbptt_chunk_size": $TBPTT_CHUNK_SIZE,
+  "tbptt_chunk_size": $effective_tbptt_chunk_size,
   "tbptt_credit_window_chunks": $tbptt_credit_window_chunks,
   "model_sequence_executor": $(json_escape "$model_sequence_executor"),
+  "terminal_criterion": $(json_escape "$terminal_criterion"),
   "verifier_every_steps": $verifier_every_steps_json,
+  "proof_policy_start_after_steps": 0,
   "proof_policy_scoring": $(json_escape "$proof_policy_scoring"),
+  "proof_policy_decoder_calibration_steps": $proof_policy_decoder_calibration_steps,
+  "proof_policy_prompt_context": $(json_escape "$proof_policy_prompt_context"),
+  "proof_policy_target": $(json_escape "$proof_policy_target"),
   "proof_policy_mode": $(json_escape "$proof_policy_mode"),
   "proof_policy_gradient_scope": $(json_escape "$proof_policy_gradient_scope"),
   "proof_policy_normalization": $(json_escape "$proof_policy_normalization"),
   "proof_policy_candidate_symmetry": $(json_escape "$proof_policy_candidate_symmetry"),
   "proof_policy_presentation_risk": $(json_escape "$proof_policy_presentation_risk"),
+  "policy_probe_scoring": $(json_escape "$policy_probe_scoring"),
+  "policy_probe_prompt_context": $(json_escape "$proof_policy_prompt_context"),
   "policy_probe_normalization": $(json_escape "$policy_probe_normalization"),
   "policy_probe_candidate_symmetry": $(json_escape "$policy_probe_candidate_symmetry"),
   "proof_policy_counterfactual_targets": $proof_policy_counterfactual_targets,
+  "proof_policy_counterfactual_objective": $(json_escape "$proof_policy_counterfactual_objective"),
   "proof_policy_max_rows_per_update": $proof_policy_max_rows_per_update_json,
   "proof_policy_max_presentation_rows_per_update": $proof_policy_max_presentation_rows_per_update_json,
   "proof_policy_semantic_refresh_every": $proof_policy_semantic_refresh_every,
@@ -2791,6 +4148,12 @@ write_manifest() {
   "sequence_state_probe_paired_batches": $SEQUENCE_STATE_PROBE_PAIRED_BATCHES,
   "source_selection_feedback_updates_enabled": $source_feedback_json,
   "ruliad_source_selection_cold_start_enabled": $source_cold_start_json,
+  "ruliad_source_selection_documents_per_step": $source_documents_per_step_json,
+  "ruliad_consolidation_enabled": $ruliad_consolidation_json,
+  "ruliad_consolidation_initial_unique_steps": $RULIAD_CONSOLIDATION_INITIAL_UNIQUE_STEPS,
+  "ruliad_consolidation_hold_steps": $RULIAD_CONSOLIDATION_HOLD_STEPS,
+  "ruliad_consolidation_novelty_interval_steps": $RULIAD_CONSOLIDATION_NOVELTY_INTERVAL_STEPS,
+  "ruliad_consolidation_seed": $RULIAD_CONSOLIDATION_SEED,
   "validation_objective": $(json_escape "$VALIDATION_OBJECTIVE"),
   "validation_sampling": "fixed_holdout",
   "ruliad_panel_base_difficulty_levels": $RULIAD_PANEL_BASE_DIFFICULTY_LEVELS,
@@ -2807,6 +4170,19 @@ write_manifest() {
   "run_dir": $(json_escape "$run_dir"),
   "log_path": $(json_escape "$log_path"),
   "gpu_path": $(json_escape "$gpu_path"),
+  "checkpoint_eval_enabled": $CHECKPOINT_EVAL,
+  "checkpoint_eval_path": $(json_escape "$checkpoint_eval_path"),
+  "checkpoint_eval_log_path": $(json_escape "$checkpoint_eval_log_path"),
+  "checkpoint_eval_status": $(json_escape "$checkpoint_eval_status"),
+  "checkpoint_eval_elapsed_seconds": $checkpoint_eval_elapsed,
+  "checkpoint_eval_peak_used_mb": $checkpoint_eval_peak_used_mb,
+  "checkpoint_eval_min_available_mb": $checkpoint_eval_min_available_mb,
+  "checkpoint_eval_free_run_items": $CHECKPOINT_EVAL_FREE_RUN_ITEMS,
+  "checkpoint_eval_policy_items": $CHECKPOINT_EVAL_POLICY_ITEMS,
+  "checkpoint_eval_difficulty_levels": $CHECKPOINT_EVAL_DIFFICULTY_LEVELS,
+  "checkpoint_eval_batch_size": $CHECKPOINT_EVAL_BATCH_SIZE,
+  "checkpoint_eval_policy_scoring": $(json_escape "$CHECKPOINT_EVAL_POLICY_SCORING"),
+  "checkpoint_eval_policy_max_steps": $CHECKPOINT_EVAL_POLICY_MAX_STEPS,
   "status": $(json_escape "$status"),
   "elapsed_seconds": $elapsed,
   "peak_used_mb": $peak_used_mb,
@@ -2819,6 +4195,7 @@ write_manifest() {
   "git_dirty": $dirty,
   "clean_git_required": $REQUIRE_CLEAN_GIT,
   "train_binary_sha256": $(json_escape "$train_binary_sha256"),
+  "checkpoint_eval_binary_sha256": $(json_escape "$eval_binary_sha256"),
   "runner_sha256": $(json_escape "$runner_sha256"),
   "note": $(json_escape "$exit_note")
 }
@@ -2832,9 +4209,51 @@ validate_overlay_contract() {
     echo "verifier arm did not emit a proof-policy section: arm=$arm overlay=$path" >&2
     return 2
   fi
+  if [[ "$arm" == *_progress* ]] && ! grep -Fq 'target = "verified_progress_distribution"' "$path"; then
+    echo "progress arm did not emit the verified-progress target: arm=$arm overlay=$path" >&2
+    return 2
+  fi
+  if [[ "$arm" =~ _deccal([1-9][0-9]*)(_|$) ]] \
+    && ! grep -Fq "decoder_calibration_steps = ${BASH_REMATCH[1]}" "$path"; then
+    echo "decoder-calibration arm did not emit its phase length: arm=$arm overlay=$path" >&2
+    return 2
+  fi
+  if [[ "$arm" == *_factorjoint* ]] \
+    && ! grep -Fq 'counterfactual_objective = "factorized_joint"' "$path"; then
+    echo "factorized-joint arm did not emit its block-coordinate objective: arm=$arm overlay=$path" >&2
+    return 2
+  fi
   if [[ "$arm" == *_cosine* ]] && ! grep -Fq '[optimizer.lr_schedule]' "$path"; then
     echo "cosine arm did not emit an optimizer schedule: arm=$arm overlay=$path" >&2
     return 2
+  fi
+  if [[ "$arm" == *_routefixed* ]] \
+    && { ! grep -Fq '[training.local_predictive_coding.objective_routing]' "$path" \
+      || ! grep -Fq 'next_token_solver = "fixed_prediction"' "$path"; }; then
+    echo "routed arm did not emit its next-token solver contract: arm=$arm overlay=$path" >&2
+    return 2
+  fi
+  if [[ "$arm" =~ _pcsteps(1|2|4|5|6|8|16)_eta(001|003|005|01|03|05|10|20)_prec(1|3|10|30)(_|$) ]]; then
+    local expected_steps="${BASH_REMATCH[1]}"
+    local eta_code="${BASH_REMATCH[2]}"
+    local expected_precision="${BASH_REMATCH[3]}.0"
+    local expected_eta=""
+    case "$eta_code" in
+      001) expected_eta=0.001 ;;
+      003) expected_eta=0.003 ;;
+      005) expected_eta=0.005 ;;
+      01) expected_eta=0.01 ;;
+      03) expected_eta=0.03 ;;
+      05) expected_eta=0.05 ;;
+      10) expected_eta=0.1 ;;
+      20) expected_eta=0.2 ;;
+    esac
+    if ! grep -Fq "steps = $expected_steps" "$path" \
+      || ! grep -Fq "step_size = $expected_eta" "$path" \
+      || ! grep -Fq "prediction_precision = $expected_precision" "$path"; then
+      echo "EPC arm did not emit its encoded solver settings: arm=$arm overlay=$path" >&2
+      return 2
+    fi
   fi
 }
 
@@ -2853,6 +4272,204 @@ latest_run_dir_for_root() {
     | sort -nr | awk 'NR==1 {print $2}'
 }
 
+validate_dynamic_run_contract() {
+  local arm="$1"
+  local iters="$2"
+  local run_dir="$3"
+  local log_path="$4"
+  if [[ "$arm" != *dagger* ]] || (( iters <= RULIAD_DAGGER_START_AFTER_STEPS )); then
+    return 0
+  fi
+  local telemetry="$run_dir/events/ruliad_proof_policy_dagger.jsonl"
+  if [[ ! -s "$telemetry" ]]; then
+    echo "dynamic proof-policy telemetry is missing: arm=$arm run_dir=$run_dir" >> "$log_path"
+    return 1
+  fi
+  local model_scoring_batches
+  model_scoring_batches="$(python3 -c '
+import json
+import sys
+
+total = 0
+with open(sys.argv[1], encoding="utf-8") as stream:
+    for line in stream:
+        event = json.loads(line)
+        if event.get("mode") in {"dagger", "paired_dagger"}:
+            total += int(event.get("model_scoring_batches", 0))
+print(total)
+' "$telemetry")"
+  if (( model_scoring_batches <= 0 )); then
+    echo "dynamic proof-policy contract failed: no model-scoring batches executed after the DAgger transition" >> "$log_path"
+    return 1
+  fi
+}
+
+validate_proof_policy_delivery_contract() {
+  local arm="$1"
+  local iters="$2"
+  local overlay="$3"
+  local run_dir="$4"
+  local log_path="$5"
+  if [[ "$arm" != *verifier* ]]; then
+    return 0
+  fi
+  local telemetry="$run_dir/events/ruliad_proof_policy_dagger.jsonl"
+  if [[ ! -s "$telemetry" ]]; then
+    echo "proof-policy delivery telemetry is missing: arm=$arm run_dir=$run_dir" >> "$log_path"
+    return 1
+  fi
+  python3 - "$overlay" "$telemetry" "$iters" >> "$log_path" <<'PY'
+import json
+import sys
+import tomllib
+
+overlay_path, telemetry_path, raw_iters = sys.argv[1:]
+with open(overlay_path, "rb") as stream:
+    overlay = tomllib.load(stream)
+policy = overlay["training"]["ruliad_supervision"]["proof_policy"]
+if not policy.get("enabled") or not policy.get("require_scheduled_update"):
+    raise SystemExit("proof-policy delivery gate requires an enabled, required policy")
+
+iters = int(raw_iters)
+every = int(policy["every_steps"])
+start = int(policy.get("start_after_steps", 0))
+expected = [step for step in range(iters) if step >= start and step % every == 0]
+with open(telemetry_path, encoding="utf-8") as stream:
+    events = [json.loads(line) for line in stream if line.strip()]
+actual = [int(event["step_index"]) for event in events]
+if actual != expected:
+    missing = sorted(set(expected) - set(actual))
+    extra = sorted(set(actual) - set(expected))
+    raise SystemExit(
+        f"proof-policy delivery mismatch: expected={expected} actual={actual} "
+        f"missing={missing} extra={extra}"
+    )
+skipped = [event for event in events if event.get("skip_reason")]
+if skipped:
+    raise SystemExit(
+        "proof-policy delivery contained skipped updates: "
+        + json.dumps(
+            [[event.get("step_index"), event.get("skip_reason")] for event in skipped],
+            separators=(",", ":"),
+        )
+    )
+missing_fingerprints = [
+    event.get("step_index")
+    for event in events
+    if event.get("policy_batch_fingerprint") is None
+]
+if missing_fingerprints:
+    raise SystemExit(
+        f"proof-policy events lack batch fingerprints: steps={missing_fingerprints}"
+    )
+missing_objective_fingerprints = [
+    event.get("step_index")
+    for event in events
+    if event.get("objective_panel_fingerprint") is None
+    or int(event.get("objective_panel_fingerprint", 0)) == 0
+]
+if missing_objective_fingerprints:
+    raise SystemExit(
+        "proof-policy events lack realized objective-panel fingerprints: "
+        f"steps={missing_objective_fingerprints}"
+    )
+context = policy.get("prompt_context", "full_problem_suffix")
+wrong_context = [
+    event.get("step_index") for event in events if event.get("prompt_context") != context
+]
+if wrong_context:
+    raise SystemExit(
+        f"proof-policy prompt context mismatch: expected={context} steps={wrong_context}"
+    )
+if context == "local_action_state":
+    lossy = [
+        event.get("step_index")
+        for event in events
+        if int(event.get("original_prompt_tokens", 0))
+        != int(event.get("retained_prompt_tokens", 0))
+        or int(event.get("truncated_presentations", 0)) != 0
+    ]
+    if lossy:
+        raise SystemExit(
+            f"local-action prompts were truncated at scheduled steps={lossy}"
+        )
+calibration_steps = int(policy.get("decoder_calibration_steps", 0))
+if calibration_steps > 0:
+    calibration_end = start + calibration_steps
+    calibration_events = [
+        event for event in events if int(event["step_index"]) < calibration_end
+    ]
+    if not calibration_events:
+        raise SystemExit("decoder calibration produced no scheduled policy updates")
+    invalid_calibration = [
+        [
+            event.get("step_index"),
+            event.get("objective"),
+            event.get("target"),
+            event.get("mode"),
+        ]
+        for event in calibration_events
+        if event.get("objective") != "vocabulary_marginal_equivalent_v1"
+        or event.get("target") != "expert_set"
+        or event.get("gradient_scope") != "full_model"
+        or event.get("mode") != "static_expert"
+    ]
+    if invalid_calibration:
+        raise SystemExit(
+            "decoder-calibration objective contract failed: "
+            + json.dumps(invalid_calibration, separators=(",", ":"))
+        )
+    post_calibration = [
+        event for event in events if int(event["step_index"]) >= calibration_end
+    ]
+    if calibration_end < iters and not post_calibration:
+        raise SystemExit("decoder calibration never transitioned to the deployed scorer")
+    if policy.get("counterfactual_objective") == "factorized_joint":
+        invalid_deployed = []
+        for event in post_calibration:
+            step = int(event["step_index"])
+            update_ordinal = (step - start) // every
+            autoregressive = update_ordinal % 2 == 0
+            expected = (
+                "vocabulary_marginal_equivalent_v1",
+                "expert_set",
+                "full_model",
+            ) if autoregressive else (
+                "residual_energy_target_group_conditional_v1",
+                "expert_set",
+                policy.get("gradient_scope"),
+            )
+            actual = (
+                event.get("objective"),
+                event.get("target"),
+                event.get("gradient_scope"),
+            )
+            if actual != expected:
+                invalid_deployed.append([step, *actual, *expected])
+    else:
+        invalid_deployed = [
+            [event.get("step_index"), event.get("objective"), event.get("target")]
+            for event in post_calibration
+            if "residual_energy" not in str(event.get("objective", ""))
+            or event.get("target") != policy.get("target")
+        ]
+    if invalid_deployed:
+        raise SystemExit(
+            "post-calibration deployed objective contract failed: "
+            + json.dumps(invalid_deployed, separators=(",", ":"))
+        )
+print(
+    f"proof-policy delivery contract passed: events={len(events)} "
+    f"schedule={start}:{every} context={context} calibration={calibration_steps}"
+)
+PY
+}
+
+validate_matrix_proof_policy_stream_identity() {
+  local out_dir="$1"
+  python3 "$ROOT_DIR/scripts/pc_paper_identity.py" "$out_dir"
+}
+
 run_trial() {
   local arm="$1"
   local seed="$2"
@@ -2865,10 +4482,22 @@ run_trial() {
   local run_dir=""
   local status="not_started"
   local gpu_path=""
+  local train_elapsed_seconds=0
+  local train_peak_used_mb=0
+  local train_min_available_mb=0
+
+  CHECKPOINT_EVAL_PATH_CURRENT=""
+  CHECKPOINT_EVAL_LOG_CURRENT=""
+  CHECKPOINT_EVAL_STATUS_CURRENT="disabled"
+  CHECKPOINT_EVAL_ELAPSED_SECONDS_CURRENT=0
+  CHECKPOINT_EVAL_PEAK_USED_MB_CURRENT=0
+  CHECKPOINT_EVAL_MIN_AVAILABLE_MB_CURRENT=0
 
   mkdir -p "$run_root"
   write_overlay "$overlay" "$arm" "$seed" "$iters" "$BATCH_SIZE"
-  validate_overlay_contract "$overlay" "$arm"
+  if ! validate_overlay_contract "$overlay" "$arm"; then
+    return 2
+  fi
 
   local cmd=(
     "$TRAIN_BINARY"
@@ -2884,7 +4513,13 @@ run_trial() {
 
   if (( DRY_RUN == 1 )); then
     status="dry_run"
-    write_manifest "$manifest" "$trial_key" "$arm" "$seed" "$iters" "$BATCH_SIZE" "$overlay" "$run_root" "" "$log_path" "$status" 0 0 0 "not launched" ""
+    if (( CHECKPOINT_EVAL == 1 )); then
+      CHECKPOINT_EVAL_STATUS_CURRENT="dry_run"
+      CHECKPOINT_EVAL_PATH_CURRENT="$OUT_DIR/checkpoint_evaluations/iters${iters}/${arm}-seed${seed}.json"
+      CHECKPOINT_EVAL_LOG_CURRENT="$OUT_DIR/logs/${trial_key}.checkpoint-eval.log"
+    fi
+    write_manifest "$manifest" "$trial_key" "$arm" "$seed" "$iters" "$BATCH_SIZE" "$overlay" "$run_root" "" "$log_path" "$status" 0 0 0 "not launched" "" \
+      "$CHECKPOINT_EVAL_PATH_CURRENT" "$CHECKPOINT_EVAL_LOG_CURRENT" "$CHECKPOINT_EVAL_STATUS_CURRENT" 0 0 0
     printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
       "$trial_key" "$MATRIX" "$iters" "$arm" "$seed" "$BATCH_SIZE" "$status" 0 0 0 "" "$manifest" "$log_path" \
       | tee -a "$RUN_INDEX"
@@ -2906,11 +4541,27 @@ run_trial() {
 
   monitor_process "$pid" "$log_path" "$gpu_path"
   status="$MONITOR_STATUS"
+  train_elapsed_seconds="$MONITOR_ELAPSED_SECONDS"
+  train_peak_used_mb="$MONITOR_PEAK_USED_MB"
+  train_min_available_mb="$MONITOR_MIN_AVAILABLE_MB"
   run_dir="$(latest_run_dir_for_root "$run_root" || true)"
-  write_manifest "$manifest" "$trial_key" "$arm" "$seed" "$iters" "$BATCH_SIZE" "$overlay" "$run_root" "$run_dir" "$log_path" "$status" "$MONITOR_ELAPSED_SECONDS" "$MONITOR_PEAK_USED_MB" "$MONITOR_MIN_AVAILABLE_MB" "" "$gpu_path"
+  if [[ "$status" == "ok" ]] && ! validate_dynamic_run_contract "$arm" "$iters" "$run_dir" "$log_path"; then
+    status="failed_dynamic_supervision_contract"
+  fi
+  if [[ "$status" == "ok" ]] && ! validate_proof_policy_delivery_contract "$arm" "$iters" "$overlay" "$run_dir" "$log_path"; then
+    status="failed_proof_policy_delivery_contract"
+  fi
+  if (( CHECKPOINT_EVAL == 1 )) && [[ "$status" == "ok" || "$status" == "wall_clock_complete" ]]; then
+    echo "==> checkpoint evaluation: $trial_key"
+    if ! run_checkpoint_evaluation "$trial_key" "$arm" "$seed" "$iters" "$run_dir"; then
+      status="failed_checkpoint_evaluation"
+    fi
+  fi
+  write_manifest "$manifest" "$trial_key" "$arm" "$seed" "$iters" "$BATCH_SIZE" "$overlay" "$run_root" "$run_dir" "$log_path" "$status" "$train_elapsed_seconds" "$train_peak_used_mb" "$train_min_available_mb" "" "$gpu_path" \
+    "$CHECKPOINT_EVAL_PATH_CURRENT" "$CHECKPOINT_EVAL_LOG_CURRENT" "$CHECKPOINT_EVAL_STATUS_CURRENT" "$CHECKPOINT_EVAL_ELAPSED_SECONDS_CURRENT" "$CHECKPOINT_EVAL_PEAK_USED_MB_CURRENT" "$CHECKPOINT_EVAL_MIN_AVAILABLE_MB_CURRENT"
 
   printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-    "$trial_key" "$MATRIX" "$iters" "$arm" "$seed" "$BATCH_SIZE" "$status" "$MONITOR_ELAPSED_SECONDS" "$MONITOR_PEAK_USED_MB" "$MONITOR_MIN_AVAILABLE_MB" "$run_dir" "$manifest" "$log_path" \
+    "$trial_key" "$MATRIX" "$iters" "$arm" "$seed" "$BATCH_SIZE" "$status" "$train_elapsed_seconds" "$train_peak_used_mb" "$train_min_available_mb" "$run_dir" "$manifest" "$log_path" \
     | tee -a "$RUN_INDEX"
 
   [[ "$status" == "ok" || "$status" == "wall_clock_complete" ]]
@@ -2919,6 +4570,7 @@ run_trial() {
 IFS=',' read -r -a SEEDS <<< "$SEEDS_CSV"
 IFS=',' read -r -a ITERS <<< "$ITERS_CSV"
 IFS=',' read -r -a ARMS <<< "$ARMS_CSV"
+: "${CHECKPOINT_EVAL_REFERENCE_ARM:=${ARMS[0]}}"
 
 echo "pc paper matrix: matrix=$MATRIX backend=$BACKEND profile=$PROFILE batch_size=$BATCH_SIZE out_dir=$OUT_DIR"
 echo "seeds=$SEEDS_CSV iters=$ITERS_CSV arms=$ARMS_CSV"
@@ -2929,6 +4581,7 @@ echo "block_size=${BLOCK_SIZE:-profile} tbptt_chunk_size=$TBPTT_CHUNK_SIZE tbptt
 echo "sequence_state_probe=$SEQUENCE_STATE_PROBE paired_batches=$SEQUENCE_STATE_PROBE_PAIRED_BATCHES"
 echo "source_selection_feedback_updates=$SOURCE_SELECTION_FEEDBACK_UPDATES"
 echo "ruliad_cold_start_enabled=${RULIAD_COLD_START_ENABLED:-profile}"
+echo "ruliad_source_selection_documents_per_step=${RULIAD_SOURCE_SELECTION_DOCUMENTS_PER_STEP:-batch_size}"
 echo "validation_objective=$VALIDATION_OBJECTIVE"
 echo "ruliad_panel_base_difficulty_levels=$RULIAD_PANEL_BASE_DIFFICULTY_LEVELS"
 if (( DEFER_EXPENSIVE_RULIAD_PROBES == 1 )); then
@@ -2940,6 +4593,7 @@ else
 fi
 echo "guards: max_system_memory_fraction=$MAX_SYSTEM_MEMORY_FRACTION min_available_mb=$MIN_AVAILABLE_MB timeout_seconds=$TIMEOUT_SECONDS"
 echo "defer_expensive_ruliad_probes=$DEFER_EXPENSIVE_RULIAD_PROBES"
+echo "checkpoint_eval=$CHECKPOINT_EVAL free_run_items=$CHECKPOINT_EVAL_FREE_RUN_ITEMS policy_items=$CHECKPOINT_EVAL_POLICY_ITEMS difficulty_levels=$CHECKPOINT_EVAL_DIFFICULTY_LEVELS batch_size=$CHECKPOINT_EVAL_BATCH_SIZE scoring=$CHECKPOINT_EVAL_POLICY_SCORING max_steps=$CHECKPOINT_EVAL_POLICY_MAX_STEPS reference_arm=$CHECKPOINT_EVAL_REFERENCE_ARM"
 
 matrix_status=0
 for iters in "${ITERS[@]}"; do
@@ -2953,5 +4607,24 @@ for iters in "${ITERS[@]}"; do
   done
 done
 
+if ! validate_matrix_proof_policy_stream_identity "$OUT_DIR"; then
+  matrix_status=1
+fi
+if (( DRY_RUN == 0 && CHECKPOINT_EVAL == 1 )); then
+  for iters in "${ITERS[@]}"; do
+    checkpoint_eval_dir="$OUT_DIR/checkpoint_evaluations/iters${iters}"
+    if [[ ! -d "$checkpoint_eval_dir" ]] || ! find "$checkpoint_eval_dir" -maxdepth 1 -name '*.json' -print -quit | grep -q .; then
+      echo "checkpoint evaluation reports are missing for iters=$iters" >&2
+      matrix_status=1
+      continue
+    fi
+    if ! python3 "$ROOT_DIR/scripts/ruliad_checkpoint_eval_analyze.py" \
+      "$checkpoint_eval_dir" \
+      --output-dir "$OUT_DIR/checkpoint_evaluations/analysis/iters${iters}" \
+      --reference-arm "$CHECKPOINT_EVAL_REFERENCE_ARM"; then
+      matrix_status=1
+    fi
+  done
+fi
 echo "matrix complete: $RUN_INDEX"
 exit "$matrix_status"

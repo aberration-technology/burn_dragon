@@ -1,3 +1,5 @@
+# Archived negative control. Rejected by the masked-stream safety contract:
+# context-only windows cannot update the model or carry their context forward.
 extends = "ruliad-r3.stateful-tbptt-base.training.toml"
 
 [training]

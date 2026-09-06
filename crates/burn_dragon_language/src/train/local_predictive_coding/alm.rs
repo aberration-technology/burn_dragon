@@ -210,9 +210,13 @@ where
         parameter_ids.norm_shift,
         batched_vjp.grad_norm_shift + initial_vjp.grad_norm_shift,
     );
-    grads.register(
-        parameter_ids.lm_head,
-        terminal.grad_lm_head.mul_scalar(scale),
+    register_terminal_head_derivatives(
+        &mut grads,
+        &parameter_ids,
+        terminal.grad_lm_head,
+        terminal.grad_sequence_score_head,
+        scale,
+        None,
     );
 
     let sync = config.sync_diagnostics;

@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROFILE_DIR="$ROOT_DIR/crates/burn_dragon_p2p/deploy/profiles"
-ARMS_CSV="block512_reset,block512_carry,chunk128_reset,chunk128_carry"
+ARMS_CSV="block512_carry,chunk128_carry,chunk64_carry"
 SEEDS_CSV="1337,7331,4242"
 MAX_ITERS=512
 BATCH_SIZE=32
@@ -31,8 +31,8 @@ usage() {
   cat <<'USAGE'
 Usage: scripts/stateful_tbptt_matrix.sh [options]
 
-  --arms <csv>              block512_reset, block512_carry, chunk128_reset,
-                            chunk128_carry, and/or chunk64_carry.
+  --arms <csv>              block512_carry, chunk128_carry, and/or chunk64_carry.
+                            Archived masked-stream reset arms are not runnable.
   --seeds <csv>             Deterministic training seeds. Default: 1337,7331,4242.
   --max-iters <n>           Updates per trial. Default: 512.
   --batch-size <n>          Fixed micro-batch for every arm. Default: 32.
@@ -110,14 +110,22 @@ done
 
 profile_for_arm() {
   case "$1" in
-    block512_reset) echo "$PROFILE_DIR/ruliad-r3.stateful-tbptt-block512-reset.toml" ;;
     block512_carry) echo "$PROFILE_DIR/ruliad-r3.stateful-tbptt-block512-carry.toml" ;;
-    chunk128_reset) echo "$PROFILE_DIR/ruliad-r3.stateful-tbptt-chunk128-reset.toml" ;;
     chunk128_carry) echo "$PROFILE_DIR/ruliad-r3.stateful-tbptt-chunk128-carry.toml" ;;
     chunk64_carry) echo "$PROFILE_DIR/ruliad-r3.stateful-tbptt-chunk64-carry.toml" ;;
+    block512_reset|chunk128_reset)
+      echo "unsupported masked-stream reset arm: $1 (context-only windows lose state and yield zero-gradient updates)" >&2
+      return 2 ;;
     *) echo "unknown stateful TBPTT arm: $1" >&2; return 2 ;;
   esac
 }
+
+# Reject unsupported contracts before compiling, writing artifacts, or launching a GPU job.
+IFS=',' read -r -a ARMS <<< "$ARMS_CSV"
+[[ ${#ARMS[@]} -gt 0 ]] || { echo "matrix needs at least one arm" >&2; exit 2; }
+for arm in "${ARMS[@]}"; do
+  profile_for_arm "$arm" > /dev/null
+done
 
 mem_total_kb() {
   awk '/^MemTotal:/ {print $2}' /proc/meminfo
@@ -334,7 +342,6 @@ elif (( DRY_RUN == 0 )); then
   fi
 fi
 
-IFS=',' read -r -a ARMS <<< "$ARMS_CSV"
 IFS=',' read -r -a SEEDS <<< "$SEEDS_CSV"
 echo "stateful TBPTT matrix: out=$OUT_DIR arms=${ARMS[*]} seeds=${SEEDS[*]} max_iters=$MAX_ITERS batch=$BATCH_SIZE backend=$BACKEND"
 echo "RAM guards: max_fraction=$MAX_SYSTEM_MEMORY_FRACTION min_available_mb=$MIN_AVAILABLE_MB"

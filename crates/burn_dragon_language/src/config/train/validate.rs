@@ -67,6 +67,7 @@ impl TrainingConfig {
         let verifier_terminal = matches!(
             self.training.local_predictive_coding.terminal_criterion,
             crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSet
+                | crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSetJoint
         );
         if verifier_terminal {
             if !matches!(
@@ -110,16 +111,82 @@ impl TrainingConfig {
             .training
             .ruliad_supervision
             .proof_policy_semantic_refresh;
+        let joint_primary = matches!(
+            pc.terminal_criterion,
+            crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSetJoint
+        );
+        if joint_primary {
+            let exact_local_temporal_credit =
+                require_local_solver && pc.temporal_credit.carries_temporal_credit();
+            if !self.training.objective.is_next_token()
+                || (!exact_local_temporal_credit
+                    && self
+                        .training
+                        .tbptt_chunk_size
+                        .is_some_and(|chunk_size| chunk_size < self.training.block_size))
+            {
+                return Err(anyhow!(
+                    "ruliad_verifier_set_joint requires the next-token objective and an unset or full-block TBPTT chunk; predictive-coding exact-window temporal credit may split that primary factor explicitly"
+                ));
+            }
+            if self.training.input_corruption.enabled
+                || self.training.dynamics_anchor.enabled
+                || self.training.latent_reasoning.enabled
+                || self.training.logit_entropy_floor.enabled
+                || self.training.repeat_unlikelihood.enabled
+                || self.training.greedy_rollout_unlikelihood.enabled
+                || self.training.ruliad_supervision.answer_ranking.enabled
+                || self.training.ruliad_supervision.answer_denoising.enabled
+                || self.training.ruliad_supervision.answer_contract.enabled
+                || self
+                    .training
+                    .ruliad_supervision
+                    .prompt_value_binding
+                    .enabled
+                || self.training.ruliad_supervision.verifier_reward.enabled
+                || semantic_refresh.enabled
+            {
+                return Err(anyhow!(
+                    "ruliad_verifier_set_joint owns the complete two-factor objective and requires other global or Ruliad auxiliary objectives to be disabled"
+                ));
+            }
+        }
         if require_local_solver
             && !matches!(
                 pc.solver,
-                crate::config::LocalPredictiveCodingSolver::FixedPrediction
+                crate::config::LocalPredictiveCodingSolver::SynchronousEquilibrium
+                    | crate::config::LocalPredictiveCodingSolver::ReverseGaussSeidel
+                    | crate::config::LocalPredictiveCodingSolver::FixedPrediction
+                    | crate::config::LocalPredictiveCodingSolver::LayerLocalPrediction
                     | crate::config::LocalPredictiveCodingSolver::ErrorEquilibrium
                     | crate::config::LocalPredictiveCodingSolver::AugmentedLagrangian
             )
         {
             return Err(anyhow!(
-                "training.local_predictive_coding.terminal_criterion=ruliad_verifier_set currently requires solver=fixed_prediction, error_equilibrium, or augmented_lagrangian"
+                "training.local_predictive_coding.terminal_criterion=ruliad_verifier_set currently requires solver=synchronous_equilibrium, reverse_gauss_seidel, fixed_prediction, layer_local_prediction, error_equilibrium, or augmented_lagrangian"
+            ));
+        }
+        let model_layers = self
+            .model
+            .n_layer
+            .unwrap_or_else(|| burn_dragon_core::DragonConfig::default().n_layer);
+        if require_local_solver
+            && ((pc.solver == crate::config::LocalPredictiveCodingSolver::AugmentedLagrangian
+                && pc.augmented_lagrangian.steps <= model_layers)
+                || (pc.solver
+                    == crate::config::LocalPredictiveCodingSolver::SynchronousEquilibrium
+                    && pc.inference.steps <= model_layers))
+        {
+            let steps =
+                if pc.solver == crate::config::LocalPredictiveCodingSolver::AugmentedLagrangian {
+                    pc.augmented_lagrangian.steps
+                } else {
+                    pc.inference.steps
+                };
+            return Err(anyhow!(
+                "synchronous/augmented-Lagrangian ruliad_verifier_set requires inference steps > model.n_layer so terminal credit reaches the embedding (steps={}, layers={})",
+                steps,
+                model_layers,
             ));
         }
         if require_local_solver && semantic_refresh.enabled {
@@ -142,26 +209,49 @@ impl TrainingConfig {
         let completion_terminal = policy.scoring
             == crate::config::RuliadProofPolicyScoring::CompletionLikelihood
             && policy.gradient_scope == crate::config::RuliadProofPolicyGradientScope::FullModel
-            && policy.normalization
-                == crate::config::RuliadProofPolicyNormalization::PrefixConditional;
+            && matches!(
+                policy.normalization,
+                crate::config::RuliadProofPolicyNormalization::CandidateConditional
+                    | crate::config::RuliadProofPolicyNormalization::PrefixConditional
+            );
         let global_semantic_terminal = !require_local_solver
             && policy.scoring.uses_sequence_score_head()
             && matches!(
                 policy.gradient_scope,
                 crate::config::RuliadProofPolicyGradientScope::FullModel
                     | crate::config::RuliadProofPolicyGradientScope::ScoreHeadOnly
+                    | crate::config::RuliadProofPolicyGradientScope::PolicyPath
             )
             && policy.normalization
                 == crate::config::RuliadProofPolicyNormalization::CandidateConditional;
-        let exact_local_semantic_terminal = require_local_solver
-            && pc.solver == crate::config::LocalPredictiveCodingSolver::FixedPrediction
-            && policy.scoring == crate::config::RuliadProofPolicyScoring::SemanticEnergy
-            && policy.gradient_scope == crate::config::RuliadProofPolicyGradientScope::FullModel
+        let local_energy_terminal = require_local_solver
+            && matches!(
+                pc.solver,
+                crate::config::LocalPredictiveCodingSolver::SynchronousEquilibrium
+                    | crate::config::LocalPredictiveCodingSolver::ReverseGaussSeidel
+                    | crate::config::LocalPredictiveCodingSolver::FixedPrediction
+                    | crate::config::LocalPredictiveCodingSolver::LayerLocalPrediction
+                    | crate::config::LocalPredictiveCodingSolver::ErrorEquilibrium
+                    | crate::config::LocalPredictiveCodingSolver::AugmentedLagrangian
+            )
+            && policy.scoring.uses_sequence_score_head()
+            && (matches!(
+                policy.gradient_scope,
+                crate::config::RuliadProofPolicyGradientScope::FullModel
+                    | crate::config::RuliadProofPolicyGradientScope::PolicyPath
+            ) || (matches!(
+                pc.solver,
+                crate::config::LocalPredictiveCodingSolver::SynchronousEquilibrium
+                    | crate::config::LocalPredictiveCodingSolver::ReverseGaussSeidel
+                    | crate::config::LocalPredictiveCodingSolver::FixedPrediction
+                    | crate::config::LocalPredictiveCodingSolver::LayerLocalPrediction
+            ) && policy.gradient_scope
+                == crate::config::RuliadProofPolicyGradientScope::ScoreHeadOnly))
             && policy.normalization
                 == crate::config::RuliadProofPolicyNormalization::CandidateConditional;
-        if !completion_terminal && !global_semantic_terminal && !exact_local_semantic_terminal {
+        if !completion_terminal && !global_semantic_terminal && !local_energy_terminal {
             return Err(anyhow!(
-                "ruliad_verifier_set requires full-model prefix-conditional deployed-decoder completion likelihood; global-backprop candidate-conditional semantic/residual energy with full-model or score-head-only gradients; or fixed-prediction PC candidate-conditional semantic energy with full-model gradients"
+                "ruliad_verifier_set requires full-model candidate- or prefix-conditional deployed-decoder completion likelihood; global-backprop candidate-conditional semantic/residual energy with full-model, policy-path, or score-head-only gradients; state-equilibrium/fixed-prediction/layer-local PC candidate-conditional semantic/residual energy with full-model, policy-path, or score-head-only gradients; or error-equilibrium/augmented-Lagrangian PC candidate-conditional semantic/residual energy with full-model or policy-path gradients"
             ));
         }
         Ok(())
@@ -169,6 +259,41 @@ impl TrainingConfig {
 
     fn validate_local_predictive_coding(&self) -> Result<()> {
         let pc = &self.training.local_predictive_coding;
+        if let Some(next_token_solver) = pc.objective_routing.next_token_solver {
+            if matches!(
+                pc.terminal_criterion,
+                crate::config::LocalPredictiveCodingTerminalCriterion::NextToken
+            ) {
+                return Err(anyhow!(
+                    "local_predictive_coding.objective_routing.next_token_solver requires a verifier terminal so the top-level solver still owns a scheduled objective"
+                ));
+            }
+            if !matches!(
+                pc.solver,
+                crate::config::LocalPredictiveCodingSolver::ErrorEquilibrium
+            ) || !matches!(
+                next_token_solver,
+                crate::config::LocalPredictiveCodingSolver::FixedPrediction
+            ) {
+                return Err(anyhow!(
+                    "objective-routed local PC currently requires solver=error_equilibrium and objective_routing.next_token_solver=fixed_prediction"
+                ));
+            }
+            if pc.temporal_credit.carries_temporal_credit()
+                || !matches!(
+                    pc.learning_schedule,
+                    burn_pc::PcLearningSchedule::Equilibrium
+                )
+                || !matches!(
+                    pc.parameterization,
+                    burn_pc::PcParameterizationKind::Standard
+                )
+            {
+                return Err(anyhow!(
+                    "objective-routed local PC requires equilibrium learning, standard parameterization, and detached temporal credit"
+                ));
+            }
+        }
         if self.training.tbptt_credit_window_chunks != 1 {
             return Err(anyhow!(
                 "training.algorithm=predictive_coding requires training.tbptt_credit_window_chunks=1; configure local_predictive_coding.temporal_credit for local rho credit"
@@ -412,6 +537,7 @@ impl TrainingConfig {
         let verifier_terminal = matches!(
             pc.terminal_criterion,
             crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSet
+                | crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSetJoint
         );
         if ruliad.answer_ranking.enabled
             || ruliad.answer_denoising.enabled

@@ -269,6 +269,9 @@ fn dragon_training_contract(
                 "predictive_context_routing": config.training.predictive_context_routing,
                 "latent_reasoning": config.training.latent_reasoning,
                 "ruliad_supervision": config.training.ruliad_supervision,
+                "ruliad_policy_batch_contract": config.training.ruliad_supervision
+                    .needs_ruliad_policy_batch()
+                    .then_some(crate::experiments::common::RULIAD_POLICY_BATCH_CONTRACT),
                 "gdpo": config.training.gdpo,
             })
         }),
@@ -307,6 +310,14 @@ fn dragon_training_contract(
                 "validation_dataset": config.dataset.validation,
                 "generation": config.generation,
                 "gates": config.training.gates,
+                "ruliad_correctness_probe": {
+                    "every_epochs": config.training.events.ruliad_correctness_probe_every_epochs,
+                    "items": config.training.events.ruliad_correctness_probe_items,
+                    "tokens": config.training.events.ruliad_correctness_probe_tokens,
+                    "hard_token_cap": config.training.events.ruliad_correctness_probe_hard_token_cap,
+                },
+                "ruliad_probe_generation": config.training.ruliad_probe_generation,
+                "ruliad_policy_probe": config.training.ruliad_policy_probe,
             })
         }),
     );
@@ -940,6 +951,29 @@ mod tests {
             solver_drift.contract_id().expect("solver-drift contract")
         );
 
+        let mut objective_route_drift = baseline_config.clone();
+        objective_route_drift
+            .training
+            .local_predictive_coding
+            .objective_routing
+            .next_token_solver =
+            Some(burn_dragon_language::LocalPredictiveCodingSolver::FixedPrediction);
+        let objective_route_drift = local_training_contract(&objective_route_drift);
+        assert_ne!(
+            baseline
+                .extensions
+                .get(DRAGON_LOCAL_PC_PROGRAM_CONTRACT_EXTENSION),
+            objective_route_drift
+                .extensions
+                .get(DRAGON_LOCAL_PC_PROGRAM_CONTRACT_EXTENSION)
+        );
+        assert_ne!(
+            baseline.contract_id().expect("baseline contract"),
+            objective_route_drift
+                .contract_id()
+                .expect("objective-route contract")
+        );
+
         let mut temporal_drift = baseline_config.clone();
         temporal_drift.training.tbptt_chunk_size = Some(64);
         temporal_drift.training.tbptt_credit_window_chunks = 2;
@@ -973,6 +1007,40 @@ mod tests {
                 .expect("hardware-local batch contract"),
             "peer-local batch calibration must remain outside semantic revision identity"
         );
+    }
+
+    #[test]
+    fn ruliad_typed_policy_validation_semantics_are_contract_bound() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut baseline_config = burn_dragon_language::load_training_config(&[
+            manifest_dir.join("deploy/profiles/ruliad-r3.typed-policy.training.toml")
+        ])
+        .expect("load typed-policy profile");
+        baseline_config.dataset.source = DatasetSourceConfig::UniversalityRuliad {
+            config: manifest_dir.join("deploy/profiles/ruliad-r3.semantic-action.corpus.toml"),
+        };
+        let baseline = local_training_contract(&baseline_config);
+
+        let mut item_drift = baseline_config.clone();
+        item_drift.training.ruliad_policy_probe.items = item_drift
+            .training
+            .ruliad_policy_probe
+            .items
+            .saturating_add(1);
+        let item_drift = local_training_contract(&item_drift);
+        assert_eq!(baseline.objective_hash, item_drift.objective_hash);
+        assert_ne!(baseline.validation_hash, item_drift.validation_hash);
+        assert_ne!(
+            baseline.contract_id().expect("baseline contract"),
+            item_drift.contract_id().expect("item-drift contract")
+        );
+
+        let mut scoring_drift = baseline_config;
+        scoring_drift.training.ruliad_policy_probe.scoring =
+            burn_dragon_language::config::RuliadProofPolicyScoring::SemanticEnergy;
+        let scoring_drift = local_training_contract(&scoring_drift);
+        assert_eq!(baseline.objective_hash, scoring_drift.objective_hash);
+        assert_ne!(baseline.validation_hash, scoring_drift.validation_hash);
     }
 
     #[test]

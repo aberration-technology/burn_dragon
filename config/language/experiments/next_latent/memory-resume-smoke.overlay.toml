@@ -1,0 +1,7 @@
+[training]
+launch_mode = "resume_exact_run"
+resume_run_dir = "target/experiments/nextlat-clock-resume-work/alcoholic-metal"
+resume_checkpoint_epoch = 2
+
+[training.resume_horizon_extension]
+enabled = true

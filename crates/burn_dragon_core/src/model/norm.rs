@@ -207,6 +207,20 @@ impl<B: Backend> DragonNorm<B> {
         (self.gamma.id, self.beta.id, self.alpha.id, self.shift.id)
     }
 
+    /// Parameters which do not participate in the selected normalization
+    /// graph. Analytic derivative paths must omit these entries, matching
+    /// Burn autodiff's absent-gradient contract so optimizers do not apply
+    /// weight decay to mathematically inactive tensors.
+    pub(crate) fn inactive_parameter_ids(&self) -> Vec<ParamId> {
+        match self.kind {
+            DragonNormKind::LayerNorm | DragonNormKind::RmsNorm => {
+                vec![self.alpha.id, self.shift.id]
+            }
+            DragonNormKind::DynamicTanh => vec![self.shift.id],
+            DragonNormKind::Derf => Vec::new(),
+        }
+    }
+
     fn param_rms<const D: usize>(tensor: Tensor<B, D>) -> f32 {
         let values = tensor
             .powf_scalar(2.0)

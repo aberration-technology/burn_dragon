@@ -1,0 +1,10 @@
+# Deterministic consolidation without a document replay buffer. The first 16
+# generated coordinates are revisited through step 63; thereafter one new
+# coordinate is released every four consumed updates and the remaining updates
+# replay the released panel. There is intentionally no maximum frontier.
+[training.ruliad_supervision.consolidation]
+enabled = true
+initial_unique_steps = 16
+hold_steps = 64
+novelty_interval_steps = 4
+seed = 6027518751057927917

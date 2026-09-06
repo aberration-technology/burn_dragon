@@ -32,15 +32,17 @@ impl LiveSourceSelectionState {
                 candidates,
             )),
             fixed_validation_bucket_labels,
+            proof_policy_strata: Mutex::new(BTreeMap::new()),
             corpus_config,
             frontier_extension: source_selection.frontier_extension,
             cold_start: source_selection.cold_start,
             feedback_updates_enabled: AtomicBool::new(source_selection.feedback_updates_enabled),
             frontier_extension_count: AtomicUsize::new(0),
             released_max_difficulty_level: AtomicUsize::new(released_max_difficulty_level),
-            absolute_step_offset: AtomicUsize::new(0),
+            run_step_origin: 0,
             pending: Mutex::new(HashMap::new()),
             pending_limit: live_source_selection_pending_limit(),
+            consolidation_bucket_catalog: Mutex::new(BTreeMap::new()),
             control: Mutex::new(LiveSourceSelectionControl::default()),
         })
     }
@@ -50,6 +52,7 @@ impl LiveSourceSelectionState {
         corpus_config: burn_dragon_universality::RuliadCorpusConfig,
         configured_candidates: Vec<burn_dragon_universality::RuliadSamplerCandidate>,
         snapshot: RuliadSourceSelectionStateSnapshot,
+        restore: RuliadSourceSelectionRestore,
     ) -> Option<Self> {
         if snapshot.version != RULIAD_SOURCE_SELECTION_STATE_VERSION {
             return None;
@@ -79,7 +82,7 @@ impl LiveSourceSelectionState {
         let inferred_released_max = current_cold_start_max_difficulty(
             sampler.candidates(),
             &source_selection.cold_start,
-            Some(snapshot.absolute_step_offset),
+            Some(snapshot.clock.next_global_step().saturating_sub(1)),
         )
         .unwrap_or_else(|| sampler.max_difficulty_level());
         let released_max_difficulty_level = snapshot
@@ -92,25 +95,28 @@ impl LiveSourceSelectionState {
         Some(Self {
             sampler: Mutex::new(sampler),
             fixed_validation_bucket_labels,
+            proof_policy_strata: Mutex::new(BTreeMap::new()),
             corpus_config,
             frontier_extension: source_selection.frontier_extension,
             cold_start: source_selection.cold_start,
             feedback_updates_enabled: AtomicBool::new(source_selection.feedback_updates_enabled),
             frontier_extension_count: AtomicUsize::new(snapshot.frontier_extension_count),
             released_max_difficulty_level: AtomicUsize::new(released_max_difficulty_level),
-            absolute_step_offset: AtomicUsize::new(snapshot.absolute_step_offset),
+            run_step_origin: match restore {
+                RuliadSourceSelectionRestore::ResumeRun => snapshot.clock.run_step_origin,
+                RuliadSourceSelectionRestore::StartNewRun => snapshot.clock.next_global_step(),
+            },
             pending: Mutex::new(HashMap::new()),
             pending_limit: live_source_selection_pending_limit(),
+            consolidation_bucket_catalog: Mutex::new(snapshot.consolidation_bucket_catalog),
             control: Mutex::new(snapshot.control.into()),
         })
     }
 
     pub(super) fn export_state(
         &self,
-        absolute_step_offset: usize,
+        completed_run_steps: usize,
     ) -> RuliadSourceSelectionStateSnapshot {
-        self.absolute_step_offset
-            .store(absolute_step_offset, Ordering::Relaxed);
         let sampler = self
             .sampler
             .lock()
@@ -119,25 +125,70 @@ impl LiveSourceSelectionState {
             .control
             .lock()
             .expect("ruliad source control lock poisoned");
+        let consolidation_bucket_catalog = self
+            .consolidation_bucket_catalog
+            .lock()
+            .expect("ruliad consolidation bucket catalog lock poisoned")
+            .clone();
         RuliadSourceSelectionStateSnapshot {
             version: RULIAD_SOURCE_SELECTION_STATE_VERSION,
-            absolute_step_offset,
+            clock: RuliadSourceSelectionClock {
+                run_step_origin: self.run_step_origin,
+                completed_run_steps,
+            },
             frontier_extension_count: self.frontier_extension_count.load(Ordering::Relaxed),
             released_max_difficulty_level: self
                 .released_max_difficulty_level
                 .load(Ordering::Relaxed),
             control: control.into(),
             sampler: sampler.export_state(),
+            consolidation_bucket_catalog,
         }
     }
 
     pub(super) fn effective_absolute_step(&self, absolute_step: Option<usize>) -> Option<usize> {
-        absolute_step
-            .map(|step| step.saturating_add(self.absolute_step_offset.load(Ordering::Relaxed)))
+        absolute_step.map(|step| step.saturating_add(self.run_step_origin))
     }
 
     pub(super) fn probabilities(&self) -> Vec<f32> {
         self.probabilities_for_step(None)
+    }
+
+    /// Return the deterministic select-proof-action labels for the lowest
+    /// requested difficulty strata. This catalog is immutable for a corpus
+    /// config, so cache it outside the per-step batch-construction path.
+    pub(super) fn proof_policy_stratified_bucket_labels(
+        &self,
+        difficulty_levels: usize,
+    ) -> Arc<Vec<Vec<String>>> {
+        let mut cache = self
+            .proof_policy_strata
+            .lock()
+            .expect("ruliad proof-policy stratum cache lock poisoned");
+        cache
+            .entry(difficulty_levels)
+            .or_insert_with(|| {
+                let first_difficulty = self.corpus_config.source_selection.difficulty_levels.min;
+                Arc::new(
+                    (first_difficulty..first_difficulty.saturating_add(difficulty_levels))
+                        .filter_map(|difficulty_level| {
+                            let mut labels =
+                                burn_dragon_universality::ruliad_sampler_candidates_for_difficulty(
+                                    &self.corpus_config,
+                                    difficulty_level,
+                                )
+                                .into_iter()
+                                .filter(|candidate| candidate.task_kind == "select_proof_action")
+                                .map(|candidate| candidate.oracle_hash)
+                                .collect::<Vec<_>>();
+                            labels.sort();
+                            labels.dedup();
+                            (!labels.is_empty()).then_some(labels)
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .clone()
     }
 
     pub(super) fn probabilities_for_step(&self, absolute_step: Option<usize>) -> Vec<f32> {
@@ -169,6 +220,13 @@ impl LiveSourceSelectionState {
         &self,
         absolute_step: Option<usize>,
     ) -> Vec<(String, f32)> {
+        self.weighted_bucket_labels_at_global_step(self.effective_absolute_step(absolute_step))
+    }
+
+    fn weighted_bucket_labels_at_global_step(
+        &self,
+        global_step: Option<usize>,
+    ) -> Vec<(String, f32)> {
         let mut sampler = self
             .sampler
             .lock()
@@ -179,9 +237,8 @@ impl LiveSourceSelectionState {
             .control
             .lock()
             .expect("ruliad source control lock poisoned");
-        let effective_step = self.effective_absolute_step(absolute_step);
         let released_max_difficulty =
-            self.released_cold_start_max_difficulty(sampler.candidates(), effective_step);
+            self.released_cold_start_max_difficulty(sampler.candidates(), global_step);
         apply_source_selection_cold_start_with_max(
             &mut probabilities,
             sampler.candidates(),
@@ -201,7 +258,7 @@ impl LiveSourceSelectionState {
                         .is_finite()
                         .then_some(weight)
                         .filter(|value| *value > 0.0)
-                        .unwrap_or(1e-9),
+                        .unwrap_or(0.0),
                 )
             })
             .collect()
@@ -293,37 +350,78 @@ impl LiveSourceSelectionState {
         Some(label)
     }
 
+    /// Selects a source once for a released generation coordinate and reuses
+    /// that assignment on every later replay. The catalog stores labels only;
+    /// documents remain generated on demand and bounded by the normal cache.
+    pub(super) fn choose_consolidated_bucket_label(
+        &self,
+        epoch_index: usize,
+        generation_step: usize,
+        feedback_step: usize,
+    ) -> Option<String> {
+        let mut catalog = self
+            .consolidation_bucket_catalog
+            .lock()
+            .expect("ruliad consolidation bucket catalog lock poisoned");
+        let label = if let Some(label) = catalog.get(&generation_step) {
+            label.clone()
+        } else {
+            let curriculum_step = self.effective_absolute_step(Some(feedback_step))?;
+            let label = self.choose_bucket_label_at_global_coordinate(
+                epoch_index,
+                generation_step,
+                curriculum_step,
+            )?;
+            catalog.insert(generation_step, label.clone());
+            label
+        };
+        drop(catalog);
+        self.record_pending(feedback_step, &label);
+        Some(label)
+    }
+
     pub(super) fn choose_bucket_label_for_step_inner(
         &self,
         epoch_index: usize,
         absolute_step: usize,
         record_pending: bool,
     ) -> Option<String> {
-        let weighted = self.weighted_bucket_labels(Some(absolute_step));
-        if weighted.is_empty() {
-            return None;
+        let global_step = self.effective_absolute_step(Some(absolute_step))?;
+        let label =
+            self.choose_bucket_label_at_global_coordinate(epoch_index, global_step, global_step)?;
+        if record_pending {
+            self.record_pending(absolute_step, &label);
         }
-        let total = weighted.iter().map(|(_, weight)| *weight).sum::<f32>();
-        let effective_step = self
-            .effective_absolute_step(Some(absolute_step))
-            .unwrap_or(absolute_step);
+        Some(label)
+    }
+
+    fn choose_bucket_label_at_global_coordinate(
+        &self,
+        epoch_index: usize,
+        generation_step: usize,
+        curriculum_step: usize,
+    ) -> Option<String> {
+        Self::sample_weighted_label(
+            self.weighted_bucket_labels_at_global_step(Some(curriculum_step)),
+            epoch_index,
+            generation_step,
+        )
+    }
+
+    fn sample_weighted_label(
+        mut weighted: Vec<(String, f32)>,
+        epoch_index: usize,
+        global_generation_step: usize,
+    ) -> Option<String> {
+        use rand::distributions::{Distribution, WeightedIndex};
+
+        let distribution = WeightedIndex::new(weighted.iter().map(|(_, weight)| *weight)).ok()?;
         let mut rng = StdRng::seed_from_u64(source_selection_step_seed(
             epoch_index,
-            effective_step,
-            weighted.len(),
+            global_generation_step,
+            weighted.len() as u64,
         ));
-        let ticket = rng.r#gen::<f32>() * total.max(1e-12);
-        let mut cumulative = 0.0;
-        for (label, weight) in weighted {
-            cumulative += weight;
-            if ticket <= cumulative {
-                if record_pending {
-                    self.record_pending(absolute_step, &label);
-                }
-                return Some(label);
-            }
-        }
-        None
+        Some(weighted.swap_remove(distribution.sample(&mut rng)).0)
     }
 
     pub(super) fn choose_bucket_for_step_inner(
@@ -342,30 +440,14 @@ impl LiveSourceSelectionState {
                 filtered.push((label, weight));
             }
         }
-        if filtered.is_empty() {
-            return None;
-        }
-        let total = filtered.iter().map(|(_, weight)| *weight).sum::<f32>();
         let effective_step = self
             .effective_absolute_step(Some(absolute_step))
             .unwrap_or(absolute_step);
-        let mut rng = StdRng::seed_from_u64(source_selection_step_seed(
-            epoch_index,
-            effective_step,
-            filtered.len(),
-        ));
-        let ticket = rng.r#gen::<f32>() * total.max(1e-12);
-        let mut cumulative = 0.0;
-        for (label, weight) in filtered {
-            cumulative += weight;
-            if ticket <= cumulative {
-                if record_pending {
-                    self.record_pending(absolute_step, &label);
-                }
-                return Some(label);
-            }
+        let label = Self::sample_weighted_label(filtered, epoch_index, effective_step)?;
+        if record_pending {
+            self.record_pending(absolute_step, &label);
         }
-        None
+        Some(label)
     }
 
     pub(super) fn record_pending(&self, absolute_step: usize, bucket_label: &str) {

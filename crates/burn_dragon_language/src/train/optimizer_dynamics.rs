@@ -320,6 +320,7 @@ fn tiny_model_config() -> DragonConfig {
 
 fn tiny_training_hparams(config: &OptimizerDynamicsConfig) -> TrainingHyperparameters {
     TrainingHyperparameters {
+        provenance: Default::default(),
         algorithm: TrainingAlgorithm::Auto,
         block_size: 4,
         tbptt_chunk_size: None,

@@ -1,0 +1,15 @@
+extends = "local-pc-verifier-1m-answer-completion.toml"
+
+# Isolated typed-action corpus for matched AdamW/PC verifier-objective gates.
+# The verifier owns legal-action enumeration and transition execution; Dragon
+# learns the conditional ranking policy and the compact semantic-step decoder.
+[dataset]
+cache_dir = "target/datasets/local-pc-ruliad-semantic-policy"
+config = "crates/burn_dragon_p2p/deploy/profiles/ruliad-r3.semantic-action.corpus.toml"
+ruliad_source_selection_feedback_updates_enabled = false
+
+[training.ruliad_supervision.proof_policy]
+prompt_context = "local_action_state"
+
+[training.ruliad_policy_probe]
+prompt_context = "local_action_state"

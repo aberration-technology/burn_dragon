@@ -23,14 +23,16 @@ use super::scheduler::{
     RuliadPolicyBatch, RuliadPolicySample, SequenceBatch, SourceSelectedBatch,
     SourceSelectedStreamBatch, TokenSequenceDataset,
 };
-use crate::config::{RuliadSupervisionConfig, RuliadSupervisionMode};
+use crate::config::{
+    RuliadConsolidationConfig, RuliadConsolidationCoordinate, RuliadSupervisionConfig,
+    RuliadSupervisionMode,
+};
 use crate::summary_events::summary_event_mask_tensor;
 use crate::tokenizer::{SharedTokenizer, TokenizerConfig, TokenizerKind};
 
 const DEFAULT_RUNTIME_CHUNK_CACHE_LIMIT: usize = 8;
 const DEFAULT_RUNTIME_DOCUMENT_CACHE_LIMIT: usize = 64;
 const DEFAULT_RUNTIME_GENERATION_WORKER_LIMIT: usize = 32;
-const DEFAULT_LIVE_SOURCE_SELECTION_DOCUMENTS_PER_STEP: usize = 4;
 const DEFAULT_LIVE_SOURCE_BATCH_CACHE_LIMIT: usize = 32;
 const DEFAULT_LIVE_SOURCE_BATCH_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const DEFAULT_SOURCE_SELECTED_EOS_WINDOW_PROBABILITY: f64 = 0.05;
@@ -41,7 +43,7 @@ const RULIAD_SYMBOLIC_QUERY_TOKEN: u32 = 262;
 const RULIAD_SYMBOLIC_PROOF_STEP_TOKEN: u32 = 263;
 const RULIAD_SYMBOLIC_ANSWER_TOKEN: u32 = 264;
 const RULIAD_SYMBOLIC_DOCUMENT_END_TOKEN: u32 = 265;
-const RULIAD_SOURCE_SELECTION_STATE_VERSION: u32 = 1;
+const RULIAD_SOURCE_SELECTION_STATE_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug)]
 struct RuliadWindowRequest {
@@ -82,12 +84,36 @@ pub enum RuliadValidationPromptMode {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct RuliadSourceSelectionStateSnapshot {
     pub version: u32,
-    pub absolute_step_offset: usize,
+    pub clock: RuliadSourceSelectionClock,
     pub frontier_extension_count: usize,
     #[serde(default)]
     pub released_max_difficulty_level: usize,
     pub control: RuliadSourceSelectionControlSnapshot,
     pub sampler: burn_dragon_universality::RuliadFrontierSamplerState,
+    /// Compact, checkpointed source assignments for exact consolidation replay.
+    #[serde(default)]
+    pub consolidation_bucket_catalog: BTreeMap<usize, String>,
+}
+
+/// An exclusive progress counter, distinct from the last zero-based step index.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RuliadSourceSelectionClock {
+    pub run_step_origin: usize,
+    pub completed_run_steps: usize,
+}
+
+impl RuliadSourceSelectionClock {
+    pub fn next_global_step(self) -> usize {
+        self.run_step_origin
+            .saturating_add(self.completed_run_steps)
+    }
+}
+
+/// Whether the consumer retains its scheduler clock or starts a new phase at zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuliadSourceSelectionRestore {
+    ResumeRun,
+    StartNewRun,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
@@ -118,6 +144,8 @@ struct OnTheFlyStorage {
     cache: Arc<EpochRuntimeCacheState>,
     live_batch_cache: Arc<LiveDocumentBatchCacheState>,
     source_selection: Option<Arc<LiveSourceSelectionState>>,
+    live_documents_per_step: Option<usize>,
+    consolidation: RuliadConsolidationConfig,
     train_probe_summary: burn_dragon_universality::RuntimeCorpusSummary,
     validation_probe_summary: burn_dragon_universality::RuntimeCorpusSummary,
 }
@@ -210,21 +238,24 @@ impl GeneratedEpochDocuments {
 struct LiveSourceSelectionState {
     sampler: Mutex<burn_dragon_universality::RuliadFrontierSampler>,
     fixed_validation_bucket_labels: Vec<String>,
+    proof_policy_strata: Mutex<BTreeMap<usize, Arc<Vec<Vec<String>>>>>,
     corpus_config: burn_dragon_universality::RuliadCorpusConfig,
     frontier_extension: burn_dragon_universality::RuliadFrontierExtensionConfig,
     cold_start: burn_dragon_universality::RuliadSourceSelectionColdStartConfig,
     feedback_updates_enabled: AtomicBool,
     frontier_extension_count: AtomicUsize,
     released_max_difficulty_level: AtomicUsize,
-    absolute_step_offset: AtomicUsize,
+    run_step_origin: usize,
     pending: Mutex<HashMap<usize, String>>,
     pending_limit: usize,
+    consolidation_bucket_catalog: Mutex<BTreeMap<usize, String>>,
     control: Mutex<LiveSourceSelectionControl>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct RuliadSourceSelectionOverrides {
     pub cold_start_enabled: Option<bool>,
+    pub documents_per_step: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
@@ -284,6 +315,17 @@ trait OnlineUniversalityCorpus: Send + Sync {
 
     fn ruliad_config(&self) -> Option<&burn_dragon_universality::RuliadCorpusConfig> {
         None
+    }
+
+    fn audit_frontier_supervision(
+        &self,
+        _difficulty_levels: &[usize],
+        _samples_per_bucket: usize,
+        _block_size: usize,
+        _supervision: burn_dragon_universality::ruliad::RuliadTokenSupervisionConfig,
+    ) -> anyhow::Result<Option<burn_dragon_universality::ruliad::RuliadSupervisionAuditReport>>
+    {
+        Ok(None)
     }
 
     fn generate_document_tokens_for_source_bucket(
@@ -386,6 +428,8 @@ pub struct UniversalityDataset {
     tokenizer: SharedTokenizer,
     dataset_name: String,
     ruliad_supervision: RuliadSupervisionConfig,
+    ruliad_supervision_audit:
+        Option<Arc<burn_dragon_universality::ruliad::RuliadSupervisionAuditReport>>,
 }
 
 impl OnlineUniversalityCorpus for burn_dragon_universality::OnlineNcaCorpus {
@@ -451,6 +495,24 @@ impl OnlineUniversalityCorpus for burn_dragon_universality::OnlineRuliadCorpus {
 
     fn ruliad_config(&self) -> Option<&burn_dragon_universality::RuliadCorpusConfig> {
         Some(self.config())
+    }
+
+    fn audit_frontier_supervision(
+        &self,
+        difficulty_levels: &[usize],
+        samples_per_bucket: usize,
+        block_size: usize,
+        supervision: burn_dragon_universality::ruliad::RuliadTokenSupervisionConfig,
+    ) -> anyhow::Result<Option<burn_dragon_universality::ruliad::RuliadSupervisionAuditReport>>
+    {
+        burn_dragon_universality::OnlineRuliadCorpus::audit_frontier_supervision(
+            self,
+            difficulty_levels,
+            samples_per_bucket,
+            block_size,
+            supervision,
+        )
+        .map(Some)
     }
 
     fn generate_document_tokens_for_source_bucket(

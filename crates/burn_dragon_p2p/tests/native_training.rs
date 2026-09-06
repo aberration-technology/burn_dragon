@@ -1969,6 +1969,24 @@ fn concatenate_cpu_parity_batches(batches: &[CpuParityBatch]) -> CpuParityBatch 
             .all(|batch| batch.absolute_step == absolute_step),
         "synchronized PC reference cannot concatenate different absolute-step clocks"
     );
+    let supervised_counts = batches
+        .iter()
+        .map(|batch| batch.supervised_token_count)
+        .collect::<Vec<_>>();
+    let present_supervised_counts = supervised_counts
+        .iter()
+        .filter(|count| count.is_some())
+        .count();
+    assert!(
+        present_supervised_counts == 0 || present_supervised_counts == supervised_counts.len(),
+        "synchronized PC reference cannot concatenate mixed supervised-token count contracts"
+    );
+    let supervised_token_count = (present_supervised_counts != 0).then(|| {
+        supervised_counts
+            .into_iter()
+            .map(|count| count.expect("all supervised-token counts are present"))
+            .sum()
+    });
     CpuParityBatch {
         inputs: Tensor::cat(
             batches.iter().map(|batch| batch.inputs.clone()).collect(),
@@ -1979,6 +1997,7 @@ fn concatenate_cpu_parity_batches(batches: &[CpuParityBatch]) -> CpuParityBatch 
             0,
         ),
         loss_mask,
+        supervised_token_count,
         summary_event_mask,
         ruliad_policy_batch: None,
         absolute_step,

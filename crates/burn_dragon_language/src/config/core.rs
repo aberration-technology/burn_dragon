@@ -106,6 +106,10 @@ pub struct ModelOverrides {
     #[serde(alias = "rollout_fast_steps")]
     pub rollout_fast_steps_per_slow_step: Option<usize>,
     pub rotary_embedding: Option<RotaryEmbedding>,
+    /// Per-head exponential forgetting rates for ALiBi recurrent memory.
+    /// Omission preserves historical checkpoint behavior; zero disables decay for a head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alibi_slopes: Option<Vec<f32>>,
     #[serde(alias = "y_sparse_recurrence")]
     pub y_neuron_recurrence: Option<YNeuronRecurrenceConfig>,
     pub clocked_slow_memory: Option<ClockedSlowMemoryConfig>,

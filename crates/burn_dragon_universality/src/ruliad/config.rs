@@ -567,6 +567,9 @@ pub enum RuliadFormalGeneralizationContract {
     #[default]
     SeedDisjointV1,
     StructuralHoldoutV1,
+    /// Diagnostic control: training laws, alpha renaming and tree construction
+    /// in both splits, while retaining distinct train/validation random seeds.
+    StructuralTrainSeedDisjointV1,
 }
 
 impl RuliadFormalGeneralizationContract {
@@ -574,6 +577,7 @@ impl RuliadFormalGeneralizationContract {
         match self {
             Self::SeedDisjointV1 => "seed_disjoint_v1",
             Self::StructuralHoldoutV1 => "structural_holdout_v1",
+            Self::StructuralTrainSeedDisjointV1 => "structural_train_seed_disjoint_v1",
         }
     }
 }

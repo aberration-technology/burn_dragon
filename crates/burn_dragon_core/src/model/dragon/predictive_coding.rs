@@ -314,6 +314,19 @@ where
         })
     }
 
+    /// Parameter ids that are structurally absent from this model's forward
+    /// graph despite being retained in the stable checkpoint schema.
+    ///
+    /// Burn autodiff emits no gradient entry for these tensors. Analytic PC
+    /// paths use this list at their optimizer boundary to preserve identical
+    /// AdamW/SGD update and weight-decay semantics.
+    pub fn predictive_coding_structurally_inactive_parameter_ids(
+        &self,
+    ) -> Result<Vec<ParamId>, String> {
+        self.predictive_coding_support()?;
+        Ok(self.norm.inactive_parameter_ids())
+    }
+
     pub fn predictive_coding_layer_count(&self) -> usize {
         self.n_layer
     }

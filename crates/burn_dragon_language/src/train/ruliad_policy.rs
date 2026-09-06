@@ -38,6 +38,53 @@ pub(crate) fn counterfactual_candidate_indices(
     indices
 }
 
+/// Build the finite candidate support shared by each matched target-variant group.
+///
+/// Independent supervision uses the complete menu. Target-group conditioning restricts every
+/// row to the union of verifier-equivalent actions across the original and retargeted prompts.
+pub(crate) fn target_group_candidate_support_mask(
+    target_group_conditional: bool,
+    valid: &[f32],
+    target_groups: &[usize],
+    candidates_per_group: usize,
+    expected_variants: usize,
+) -> Option<Vec<f32>> {
+    let rows = target_groups.len();
+    if candidates_per_group < 2 || valid.len() != rows.saturating_mul(candidates_per_group) {
+        return None;
+    }
+    if !target_group_conditional {
+        return Some(vec![1.0; valid.len()]);
+    }
+
+    let mut grouped_rows = std::collections::HashMap::<usize, Vec<usize>>::new();
+    for (row, target_group) in target_groups.iter().copied().enumerate() {
+        grouped_rows.entry(target_group).or_default().push(row);
+    }
+    let expected_variants = expected_variants.max(1);
+    let mut support = vec![0.0_f32; valid.len()];
+    for rows in grouped_rows.values() {
+        if rows.len() != expected_variants {
+            return None;
+        }
+        let mut union = vec![0.0_f32; candidates_per_group];
+        for row in rows {
+            let start = row.saturating_mul(candidates_per_group);
+            for candidate in 0..candidates_per_group {
+                union[candidate] = union[candidate].max(valid[start + candidate]);
+            }
+        }
+        if union.iter().filter(|value| **value > 0.0).count() < expected_variants {
+            return None;
+        }
+        for row in rows {
+            let start = row.saturating_mul(candidates_per_group);
+            support[start..start + candidates_per_group].copy_from_slice(&union);
+        }
+    }
+    Some(support)
+}
+
 pub(crate) fn candidate_presentation_rotations(
     symmetry: crate::config::RuliadProofPolicyCandidateSymmetry,
     selected_index: usize,
@@ -202,6 +249,7 @@ pub(crate) fn semantic_action_orbit_summary(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EncodedRuliadProofActionPresentation {
     pub rotation: usize,
+    pub original_prompt_token_count: usize,
     pub prompt_tokens: Vec<i64>,
     pub candidate_tokens: Vec<Vec<i64>>,
 }
@@ -211,6 +259,168 @@ pub struct EncodedRuliadProofActionPresentation {
 pub struct EncodedRuliadProofActionRequest {
     pub presentations: Vec<EncodedRuliadProofActionPresentation>,
     pub answer_contract: burn_dragon_universality::ruliad::RuliadProofActionAnswerContract,
+}
+
+pub(crate) fn ruliad_proof_policy_prompt(
+    context: crate::config::RuliadProofPolicyPromptContext,
+    problem: &burn_dragon_universality::ruliad::RuliadProofProblem,
+    actions: &burn_dragon_universality::ruliad::RuliadProofActionSet,
+) -> Result<String> {
+    match context {
+        crate::config::RuliadProofPolicyPromptContext::FullProblemSuffix => {
+            burn_dragon_universality::ruliad::ruliad_proof_action_prompt(problem, actions)
+        }
+        crate::config::RuliadProofPolicyPromptContext::LocalActionState => {
+            burn_dragon_universality::ruliad::ruliad_proof_action_local_prompt(problem, actions)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_ruliad_proof_action_request_with_rotations(
+    problem: &burn_dragon_universality::ruliad::RuliadProofProblem,
+    actions: &burn_dragon_universality::ruliad::RuliadProofActionSet,
+    answer_contract: burn_dragon_universality::ruliad::RuliadProofActionAnswerContract,
+    prompt_context: crate::config::RuliadProofPolicyPromptContext,
+    rotations: &[usize],
+    tokenization: &burn_dragon_universality::RuliadTokenizationConfig,
+    stop_token_id: Option<i64>,
+    block_size: usize,
+    max_completion_tokens: usize,
+) -> Result<EncodedRuliadProofActionRequest> {
+    if rotations.is_empty() || actions.candidates.len() < 2 || block_size < 2 {
+        return Err(anyhow!(
+            "typed proof-action encoding requires a non-empty presentation set, at least two candidates, and block_size>=2"
+        ));
+    }
+    let tokenizer =
+        burn_dragon_universality::ruliad::tokenize::RuliadByteTokenizer::from_config(tokenization)?;
+    let completion_budget = max_completion_tokens
+        .max(1)
+        .min(block_size.saturating_sub(1));
+    let mut presentations = Vec::with_capacity(rotations.len());
+    for rotation in rotations {
+        let presented = actions.rotate_left(*rotation)?;
+        let prompt = ruliad_proof_policy_prompt(prompt_context, problem, &presented)?;
+        let candidates = (0..presented.candidates.len())
+            .map(|candidate_index| {
+                let answer = burn_dragon_universality::ruliad::proof_action_answer(
+                    &presented,
+                    candidate_index,
+                    answer_contract,
+                )?;
+                let mut tokens = tokenizer
+                    .encode_payload(&answer)
+                    .into_iter()
+                    .map(i64::from)
+                    .collect::<Vec<_>>();
+                if answer_contract
+                    == burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::SemanticStep
+                    && let Some(stop_token_id) = stop_token_id
+                    && tokens.last().copied() != Some(stop_token_id)
+                {
+                    tokens.push(stop_token_id);
+                }
+                if tokens.is_empty() || tokens.len() > completion_budget {
+                    return Err(anyhow!(
+                        "typed proof-action candidate requires {} tokens, outside the configured completion budget {completion_budget}",
+                        tokens.len()
+                    ));
+                }
+                Ok(tokens)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let maximum_completion = candidates.iter().map(Vec::len).max().unwrap_or_default();
+        let maximum_prompt = block_size.saturating_sub(maximum_completion).max(1);
+        let mut prompt_tokens = tokenizer
+            .encode_payload(&prompt)
+            .into_iter()
+            .map(i64::from)
+            .collect::<Vec<_>>();
+        let original_prompt_token_count = prompt_tokens.len();
+        if prompt_tokens.len() > maximum_prompt {
+            prompt_tokens = prompt_tokens[prompt_tokens.len() - maximum_prompt..].to_vec();
+        }
+        if prompt_tokens.is_empty() {
+            return Err(anyhow!("typed proof-action prompt encoded to no tokens"));
+        }
+        presentations.push(EncodedRuliadProofActionPresentation {
+            rotation: *rotation,
+            original_prompt_token_count,
+            prompt_tokens,
+            candidate_tokens: candidates,
+        });
+    }
+    let request = EncodedRuliadProofActionRequest {
+        presentations,
+        answer_contract,
+    };
+    validate_encoded_action_request(&request)?;
+    Ok(request)
+}
+
+/// Encode a verifier-enumerated proof-action menu using the historical full-problem suffix.
+///
+/// New training and evaluation code should call
+/// [`encode_ruliad_proof_action_request_with_context`] so the prompt contract is explicit.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_ruliad_proof_action_request(
+    problem: &burn_dragon_universality::ruliad::RuliadProofProblem,
+    actions: &burn_dragon_universality::ruliad::RuliadProofActionSet,
+    answer_contract: burn_dragon_universality::ruliad::RuliadProofActionAnswerContract,
+    candidate_symmetry: crate::config::RuliadProofPolicyCandidateSymmetry,
+    presentation_index: usize,
+    tokenization: &burn_dragon_universality::RuliadTokenizationConfig,
+    stop_token_id: Option<i64>,
+    block_size: usize,
+    max_completion_tokens: usize,
+) -> Result<EncodedRuliadProofActionRequest> {
+    encode_ruliad_proof_action_request_with_context(
+        problem,
+        actions,
+        answer_contract,
+        crate::config::RuliadProofPolicyPromptContext::FullProblemSuffix,
+        candidate_symmetry,
+        presentation_index,
+        tokenization,
+        stop_token_id,
+        block_size,
+        max_completion_tokens,
+    )
+}
+
+/// Encode a verifier-enumerated proof-action menu with one explicit prompt,
+/// finite-group presentation, causal truncation, and tokenizer contract.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_ruliad_proof_action_request_with_context(
+    problem: &burn_dragon_universality::ruliad::RuliadProofProblem,
+    actions: &burn_dragon_universality::ruliad::RuliadProofActionSet,
+    answer_contract: burn_dragon_universality::ruliad::RuliadProofActionAnswerContract,
+    prompt_context: crate::config::RuliadProofPolicyPromptContext,
+    candidate_symmetry: crate::config::RuliadProofPolicyCandidateSymmetry,
+    presentation_index: usize,
+    tokenization: &burn_dragon_universality::RuliadTokenizationConfig,
+    stop_token_id: Option<i64>,
+    block_size: usize,
+    max_completion_tokens: usize,
+) -> Result<EncodedRuliadProofActionRequest> {
+    let rotations = candidate_presentation_rotations(
+        candidate_symmetry,
+        actions.selected_index,
+        actions.candidates.len(),
+        presentation_index,
+    )?;
+    encode_ruliad_proof_action_request_with_rotations(
+        problem,
+        actions,
+        answer_contract,
+        prompt_context,
+        &rotations,
+        tokenization,
+        stop_token_id,
+        block_size,
+        max_completion_tokens,
+    )
 }
 
 /// A semantic proof-policy decision with a deterministic surface rendering.
@@ -224,6 +434,23 @@ pub struct RuliadProofActionDecision {
     pub orbit: SemanticActionOrbitSummary,
 }
 
+impl RuliadProofActionDecision {
+    /// Deterministically render this canonical semantic decision under a caller-visible menu.
+    pub fn render_answer(
+        &self,
+        actions: &burn_dragon_universality::ruliad::RuliadProofActionSet,
+        presentation_rotation: usize,
+        contract: burn_dragon_universality::ruliad::RuliadProofActionAnswerContract,
+    ) -> Result<String> {
+        burn_dragon_universality::ruliad::proof_action_answer_for_semantic_index(
+            actions,
+            self.selected_semantic_index,
+            presentation_rotation,
+            contract,
+        )
+    }
+}
+
 fn validate_encoded_action_request(request: &EncodedRuliadProofActionRequest) -> Result<usize> {
     let candidate_count = request
         .presentations
@@ -235,6 +462,7 @@ fn validate_encoded_action_request(request: &EncodedRuliadProofActionRequest) ->
             "typed proof-action request requires at least two candidates"
         ));
     }
+
     if request.presentations.iter().any(|presentation| {
         presentation.prompt_tokens.is_empty()
             || presentation.candidate_tokens.len() != candidate_count
@@ -1272,6 +1500,16 @@ where
                 |inputs| model.forward_hidden_deterministic_auxiliary(inputs),
             )?
         }
+        crate::config::RuliadProofPolicyGradientScope::PolicyPath => {
+            sequence_energy_score_tensor_dense(
+                model,
+                prompt_tokens,
+                candidate_tokens,
+                false,
+                device,
+                |inputs| model.forward_hidden(inputs),
+            )?
+        }
         crate::config::RuliadProofPolicyGradientScope::LanguageHeadOnly => {
             return Err(anyhow!(
                 "language_head_only gradient scope is unavailable for semantic-energy scoring"
@@ -1283,9 +1521,10 @@ where
 
 /// Differentiable residual-EBM candidate scores.
 ///
-/// The autoregressive term is a fixed prior under `ScoreHeadOnly`; only the residual sequence head
-/// receives policy gradients. `FullModel` keeps both paths differentiable for a controlled global
-/// backpropagation ablation.
+/// The autoregressive term is a fixed prior under `ScoreHeadOnly` and `PolicyPath`.
+/// `ScoreHeadOnly` trains only the residual sequence head, while `PolicyPath` also propagates
+/// residual credit through Dragon's recurrent representation. `FullModel` keeps both paths
+/// differentiable for a controlled global-backpropagation ablation.
 pub(crate) fn sequence_residual_energy_score_tensor_with_gradient_scope<B>(
     model: &DragonModel<B>,
     prompt_tokens: &[Vec<i64>],
@@ -1310,6 +1549,7 @@ where
                 prompt_tokens,
                 candidate_tokens,
                 false,
+                false,
                 device,
                 |inputs| model.forward_hidden(inputs),
             )?
@@ -1320,8 +1560,20 @@ where
                 prompt_tokens,
                 candidate_tokens,
                 true,
+                true,
                 device,
                 |inputs| model.forward_hidden_deterministic_auxiliary(inputs),
+            )?
+        }
+        crate::config::RuliadProofPolicyGradientScope::PolicyPath => {
+            sequence_residual_energy_score_tensor_dense(
+                model,
+                prompt_tokens,
+                candidate_tokens,
+                true,
+                false,
+                device,
+                |inputs| model.forward_hidden(inputs),
             )?
         }
         crate::config::RuliadProofPolicyGradientScope::LanguageHeadOnly => {
@@ -1337,7 +1589,8 @@ fn sequence_residual_energy_score_tensor_dense<B, F>(
     score_model: &DragonModel<B>,
     prompt_tokens: &[Vec<i64>],
     candidate_tokens: &[Vec<Vec<i64>>],
-    detach_base: bool,
+    detach_prior: bool,
+    detach_residual_hidden: bool,
     device: &B::Device,
     forward_hidden: F,
 ) -> Result<Tensor<B, 1>>
@@ -1406,13 +1659,17 @@ where
         device,
     );
     let hidden = forward_hidden(inputs);
-    let hidden_base = if detach_base {
+    let hidden_base = if detach_prior {
         hidden.clone().detach()
     } else {
         hidden.clone()
     };
     let logits = score_model.logits_from_hidden(hidden_base);
-    let logits = if detach_base { logits.detach() } else { logits };
+    let logits = if detach_prior {
+        logits.detach()
+    } else {
+        logits
+    };
     let selected = burn_dragon_core::objective::selected_token_log_probs(
         burn_dragon_core::objective::log_probs_from_logits(logits),
         targets,
@@ -1420,7 +1677,11 @@ where
     let lengths = Tensor::<B, 1>::from_data(TensorData::new(lengths, [row_count]), device);
     let mean_log_scores = (selected * mask).sum_dim(1).reshape([row_count]) / lengths;
 
-    let hidden = if detach_base { hidden.detach() } else { hidden };
+    let hidden = if detach_residual_hidden {
+        hidden.detach()
+    } else {
+        hidden
+    };
     let [_, _, hidden_size] = hidden.shape().dims::<3>();
     let prompt_gather = Tensor::<B, 3, Int>::from_data(
         TensorData::new(
@@ -2109,6 +2370,9 @@ where
         crate::config::RuliadProofPolicyGradientScope::ScoreHeadOnly => Err(anyhow!(
             "score_head_only gradient scope is unavailable for completion-likelihood scoring"
         )),
+        crate::config::RuliadProofPolicyGradientScope::PolicyPath => Err(anyhow!(
+            "policy_path gradient scope is unavailable for completion-likelihood scoring"
+        )),
     }
 }
 
@@ -2392,6 +2656,31 @@ mod tests {
     }
 
     #[test]
+    fn target_group_support_is_the_exact_union_for_each_paired_context() {
+        let valid = vec![
+            1.0, 0.0, 0.0, 0.0, // target group 7, original
+            0.0, 0.0, 1.0, 0.0, // target group 7, retargeted
+            0.0, 1.0, 0.0, 0.0, // target group 9, original
+            0.0, 0.0, 0.0, 1.0, // target group 9, retargeted
+        ];
+        let groups = [7, 7, 9, 9];
+        let support = target_group_candidate_support_mask(true, &valid, &groups, 4, 2)
+            .expect("complete paired support");
+        assert_eq!(
+            support,
+            vec![
+                1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0,
+            ]
+        );
+        assert_eq!(
+            target_group_candidate_support_mask(false, &valid, &groups, 4, 2)
+                .expect("independent support"),
+            vec![1.0; valid.len()]
+        );
+        assert!(target_group_candidate_support_mask(true, &valid[..8], &[7], 4, 2).is_none());
+    }
+
+    #[test]
     fn counterfactual_candidates_are_valid_distinct_and_deterministic() {
         use burn_dragon_universality::ruliad::{
             RuliadProofActionCandidate, RuliadProofActionSet, RuliadProofSource, RuliadProofStep,
@@ -2540,6 +2829,145 @@ mod tests {
     }
 
     #[test]
+    fn typed_policy_encoder_matches_verifier_rendering_across_complete_orbit() {
+        let bundle = burn_dragon_universality::ruliad::formal::generate_formal_bundle(
+            58,
+            burn_dragon_universality::ruliad::RuliadFormalGeneratorConfig {
+                rewrite_depth: 2,
+                leaf_count: 3,
+                context_depth: 1,
+                distractor_axioms: 1,
+                ..Default::default()
+            },
+        )
+        .expect("formal policy fixture");
+        let actions = burn_dragon_universality::ruliad::oracle_proof_action_set(
+            &bundle.problem,
+            &bundle.certificate,
+            0,
+            4,
+        )
+        .expect("proof action menu");
+        let tokenization = burn_dragon_universality::RuliadTokenizationConfig::StructuredSymbolic {
+            vocab_size: 272,
+            eos_id: Some(271),
+        };
+        let request = encode_ruliad_proof_action_request(
+            &bundle.problem,
+            &actions,
+            burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::SemanticStep,
+            crate::config::RuliadProofPolicyCandidateSymmetry::CyclicOrbitAverage,
+            0,
+            &tokenization,
+            Some(271),
+            512,
+            128,
+        )
+        .expect("encoded proof action request");
+
+        assert_eq!(request.presentations.len(), actions.candidates.len());
+        for (rotation, presentation) in request.presentations.iter().enumerate() {
+            assert_eq!(presentation.rotation, rotation);
+            assert_eq!(
+                presentation.candidate_tokens.len(),
+                actions.candidates.len()
+            );
+            assert!(presentation.prompt_tokens.len() < 512);
+            assert!(presentation.candidate_tokens.iter().all(|candidate| {
+                candidate.last() == Some(&271)
+                    && presentation.prompt_tokens.len() + candidate.len() <= 513
+            }));
+        }
+    }
+
+    #[test]
+    fn local_action_prompt_preserves_the_complete_state_when_full_context_must_crop() {
+        let bundle = burn_dragon_universality::ruliad::formal::generate_formal_bundle(
+            61,
+            burn_dragon_universality::ruliad::RuliadFormalGeneratorConfig {
+                rewrite_depth: 4,
+                leaf_count: 8,
+                context_depth: 3,
+                distractor_axioms: 4,
+                ..Default::default()
+            },
+        )
+        .expect("formal context fixture");
+        let actions = burn_dragon_universality::ruliad::oracle_proof_action_set(
+            &bundle.problem,
+            &bundle.certificate,
+            0,
+            4,
+        )
+        .expect("proof action menu");
+        let tokenization = burn_dragon_universality::RuliadTokenizationConfig::Gpt2ByteCompatible {
+            vocab_size: 512,
+            eos_id: Some(511),
+        };
+        let local_unbounded = encode_ruliad_proof_action_request_with_context(
+            &bundle.problem,
+            &actions,
+            burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::SemanticStep,
+            crate::config::RuliadProofPolicyPromptContext::LocalActionState,
+            crate::config::RuliadProofPolicyCandidateSymmetry::Canonical,
+            0,
+            &tokenization,
+            Some(511),
+            8192,
+            512,
+        )
+        .expect("unbounded local action request");
+        let local = &local_unbounded.presentations[0];
+        let maximum_completion = local
+            .candidate_tokens
+            .iter()
+            .map(Vec::len)
+            .max()
+            .expect("candidate tokens");
+        let exact_local_block = local
+            .original_prompt_token_count
+            .saturating_add(maximum_completion);
+
+        let local = encode_ruliad_proof_action_request_with_context(
+            &bundle.problem,
+            &actions,
+            burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::SemanticStep,
+            crate::config::RuliadProofPolicyPromptContext::LocalActionState,
+            crate::config::RuliadProofPolicyCandidateSymmetry::Canonical,
+            0,
+            &tokenization,
+            Some(511),
+            exact_local_block,
+            512,
+        )
+        .expect("bounded local action request");
+        let full = encode_ruliad_proof_action_request_with_context(
+            &bundle.problem,
+            &actions,
+            burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::SemanticStep,
+            crate::config::RuliadProofPolicyPromptContext::FullProblemSuffix,
+            crate::config::RuliadProofPolicyCandidateSymmetry::Canonical,
+            0,
+            &tokenization,
+            Some(511),
+            exact_local_block,
+            512,
+        )
+        .expect("bounded full action request");
+        let local = &local.presentations[0];
+        let full = &full.presentations[0];
+        assert_eq!(local.prompt_tokens.len(), local.original_prompt_token_count);
+        assert!(
+            full.prompt_tokens.len() < full.original_prompt_token_count,
+            "large serialized problem should be visibly cropped"
+        );
+        assert!(
+            local.original_prompt_token_count < full.original_prompt_token_count,
+            "local action state should remove the global proof serialization"
+        );
+    }
+
+    #[test]
     fn typed_policy_decision_is_batch_bound_invariant_and_renders_semantic_action() {
         let device = burn::tensor::Device::<TestBackend>::default();
         TestBackend::seed(&device, 59);
@@ -2566,6 +2994,7 @@ mod tests {
                     candidate_tokens.rotate_left(rotation);
                     EncodedRuliadProofActionPresentation {
                         rotation,
+                        original_prompt_token_count: 4,
                         prompt_tokens: vec![1, 2, 3, 4],
                         candidate_tokens,
                     }
@@ -2610,11 +3039,13 @@ mod tests {
             presentations: vec![
                 EncodedRuliadProofActionPresentation {
                     rotation: 0,
+                    original_prompt_token_count: 2,
                     prompt_tokens: vec![1, 2],
                     candidate_tokens: vec![vec![3], vec![4]],
                 },
                 EncodedRuliadProofActionPresentation {
                     rotation: 1,
+                    original_prompt_token_count: 2,
                     prompt_tokens: vec![1, 2],
                     candidate_tokens: vec![vec![4], vec![3], vec![5]],
                 },
@@ -2937,6 +3368,135 @@ mod tests {
         assert!(
             final_loss < initial_loss.expect("initial loss") * 0.1,
             "paired-target loss did not converge: initial={initial_loss:?}, final={final_loss}"
+        );
+    }
+
+    #[test]
+    fn vocabulary_marginal_decoder_overfits_and_greedily_replays_one_formal_action() {
+        let device = burn::tensor::Device::<TrainBackend>::default();
+        TrainBackend::seed(&device, 20260811);
+        let mut model = DragonModel::<TrainBackend>::new(
+            burn_dragon_core::DragonConfig {
+                n_layer: 1,
+                n_embd: 32,
+                n_head: 2,
+                mlp_internal_dim_multiplier: 2,
+                vocab_size: 272,
+                dropout: 0.0,
+                ..Default::default()
+            },
+            &device,
+        );
+        let mut optimizer = AdamWConfig::new()
+            .with_weight_decay(0.0)
+            .init::<TrainBackend, DragonModel<TrainBackend>>();
+        let tokenization =
+            burn_dragon_universality::ruliad::RuliadTokenizationConfig::StructuredSymbolic {
+                vocab_size: 272,
+                eos_id: Some(271),
+            };
+        let bundle = burn_dragon_universality::ruliad::formal::generate_formal_bundle(
+            20260811,
+            burn_dragon_universality::ruliad::formal::RuliadFormalGeneratorConfig {
+                rewrite_depth: 2,
+                leaf_count: 3,
+                context_depth: 1,
+                distractor_axioms: 1,
+                ..Default::default()
+            },
+        )
+        .expect("formal bundle");
+        let proof_step_index = 1.min(bundle.certificate.step_count().saturating_sub(1));
+        let actions = burn_dragon_universality::ruliad::oracle_proof_action_set(
+            &bundle.problem,
+            &bundle.certificate,
+            proof_step_index,
+            4,
+        )
+        .expect("proof action set");
+        let request = encode_ruliad_proof_action_request_with_rotations(
+            &bundle.problem,
+            &actions,
+            burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::SemanticStep,
+            crate::config::RuliadProofPolicyPromptContext::LocalActionState,
+            &[0],
+            &tokenization,
+            Some(271),
+            256,
+            64,
+        )
+        .expect("encoded action request");
+        let presentation = &request.presentations[0];
+        let prompts = vec![presentation.prompt_tokens.clone()];
+        let candidates = vec![presentation.candidate_tokens.clone()];
+        let selected = actions.selected_index;
+        let target = Tensor::<TrainBackend, 2, Int>::from_data(
+            TensorData::new(vec![selected as i64], [1, 1]),
+            &device,
+        );
+        let mut initial_loss = None;
+        let mut final_loss = f32::INFINITY;
+
+        for _ in 0..256 {
+            let scores = sequence_completion_score_tensor(&model, &prompts, &candidates, &device)
+                .expect("completion scores");
+            let loss = scores
+                .sum_log_scores
+                .reshape([1, presentation.candidate_tokens.len()])
+                .gather(1, target.clone())
+                .mean()
+                .neg()
+                .reshape([1]);
+            final_loss = loss
+                .clone()
+                .to_data()
+                .convert::<f32>()
+                .into_vec::<f32>()
+                .expect("decoder loss")[0];
+            initial_loss.get_or_insert(final_loss);
+            let grads = GradientsParams::from_grads(loss.backward(), &model);
+            model = optimizer.step(3.0e-3, model, grads);
+        }
+
+        let valid = model.valid();
+        let scores = proof_action_scores_batch(
+            &valid,
+            &prompts,
+            &candidates,
+            burn_dragon_universality::ruliad::RuliadProofActionAnswerContract::SemanticStep,
+            crate::config::RuliadProofPolicyScoring::CompletionLikelihood,
+            &burn::tensor::Device::<TestBackend>::default(),
+        )
+        .expect("trained completion scores");
+        assert_eq!(
+            best_candidate_index(&scores[0]),
+            Some(selected),
+            "{scores:?}"
+        );
+        assert!(
+            final_loss < initial_loss.expect("initial loss") * 0.05,
+            "decoder loss did not converge: initial={initial_loss:?}, final={final_loss}"
+        );
+
+        let generated = crate::generation::generate_tokens(
+            &valid,
+            presentation.prompt_tokens.clone(),
+            &burn::tensor::Device::<TestBackend>::default(),
+            crate::generation::GenerationSettings {
+                max_new_tokens: Some(presentation.candidate_tokens[selected].len() + 4),
+                temperature: 1.0,
+                top_k: Some(1),
+                strategy: crate::generation::ContextStrategy::Infinite,
+                stop_on_token: Some(271),
+            },
+            None,
+        )
+        .expect("greedy replay");
+        let completion = &generated[presentation.prompt_tokens.len()..];
+        assert_eq!(
+            completion,
+            presentation.candidate_tokens[selected].as_slice(),
+            "greedy decoder did not replay the memorized verifier action"
         );
     }
 
@@ -3517,6 +4077,55 @@ mod tests {
                 "score {index} differs: dense={dense}, reused={reused}"
             );
         }
+    }
+
+    #[test]
+    fn residual_energy_prefix_reuse_matches_dense_full_sequence_reference() {
+        let device = burn::tensor::Device::<TestBackend>::default();
+        TestBackend::seed(&device, 79);
+        let mut config = burn_dragon_core::DragonConfig {
+            n_layer: 2,
+            n_embd: 16,
+            n_head: 2,
+            mlp_internal_dim_multiplier: 2,
+            vocab_size: 32,
+            dropout: 0.0,
+            ..Default::default()
+        };
+        config.sequence_score_head.enabled = true;
+        let model = DragonModel::<TestBackend>::new(config, &device);
+        let prompts = vec![vec![1, 2, 3], vec![4, 5, 6, 7, 8], vec![9, 10, 11]];
+        let candidates = vec![
+            vec![vec![12], vec![13, 14, 15]],
+            vec![vec![16, 17], vec![18, 19, 20], vec![21]],
+            vec![vec![22, 23, 24, 25], vec![26, 27]],
+        ];
+
+        let dense = tensor_values(
+            sequence_residual_energy_score_tensor_dense(
+                &model,
+                &prompts,
+                &candidates,
+                false,
+                false,
+                &device,
+                |inputs| model.forward_hidden(inputs),
+            )
+            .expect("dense residual-energy reference scores"),
+        );
+        let (reused, group_sizes) = sequence_residual_energy_score_tensor_with_prefix_reuse(
+            &model,
+            &prompts,
+            &candidates,
+            &device,
+        )
+        .expect("prefix-reused residual-energy scores");
+        let reused = tensor_values(reused);
+
+        assert_eq!(group_sizes, vec![2, 3, 2]);
+        assert_eq!(dense.len(), reused.len());
+        let maximum_error = maximum_abs_difference(&dense, &reused);
+        assert!(maximum_error <= 2.0e-4, "maximum_error={maximum_error}");
     }
 
     #[test]

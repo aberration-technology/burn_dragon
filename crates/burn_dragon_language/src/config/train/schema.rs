@@ -26,6 +26,13 @@ pub struct DatasetConfig {
     /// is useful for open-loop train/holdout distribution controls.
     #[serde(default)]
     pub ruliad_source_selection_cold_start_enabled: Option<bool>,
+    /// Number of independently generated Ruliad documents presented per live
+    /// source-selected batch. `None` uses the full training batch size so a
+    /// large optimization batch does not silently duplicate a tiny document
+    /// panel; smaller explicit values are throughput controls for expensive
+    /// generators.
+    #[serde(default)]
+    pub ruliad_source_selection_documents_per_step: Option<usize>,
     #[serde(flatten)]
     pub source: DatasetSourceConfig,
     #[serde(default)]
@@ -604,6 +611,11 @@ pub enum LocalPredictiveCodingTerminalCriterion {
     /// verifier-enumerated conditional action-set factor. This is an
     /// alternating factor schedule, not an arbitrarily weighted auxiliary.
     RuliadVerifierSet,
+    /// Optimize the ordinary next-token terminal and the verifier-enumerated
+    /// action-set terminal in the same outer update. Each is a normalized
+    /// negative log-likelihood factor with unit multiplicity, so the joint
+    /// objective has no empirical mixing coefficient.
+    RuliadVerifierSetJoint,
 }
 
 /// Activity/error solver used by canonical layer-local predictive coding.
@@ -657,6 +669,19 @@ pub enum LocalPredictiveCodingSolver {
     FirstOrderAdjoint,
 }
 
+/// Optional objective-specific solver routes inside one local-PC program.
+///
+/// The top-level `solver` remains the verifier/default factor solver. A
+/// next-token override is useful when finite activity inference is warranted
+/// for a sparse structured terminal but would only duplicate work on the
+/// routine language factor. Both routes retain the strict no-global-backward
+/// execution contract and share one outer optimizer update.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
+#[serde(default)]
+pub struct LocalPredictiveCodingObjectiveRoutingConfig {
+    pub next_token_solver: Option<LocalPredictiveCodingSolver>,
+}
+
 impl LocalPredictiveCodingSolver {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -698,6 +723,7 @@ pub enum LocalPredictiveCodingAdjointConditioning {
 #[serde(default)]
 pub struct LocalPredictiveCodingConfig {
     pub solver: LocalPredictiveCodingSolver,
+    pub objective_routing: LocalPredictiveCodingObjectiveRoutingConfig,
     pub terminal_criterion: LocalPredictiveCodingTerminalCriterion,
     /// Penalty-PC activity settings used by synchronous and Gauss-Seidel
     /// solvers. PC-ALM uses `augmented_lagrangian` instead.
@@ -734,6 +760,7 @@ impl Default for LocalPredictiveCodingConfig {
     fn default() -> Self {
         Self {
             solver: LocalPredictiveCodingSolver::SynchronousEquilibrium,
+            objective_routing: LocalPredictiveCodingObjectiveRoutingConfig::default(),
             terminal_criterion: LocalPredictiveCodingTerminalCriterion::NextToken,
             inference: burn_pc::PcInferenceConfig {
                 steps: 4,
@@ -769,6 +796,22 @@ impl Default for LocalPredictiveCodingConfig {
 }
 
 impl LocalPredictiveCodingConfig {
+    pub fn next_token_solver(&self) -> LocalPredictiveCodingSolver {
+        self.objective_routing
+            .next_token_solver
+            .unwrap_or(self.solver)
+    }
+
+    pub fn for_next_token(&self) -> Self {
+        let mut routed = self.clone();
+        routed.solver = self.next_token_solver();
+        routed
+    }
+
+    pub fn uses_objective_routing(&self) -> bool {
+        self.next_token_solver() != self.solver
+    }
+
     /// Derivative boundary enforced by every production local-PC solver.
     /// Dragon's ePC implementation uses analytic activity VJPs; it does not
     /// retain an autodiff graph over either errors or model parameters.
@@ -1036,39 +1079,6 @@ impl Default for LatentReasoningConstraintBalancerConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
-pub struct NextLatentPredictionConfig {
-    pub enabled: bool,
-    #[serde(default)]
-    pub every_steps: Option<usize>,
-    #[serde(default)]
-    pub start_after_steps: Option<usize>,
-    #[serde(default)]
-    pub start_policy: Option<LatentReasoningAuxiliaryStartPolicy>,
-    pub horizon: usize,
-    pub regression_weight: f32,
-    pub token_kl_weight: f32,
-    pub smooth_l1_beta: f32,
-    pub detach_action_embedding: bool,
-}
-
-impl Default for NextLatentPredictionConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            every_steps: None,
-            start_after_steps: None,
-            start_policy: None,
-            horizon: 1,
-            regression_weight: 1.0,
-            token_kl_weight: 0.0,
-            smooth_l1_beta: 1.0,
-            detach_action_embedding: true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-#[serde(default)]
 pub struct DragonStateConsistencyConfig {
     pub enabled: bool,
     #[serde(default)]
@@ -1316,7 +1326,7 @@ pub enum RuliadValidationPanelMode {
 pub struct RuliadValidationPanelConfig {
     pub mode: RuliadValidationPanelMode,
     pub path: Option<PathBuf>,
-    /// Number of lowest materialized difficulty strata represented in the
+    /// Number of lowest generatable difficulty strata represented in the
     /// immutable base correctness panel. `0` retains legacy unstratified
     /// sampling; positive values balance items across difficulty before
     /// cycling across source family/task contracts within each stratum.
@@ -1338,6 +1348,11 @@ impl Default for RuliadValidationPanelConfig {
 pub struct TrainingValidationConfig {
     pub execution: TrainingValidationExecution,
     pub sampling: TrainingValidationSampling,
+    /// Optional batch budget for each local cold and stream-warm validation pass,
+    /// bounded by the available validation split. Omission preserves the historical
+    /// logging-derived budget and serialized checkpoint contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batches: Option<usize>,
     /// Single named loss contract consumed by validation-driven control logic.
     pub objective: TrainingValidationObjective,
     /// Sampling seed for the fixed teacher-forced holdout. This is deliberately independent of
@@ -1352,6 +1367,7 @@ impl Default for TrainingValidationConfig {
         Self {
             execution: TrainingValidationExecution::default(),
             sampling: TrainingValidationSampling::default(),
+            batches: None,
             objective: TrainingValidationObjective::default(),
             seed: default_validation_seed(),
             ruliad_panel: RuliadValidationPanelConfig::default(),
@@ -1436,6 +1452,11 @@ impl Default for SequenceStateProbeConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct TrainingHyperparameters {
+    #[serde(
+        default,
+        skip_serializing_if = "super::TrainingProvenanceConfig::is_default"
+    )]
+    pub provenance: super::TrainingProvenanceConfig,
     #[serde(default)]
     pub algorithm: TrainingAlgorithm,
     pub block_size: usize,
@@ -1650,6 +1671,9 @@ pub struct RuliadPolicyProbeConfig {
     /// Model contract used to rank verifier-enumerated proof actions.
     #[serde(default)]
     pub scoring: RuliadProofPolicyScoring,
+    /// Must match the proof-policy training prompt contract.
+    #[serde(default)]
+    pub prompt_context: RuliadProofPolicyPromptContext,
     /// Probability contract used to rank autoregressive semantic actions.
     ///
     /// This should match proof-policy training. `PrefixConditional` scores only legal branching
@@ -1666,6 +1690,12 @@ pub struct RuliadPolicyProbeConfig {
     pub closed_loop_every_epochs: Option<usize>,
     #[serde(default = "default_ruliad_policy_probe_items")]
     pub items: usize,
+    /// Maximum closed-loop transitions per proof. Zero selects an automatic,
+    /// finite per-item budget of four times the verifier certificate length.
+    ///
+    /// A positive fixed budget is rejected at evaluation time when it is
+    /// shorter than the item's certificate: an impossible rollout must not be
+    /// reported as a model capability failure.
     #[serde(default = "default_ruliad_policy_probe_max_steps")]
     pub max_steps: usize,
     #[serde(default = "default_ruliad_policy_probe_candidates")]
@@ -1684,8 +1714,8 @@ pub struct RuliadPolicyProbeConfig {
     /// bounded by `scoring_pipeline_depth * scoring_token_budget`.
     #[serde(default = "default_ruliad_policy_probe_scoring_pipeline_depth")]
     pub scoring_pipeline_depth: usize,
-    /// Evaluate evenly over materialized difficulty levels `[0, n)` instead of
-    /// inheriting the live sampler's current distribution. Zero disables it.
+    /// Evaluate evenly over the lowest `n` generatable difficulty levels instead
+    /// of inheriting the live sampler's current materialized frontier. Zero disables it.
     #[serde(default = "default_ruliad_policy_probe_stratified_difficulty_levels")]
     pub stratified_difficulty_levels: usize,
     /// Candidate indices are presentation details. Balanced rotation prevents a deterministic
@@ -1708,6 +1738,7 @@ impl Default for RuliadPolicyProbeConfig {
         Self {
             enabled: false,
             scoring: RuliadProofPolicyScoring::default(),
+            prompt_context: RuliadProofPolicyPromptContext::default(),
             normalization: RuliadProofPolicyNormalization::default(),
             every_epochs: default_ruliad_policy_probe_every_epochs(),
             closed_loop_every_epochs: None,
@@ -1789,6 +1820,18 @@ fn default_ruliad_policy_regression_confidence_z() -> f64 {
     1.959_963_984_540_054
 }
 
+fn default_ruliad_policy_gate_minimum_conditioning_items() -> usize {
+    16
+}
+
+fn default_ruliad_policy_gate_minimum_binding_change_rate() -> f64 {
+    0.05
+}
+
+fn default_ruliad_policy_gate_minimum_binding_probability_delta() -> f64 {
+    0.001
+}
+
 /// Closed-loop acceptance criteria for promoting a proof-action objective.
 ///
 /// These are deliberately separate from token-level capability gates: a model
@@ -1811,6 +1854,19 @@ pub struct RuliadPolicyPromotionGateConfig {
     pub maximum_repeated_state_rate: f64,
     #[serde(default = "default_ruliad_policy_gate_maximum_backtrack_rate")]
     pub maximum_backtrack_rate: f64,
+    /// Require the constrained policy to respond directionally to changed
+    /// current states and verifier-valid alternate goals.
+    pub require_context_binding: bool,
+    #[serde(default = "default_ruliad_policy_gate_minimum_conditioning_items")]
+    pub minimum_conditioning_items: usize,
+    #[serde(default = "default_ruliad_policy_gate_minimum_binding_change_rate")]
+    pub minimum_context_swap_top1_change_rate: f64,
+    #[serde(default = "default_ruliad_policy_gate_minimum_binding_probability_delta")]
+    pub minimum_context_swap_equivalent_probability_drop: f64,
+    #[serde(default = "default_ruliad_policy_gate_minimum_binding_change_rate")]
+    pub minimum_counterfactual_target_top1_change_rate: f64,
+    #[serde(default = "default_ruliad_policy_gate_minimum_binding_probability_delta")]
+    pub minimum_counterfactual_target_equivalent_probability_gain: f64,
     /// Normal quantile used by Wilson intervals for continual-regression evidence.
     /// The default is the conventional two-sided 95% interval. Promotion thresholds remain
     /// point-estimate gates; this value only prevents noisy finite panels from causing rollback.
@@ -1829,6 +1885,16 @@ impl Default for RuliadPolicyPromotionGateConfig {
             maximum_invalid_action_rate: default_ruliad_policy_gate_maximum_invalid_action_rate(),
             maximum_repeated_state_rate: default_ruliad_policy_gate_maximum_repeated_state_rate(),
             maximum_backtrack_rate: default_ruliad_policy_gate_maximum_backtrack_rate(),
+            require_context_binding: true,
+            minimum_conditioning_items: default_ruliad_policy_gate_minimum_conditioning_items(),
+            minimum_context_swap_top1_change_rate:
+                default_ruliad_policy_gate_minimum_binding_change_rate(),
+            minimum_context_swap_equivalent_probability_drop:
+                default_ruliad_policy_gate_minimum_binding_probability_delta(),
+            minimum_counterfactual_target_top1_change_rate:
+                default_ruliad_policy_gate_minimum_binding_change_rate(),
+            minimum_counterfactual_target_equivalent_probability_gain:
+                default_ruliad_policy_gate_minimum_binding_probability_delta(),
             regression_confidence_z: default_ruliad_policy_regression_confidence_z(),
         }
     }
@@ -1884,6 +1950,135 @@ impl RuliadSupervisionMode {
     }
 }
 
+/// Deterministic finite-to-open curriculum for generated Ruliad experience.
+///
+/// The curriculum stores no documents. It maps each consumed optimizer step to
+/// a previously released generation coordinate, allowing the normal bounded
+/// dataset cache to regenerate exact samples. After the initial hold, one new
+/// coordinate is released every `novelty_interval_steps`; the remaining steps
+/// revisit the released panel. With no maximum coordinate, novelty remains
+/// unbounded over a long-running job.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RuliadConsolidationConfig {
+    pub enabled: bool,
+    /// Unique generation coordinates materialized before consolidation starts.
+    pub initial_unique_steps: usize,
+    /// Absolute consumed step through which only the initial panel is replayed.
+    pub hold_steps: usize,
+    /// Cadence for releasing one additional generation coordinate after hold.
+    /// A value of one is a fresh-only stream.
+    pub novelty_interval_steps: usize,
+    /// Peer-stable permutation seed used only to select replay coordinates.
+    pub seed: u64,
+}
+
+impl Default for RuliadConsolidationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            initial_unique_steps: 16,
+            hold_steps: 64,
+            novelty_interval_steps: 4,
+            seed: 0x53A6_0C5E_71D0_5EED,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuliadConsolidationCoordinate {
+    pub generation_step: usize,
+    pub released_unique_steps: usize,
+    pub novel: bool,
+}
+
+impl RuliadConsolidationConfig {
+    pub fn coordinate(self, absolute_step: usize) -> RuliadConsolidationCoordinate {
+        if !self.enabled {
+            return RuliadConsolidationCoordinate {
+                generation_step: absolute_step,
+                released_unique_steps: absolute_step.saturating_add(1),
+                novel: true,
+            };
+        }
+
+        let initial = self.initial_unique_steps.max(1);
+        if absolute_step < initial {
+            return RuliadConsolidationCoordinate {
+                generation_step: absolute_step,
+                released_unique_steps: absolute_step.saturating_add(1),
+                novel: true,
+            };
+        }
+
+        let hold_end = self.hold_steps.max(initial);
+        if absolute_step < hold_end {
+            return RuliadConsolidationCoordinate {
+                generation_step: ruliad_consolidation_replay_slot(
+                    absolute_step.saturating_sub(initial),
+                    initial,
+                    self.seed,
+                ),
+                released_unique_steps: initial,
+                novel: false,
+            };
+        }
+
+        let novelty_interval = self.novelty_interval_steps.max(1);
+        let open_step = absolute_step.saturating_sub(hold_end);
+        let release_index = open_step / novelty_interval;
+        let novel = open_step.is_multiple_of(novelty_interval);
+        let released_unique_steps = initial
+            .saturating_add(release_index)
+            .saturating_add(usize::from(novel));
+        let generation_step = if novel {
+            initial.saturating_add(release_index)
+        } else {
+            ruliad_consolidation_replay_slot(
+                open_step,
+                released_unique_steps,
+                self.seed ^ 0xA076_1D64_78BD_642F,
+            )
+        };
+        RuliadConsolidationCoordinate {
+            generation_step,
+            released_unique_steps,
+            novel,
+        }
+    }
+}
+
+fn ruliad_consolidation_replay_slot(ordinal: usize, count: usize, seed: u64) -> usize {
+    let count = count.max(1);
+    let mixed = ruliad_consolidation_mix(seed ^ count as u64);
+    let offset = (mixed % count as u64) as usize;
+    let mut stride = ((mixed.rotate_left(29) % count as u64) as usize).max(1);
+    while ruliad_consolidation_gcd(stride, count) != 1 {
+        stride = stride.saturating_add(1);
+        if stride >= count {
+            stride = 1;
+        }
+    }
+    offset.wrapping_add(ordinal.wrapping_mul(stride)) % count
+}
+
+fn ruliad_consolidation_gcd(mut left: usize, mut right: usize) -> usize {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
+fn ruliad_consolidation_mix(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct RuliadSupervisionConfig {
@@ -1903,6 +2098,9 @@ pub struct RuliadSupervisionConfig {
     /// prompt-conditioned field value. Active rows replace the ordinary loss.
     pub prompt_value_binding: RuliadPromptValueBindingConfig,
     pub verifier_reward: RuliadVerifierRewardConfig,
+    /// Deterministic replay/novelty schedule shared by primary Ruliad documents
+    /// and verifier-policy sidecars.
+    pub consolidation: RuliadConsolidationConfig,
     pub proof_policy: RuliadProofPolicyTrainingConfig,
     /// Sparse semantic-energy replacements for primary proof-policy terminals.
     ///
@@ -1927,6 +2125,7 @@ impl Default for RuliadSupervisionConfig {
             answer_contract: RuliadAnswerContractConfig::default(),
             prompt_value_binding: RuliadPromptValueBindingConfig::default(),
             verifier_reward: RuliadVerifierRewardConfig::default(),
+            consolidation: RuliadConsolidationConfig::default(),
             proof_policy: RuliadProofPolicyTrainingConfig::default(),
             proof_policy_semantic_refresh: RuliadProofPolicySemanticRefreshConfig::default(),
         }
@@ -2045,15 +2244,83 @@ impl RuliadSupervisionConfig {
 
     pub fn proof_policy_for_step(self, absolute_step: usize) -> RuliadProofPolicyTrainingConfig {
         let mut policy = self.proof_policy;
-        if self
-            .proof_policy_semantic_refresh
-            .active_at_step(absolute_step)
+        let configured_counterfactual_objective = policy.counterfactual_objective;
+        let decoder_calibration_active = policy.decoder_calibration_active(absolute_step);
+        if decoder_calibration_active {
+            policy.scoring = RuliadProofPolicyScoring::CompletionLikelihood;
+            policy.target = RuliadProofPolicyTarget::ExpertSet;
+            policy.normalization = RuliadProofPolicyNormalization::VocabularyMarginal;
+            policy.gradient_scope = RuliadProofPolicyGradientScope::FullModel;
+            // Calibration identifies the decoder against the full vocabulary.
+            // Target-group conditioning belongs to the subsequent policy phase.
+            policy.counterfactual_objective = RuliadProofPolicyCounterfactualObjective::Independent;
+        }
+        if !decoder_calibration_active
+            && self
+                .proof_policy_semantic_refresh
+                .active_at_step(absolute_step)
         {
             policy.scoring = RuliadProofPolicyScoring::SemanticEnergy;
             policy.normalization = RuliadProofPolicyNormalization::CandidateConditional;
             policy.counterfactual_targets_per_state = self
                 .proof_policy_semantic_refresh
                 .counterfactual_targets_per_state;
+        }
+        if !decoder_calibration_active
+            && matches!(
+                configured_counterfactual_objective,
+                RuliadProofPolicyCounterfactualObjective::TargetGroupJoint
+                    | RuliadProofPolicyCounterfactualObjective::FactorizedJoint
+                    | RuliadProofPolicyCounterfactualObjective::DecoderCoupledJoint
+            )
+        {
+            let update_ordinal = absolute_step
+                .saturating_sub(policy.start_after_steps)
+                .checked_div(policy.every_steps.max(1))
+                .unwrap_or_default();
+            if configured_counterfactual_objective
+                == RuliadProofPolicyCounterfactualObjective::DecoderCoupledJoint
+            {
+                match update_ordinal % 3 {
+                    0 => {
+                        policy.counterfactual_objective =
+                            RuliadProofPolicyCounterfactualObjective::TargetGroupConditional;
+                        policy.scoring = RuliadProofPolicyScoring::CompletionLikelihood;
+                        policy.target = RuliadProofPolicyTarget::ExpertSet;
+                        policy.normalization = RuliadProofPolicyNormalization::CandidateConditional;
+                        policy.gradient_scope = RuliadProofPolicyGradientScope::FullModel;
+                    }
+                    1 => {
+                        policy.counterfactual_objective =
+                            RuliadProofPolicyCounterfactualObjective::Independent;
+                    }
+                    _ => {
+                        policy.counterfactual_objective =
+                            RuliadProofPolicyCounterfactualObjective::TargetGroupConditional;
+                    }
+                }
+            } else if update_ordinal.is_multiple_of(2) {
+                policy.counterfactual_objective =
+                    RuliadProofPolicyCounterfactualObjective::Independent;
+                if configured_counterfactual_objective
+                    == RuliadProofPolicyCounterfactualObjective::FactorizedJoint
+                {
+                    policy.scoring = RuliadProofPolicyScoring::CompletionLikelihood;
+                    policy.target = RuliadProofPolicyTarget::ExpertSet;
+                    policy.normalization = RuliadProofPolicyNormalization::VocabularyMarginal;
+                    policy.gradient_scope = RuliadProofPolicyGradientScope::FullModel;
+                }
+            } else {
+                policy.counterfactual_objective =
+                    RuliadProofPolicyCounterfactualObjective::TargetGroupConditional;
+                if configured_counterfactual_objective
+                    == RuliadProofPolicyCounterfactualObjective::FactorizedJoint
+                {
+                    policy.scoring = RuliadProofPolicyScoring::ResidualEnergy;
+                    policy.target = RuliadProofPolicyTarget::ExpertSet;
+                    policy.normalization = RuliadProofPolicyNormalization::CandidateConditional;
+                }
+            }
         }
         policy
     }
@@ -2219,7 +2486,61 @@ pub enum RuliadProofPolicyScoring {
     ResidualEnergy,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuliadProofPolicyPromptContext {
+    /// Preserve the historical full-problem prompt and crop its causal suffix
+    /// when it exceeds the model block. This exists for checkpoint and
+    /// ablation compatibility; telemetry reports every truncation.
+    #[default]
+    FullProblemSuffix,
+    /// Use the verifier-derived local action state: current/target focus,
+    /// candidate rewrite patterns, goal, and difference path. No random hash
+    /// or serialized global problem is exposed to the policy.
+    LocalActionState,
+}
+
+impl RuliadProofPolicyPromptContext {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FullProblemSuffix => "full_problem_suffix",
+            Self::LocalActionState => "local_action_state",
+        }
+    }
+}
+
+/// Formal target represented by each verifier-enumerated action menu.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuliadProofPolicyTarget {
+    /// Maximize probability mass on the verifier's minimum-distance equivalent set.
+    #[default]
+    ExpertSet,
+    /// Match an expert-preserving distribution over legal candidates. Certified
+    /// equivalents receive a lexicographic guard above all heuristic progress;
+    /// other improving transitions retain proportional one-step partial credit.
+    /// The guard is derived from the row rather than a tuned loss coefficient.
+    VerifiedProgressDistribution,
+}
+
+impl RuliadProofPolicyTarget {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExpertSet => "expert_set",
+            Self::VerifiedProgressDistribution => "verified_progress_distribution",
+        }
+    }
+}
+
 impl RuliadProofPolicyScoring {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CompletionLikelihood => "completion_likelihood",
+            Self::SemanticEnergy => "semantic_energy",
+            Self::ResidualEnergy => "residual_energy",
+        }
+    }
+
     pub fn uses_sequence_score_head(self) -> bool {
         matches!(self, Self::SemanticEnergy | Self::ResidualEnergy)
     }
@@ -2237,6 +2558,13 @@ pub enum RuliadProofPolicyGradientScope {
     /// Language-model cross entropy still updates the complete model in ordinary steps; only the
     /// semantic or residual-energy policy objective is restricted to the score head.
     ScoreHeadOnly,
+    /// Route verifier gradients through the sequence-score head and Dragon hidden state while
+    /// treating the autoregressive candidate prior as a fixed density.
+    ///
+    /// Ordinary language-model cross entropy remains the sole updater of the language projection.
+    /// This lets a residual policy shape target-sensitive recurrent representations without the
+    /// direct vocabulary-gradient interference of `full_model`.
+    PolicyPath,
     /// Stop the completion-policy gradient at Dragon's hidden representations.
     ///
     /// The verifier-equivalent completion objective updates only the untied language projection.
@@ -2244,6 +2572,17 @@ pub enum RuliadProofPolicyGradientScope {
     /// optimizer step. Tied input/output embeddings are rejected because they would make this
     /// scope modify the recurrent model's input interface.
     LanguageHeadOnly,
+}
+
+impl RuliadProofPolicyGradientScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FullModel => "full_model",
+            Self::ScoreHeadOnly => "score_head_only",
+            Self::PolicyPath => "policy_path",
+            Self::LanguageHeadOnly => "language_head_only",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -2290,12 +2629,97 @@ pub enum RuliadProofPolicyPresentationRisk {
     Worst,
 }
 
+/// Objective used when a proof state is paired with alternate verifier-valid targets.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuliadProofPolicyCounterfactualObjective {
+    /// Score every target variant against the complete candidate menu.
+    #[default]
+    Independent,
+    /// Score every target variant only against the union of semantic targets in its matched
+    /// original/counterfactual group.
+    ///
+    /// The resulting normalized multiclass likelihood cannot be minimized by a target-independent
+    /// candidate prior: the candidate presentation is held fixed while the requested target and
+    /// verifier label change together. This is a narrow target-binding diagnostic, not a complete
+    /// action-policy objective: candidates outside the target union are intentionally absent from
+    /// its partition function. Use `independent` for full-menu policy training.
+    TargetGroupConditional,
+    /// Alternate full-menu validity and matched target-group discrimination at
+    /// equal frequency. This is a stochastic estimator of the two normalized
+    /// likelihood terms and adds no second model pass to an update.
+    TargetGroupJoint,
+    /// Alternate two normalized factors with disjoint parameter contracts.
+    ///
+    /// Even updates identify verifier-equivalent action strings under the deployed
+    /// full-vocabulary autoregressive model. Odd updates identify matched target groups with a
+    /// residual-energy head. The configured residual scope may stop at the score head or continue
+    /// through Dragon's recurrent representation while keeping the autoregressive prior fixed.
+    /// This is block-coordinate maximum likelihood for an autoregressive prior and
+    /// target-conditioned residual policy, not a weighted sum of unrelated losses.
+    FactorizedJoint,
+    /// Cycle three normalized policy factors without combining arbitrary loss weights.
+    ///
+    /// The first update identifies the deployed autoregressive decoder on matched
+    /// counterfactual target groups. The second identifies full-menu verifier validity with the
+    /// residual-energy policy. The third identifies target-conditioned residual discrimination.
+    /// This couples the text decoder to the same formal target intervention used by the typed
+    /// policy while retaining full-menu validity as a separate maximum-likelihood factor.
+    DecoderCoupledJoint,
+}
+
+impl RuliadProofPolicyCounterfactualObjective {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Independent => "independent",
+            Self::TargetGroupConditional => "target_group_conditional",
+            Self::TargetGroupJoint => "target_group_joint",
+            Self::FactorizedJoint => "factorized_joint",
+            Self::DecoderCoupledJoint => "decoder_coupled_joint",
+        }
+    }
+
+    pub const fn requires_complete_target_group(self) -> bool {
+        matches!(
+            self,
+            Self::TargetGroupConditional
+                | Self::TargetGroupJoint
+                | Self::FactorizedJoint
+                | Self::DecoderCoupledJoint
+        )
+    }
+
+    pub const fn uses_target_group_support(self) -> bool {
+        matches!(self, Self::TargetGroupConditional)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct RuliadProofPolicyTrainingConfig {
     pub enabled: bool,
+    /// Fail the training step when a scheduled proof-policy update has no
+    /// policy batch or cannot materialize a non-empty verifier panel.
+    ///
+    /// This should be enabled for controlled experiments and production runs
+    /// where silently replacing the structured objective with the primary
+    /// language objective would invalidate optimizer and peer comparisons.
+    pub require_scheduled_update: bool,
     pub mode: RuliadProofPolicyTrainingMode,
     pub scoring: RuliadProofPolicyScoring,
+    /// Number of optimizer steps reserved for static-expert identification of
+    /// the deployed autoregressive action prior before enabling a residual
+    /// density-ratio correction. Zero disables calibration.
+    ///
+    /// During this phase residual-energy policies use full-model,
+    /// vocabulary-marginal completion likelihood against the verifier's expert
+    /// set. Unlike candidate-conditional ranking, this identifies the decoder
+    /// against EOS and off-candidate vocabulary mass. The phase is measured
+    /// from `start_after_steps` and must end no later than the paired-DAgger
+    /// transition.
+    pub decoder_calibration_steps: usize,
+    pub prompt_context: RuliadProofPolicyPromptContext,
+    pub target: RuliadProofPolicyTarget,
     pub gradient_scope: RuliadProofPolicyGradientScope,
     pub normalization: RuliadProofPolicyNormalization,
     pub candidate_symmetry: RuliadProofPolicyCandidateSymmetry,
@@ -2305,8 +2729,8 @@ pub struct RuliadProofPolicyTrainingConfig {
     pub start_after_steps: usize,
     /// Absolute optimizer step where `static_then_paired_dagger` adds model rollouts.
     pub dagger_start_after_steps: usize,
-    /// Number of materialized proof-policy difficulty levels represented in each auxiliary
-    /// metadata batch. Zero preserves the live source-selected bucket only.
+    /// Number of lowest generatable proof-policy difficulty levels represented in each
+    /// auxiliary metadata batch. Zero preserves the live source-selected bucket only.
     pub stratified_difficulty_levels: usize,
     pub rollout_steps: usize,
     /// Semantic proof states retained across one optimizer update. DAgger distributes this budget
@@ -2322,6 +2746,7 @@ pub struct RuliadProofPolicyTrainingConfig {
     /// changing only the target and its verifier-equivalent label. They prevent semantic-energy
     /// training from solving candidate ranking with a target-independent completion shortcut.
     pub counterfactual_targets_per_state: usize,
+    pub counterfactual_objective: RuliadProofPolicyCounterfactualObjective,
     pub candidates: usize,
     pub max_completion_tokens: usize,
 }
@@ -2330,8 +2755,12 @@ impl Default for RuliadProofPolicyTrainingConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            require_scheduled_update: false,
             mode: RuliadProofPolicyTrainingMode::Dagger,
             scoring: RuliadProofPolicyScoring::CompletionLikelihood,
+            decoder_calibration_steps: 0,
+            prompt_context: RuliadProofPolicyPromptContext::FullProblemSuffix,
+            target: RuliadProofPolicyTarget::ExpertSet,
             gradient_scope: RuliadProofPolicyGradientScope::FullModel,
             normalization: RuliadProofPolicyNormalization::CandidateConditional,
             candidate_symmetry: RuliadProofPolicyCandidateSymmetry::Canonical,
@@ -2345,6 +2774,7 @@ impl Default for RuliadProofPolicyTrainingConfig {
             max_rows_per_update: 32,
             max_presentation_rows_per_update: 32,
             counterfactual_targets_per_state: 0,
+            counterfactual_objective: RuliadProofPolicyCounterfactualObjective::Independent,
             candidates: burn_dragon_universality::ruliad::DEFAULT_PROOF_ACTION_CANDIDATES,
             max_completion_tokens: 16,
         }
@@ -2352,6 +2782,15 @@ impl Default for RuliadProofPolicyTrainingConfig {
 }
 
 impl RuliadProofPolicyTrainingConfig {
+    pub fn decoder_calibration_active(self, absolute_step: usize) -> bool {
+        self.decoder_calibration_steps > 0
+            && absolute_step >= self.start_after_steps
+            && absolute_step
+                < self
+                    .start_after_steps
+                    .saturating_add(self.decoder_calibration_steps)
+    }
+
     pub fn presentations_per_state(self) -> usize {
         match self.candidate_symmetry {
             RuliadProofPolicyCandidateSymmetry::CyclicOrbitAverage => self.candidates.max(1),
@@ -2462,6 +2901,17 @@ impl Default for RuliadAnswerContractConfig {
 #[serde(default)]
 pub struct RuliadPromptValueBindingConfig {
     pub enabled: bool,
+    /// Fail after recording skip telemetry if a scheduled primary row batch is unavailable.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub require_scheduled_update: bool,
+    /// Prompt contract used by the scheduled value-completion rows.
+    ///
+    /// `DatasetPrompt` preserves the ordinary document-completion task. `ProofPolicy` derives
+    /// the exact verifier-owned action prompt and semantic answer selected by `proof_policy`, so
+    /// policy ranking and autoregressive rendering condition on the same state representation.
+    pub context: RuliadPromptValueBindingContext,
+    /// Conditional target presented under the selected prompt contract.
+    pub objective: RuliadPromptValueBindingObjective,
     pub every_steps: usize,
     /// Residue within `every_steps`, used to keep primary objectives disjoint.
     pub phase_steps: usize,
@@ -2474,11 +2924,54 @@ impl Default for RuliadPromptValueBindingConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            require_scheduled_update: false,
+            context: RuliadPromptValueBindingContext::DatasetPrompt,
+            objective: RuliadPromptValueBindingObjective::SchemaValues,
             every_steps: 2,
             phase_steps: 1,
             start_after_steps: 0,
             max_completion_tokens: 64,
             max_rows_per_step: 32,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuliadPromptValueBindingObjective {
+    /// Supply each schema prefix and supervise only its corresponding value.
+    /// This is a diagnostic factor for field binding, not a complete free-decoder contract.
+    #[default]
+    SchemaValues,
+    /// Supervise the complete answer and document terminator from the selected prompt.
+    /// This is the maximum-likelihood contract used when free autoregressive rendering matters.
+    FullCompletion,
+}
+
+impl RuliadPromptValueBindingObjective {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SchemaValues => "schema_values",
+            Self::FullCompletion => "full_completion",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuliadPromptValueBindingContext {
+    /// Complete values from the generated document prompt carried by the dataset item.
+    #[default]
+    DatasetPrompt,
+    /// Complete the verifier-selected semantic action from the proof-policy prompt contract.
+    ProofPolicy,
+}
+
+impl RuliadPromptValueBindingContext {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DatasetPrompt => "dataset_prompt",
+            Self::ProofPolicy => "proof_policy",
         }
     }
 }

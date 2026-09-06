@@ -86,6 +86,7 @@ impl UniversalityDataset {
             tokenizer,
             dataset_name: manifest.dataset_name,
             ruliad_supervision: RuliadSupervisionConfig::default(),
+            ruliad_supervision_audit: None,
         })
     }
 
@@ -161,6 +162,8 @@ impl UniversalityDataset {
                 cache: Arc::new(EpochRuntimeCacheState::default()),
                 live_batch_cache: Arc::new(LiveDocumentBatchCacheState::new()),
                 source_selection: None,
+                live_documents_per_step: None,
+                consolidation: RuliadConsolidationConfig::default(),
                 train_probe_summary,
                 validation_probe_summary,
             }),
@@ -172,6 +175,7 @@ impl UniversalityDataset {
             tokenizer,
             dataset_name,
             ruliad_supervision: RuliadSupervisionConfig::default(),
+            ruliad_supervision_audit: None,
         })
     }
 
@@ -269,6 +273,8 @@ impl UniversalityDataset {
                 cache: Arc::new(EpochRuntimeCacheState::default()),
                 live_batch_cache: Arc::new(LiveDocumentBatchCacheState::new()),
                 source_selection,
+                live_documents_per_step: overrides.documents_per_step,
+                consolidation: RuliadConsolidationConfig::default(),
                 train_probe_summary,
                 validation_probe_summary,
             }),
@@ -280,12 +286,47 @@ impl UniversalityDataset {
             tokenizer,
             dataset_name,
             ruliad_supervision: RuliadSupervisionConfig::default(),
+            ruliad_supervision_audit: None,
         })
     }
 
     pub fn with_ruliad_supervision(mut self, supervision: RuliadSupervisionConfig) -> Self {
         self.ruliad_supervision = supervision;
+        if let UniversalityStorage::OnTheFly(storage) = &mut self.storage {
+            storage.consolidation = supervision.consolidation;
+        }
         self
+    }
+
+    /// Materialize a bounded startup audit over the first two frontier levels.
+    /// The report is retained with the dataset so launch validation and run
+    /// descriptions consume the same measured contract.
+    pub fn with_ruliad_supervision_audit(mut self, samples_per_bucket: usize) -> io::Result<Self> {
+        let UniversalityStorage::OnTheFly(storage) = &self.storage else {
+            return Ok(self);
+        };
+        let Some(config) = storage.corpus.ruliad_config() else {
+            return Ok(self);
+        };
+        let first_level = config.source_selection.difficulty_levels.min;
+        let difficulty_levels = [first_level, first_level.saturating_add(1)];
+        self.ruliad_supervision_audit = storage
+            .corpus
+            .audit_frontier_supervision(
+                &difficulty_levels,
+                samples_per_bucket.max(1),
+                self.block_size,
+                self.ruliad_supervision.token_supervision(),
+            )
+            .map_err(io::Error::other)?
+            .map(Arc::new);
+        Ok(self)
+    }
+
+    pub fn ruliad_supervision_audit(
+        &self,
+    ) -> Option<&burn_dragon_universality::ruliad::RuliadSupervisionAuditReport> {
+        self.ruliad_supervision_audit.as_deref()
     }
 
     pub fn with_source_selection_feedback_updates_enabled(self, enabled: Option<bool>) -> Self {
@@ -320,6 +361,18 @@ impl UniversalityDataset {
                 .source_selection
                 .as_ref()
                 .map(|source_selection| source_selection.cold_start.enabled),
+        }
+    }
+
+    pub fn source_selection_documents_per_step(&self) -> Option<usize> {
+        match &self.storage {
+            UniversalityStorage::Manifest(_) => None,
+            UniversalityStorage::OnTheFly(storage) => storage.source_selection.as_ref().map(|_| {
+                live_source_selection_documents_per_step(
+                    self.batch_size,
+                    storage.live_documents_per_step,
+                )
+            }),
         }
     }
 
@@ -375,28 +428,41 @@ impl UniversalityDataset {
             )
     }
 
-    pub fn with_source_selection_state_path(mut self, path: Option<&Path>) -> io::Result<Self> {
+    pub fn with_source_selection_state_path(
+        mut self,
+        path: Option<&Path>,
+        restore: RuliadSourceSelectionRestore,
+    ) -> io::Result<Self> {
         if let Some(path) = path {
-            self.load_source_selection_state(path)?;
+            self.load_source_selection_state(path, restore)?;
         }
         Ok(self)
     }
 
-    pub fn load_source_selection_state(&mut self, path: &Path) -> io::Result<()> {
+    pub fn load_source_selection_state(
+        &mut self,
+        path: &Path,
+        restore: RuliadSourceSelectionRestore,
+    ) -> io::Result<()> {
         let contents = fs::read_to_string(path)?;
-        let snapshot: RuliadSourceSelectionStateSnapshot =
-            serde_json::from_str(&contents).map_err(io::Error::other)?;
-        if snapshot.version != RULIAD_SOURCE_SELECTION_STATE_VERSION {
+        #[derive(Deserialize)]
+        struct Header {
+            version: u32,
+        }
+        let header: Header = serde_json::from_str(&contents).map_err(io::Error::other)?;
+        if header.version != RULIAD_SOURCE_SELECTION_STATE_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "unsupported ruliad source-selection state version {} in {}; expected {}",
-                    snapshot.version,
+                    "unsupported ruliad source-selection state version {} in {}; expected {} with a read-only checkpoint clock; use an explicit weights-only initialization without this source-state file for older runs",
+                    header.version,
                     path.display(),
                     RULIAD_SOURCE_SELECTION_STATE_VERSION
                 ),
             ));
         }
+        let snapshot: RuliadSourceSelectionStateSnapshot =
+            serde_json::from_str(&contents).map_err(io::Error::other)?;
         let UniversalityStorage::OnTheFly(storage) = &mut self.storage else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -437,6 +503,7 @@ impl UniversalityDataset {
             corpus_config,
             configured_candidates,
             snapshot,
+            restore,
         )
         .map(Arc::new);
         if storage.source_selection.is_none() {
@@ -454,14 +521,14 @@ impl UniversalityDataset {
     pub fn write_source_selection_state(
         &self,
         path: &Path,
-        absolute_step_offset: usize,
+        completed_run_steps: usize,
     ) -> io::Result<Option<RuliadSourceSelectionStateSnapshot>> {
         let snapshot = match &self.storage {
             UniversalityStorage::Manifest(_) => None,
             UniversalityStorage::OnTheFly(storage) => storage
                 .source_selection
                 .as_ref()
-                .map(|source_selection| source_selection.export_state(absolute_step_offset)),
+                .map(|source_selection| source_selection.export_state(completed_run_steps)),
         };
         if let Some(snapshot) = &snapshot {
             if let Some(parent) = path.parent() {
@@ -586,7 +653,7 @@ impl UniversalityDataset {
             let mut rng = StdRng::seed_from_u64(source_selection_step_seed(
                 epoch_index,
                 absolute_step,
-                SOURCE_WEIGHTED_VALIDATION_SPLIT_TAG as usize ^ batch_idx,
+                u64::from(SOURCE_WEIGHTED_VALIDATION_SPLIT_TAG) ^ batch_idx as u64,
             ));
             let start = if max_start_in_document == 0 {
                 0
@@ -933,12 +1000,27 @@ impl UniversalityDataset {
         task_kind: &str,
         difficulty_levels: usize,
     ) -> Vec<RuliadValidationProbeItem> {
+        self.sample_ruliad_task_probe_items_fixed(
+            0xB134_4A11_DA7A_5EED,
+            max_items,
+            task_kind,
+            difficulty_levels,
+        )
+    }
+
+    pub fn sample_ruliad_task_probe_items_fixed(
+        &self,
+        panel_seed: u64,
+        max_items: usize,
+        task_kind: &str,
+        difficulty_levels: usize,
+    ) -> Vec<RuliadValidationProbeItem> {
         let UniversalityStorage::OnTheFly(storage) = &self.storage else {
             return Vec::new();
         };
         stratified_ruliad_validation_probe_items(
             storage,
-            0xB134_4A11_DA7A_5EED,
+            panel_seed,
             max_items,
             Some(task_kind),
             difficulty_levels,
@@ -946,7 +1028,24 @@ impl UniversalityDataset {
         )
     }
 
-    /// Seed-stable correctness panel balanced across the lowest materialized
+    pub fn ruliad_semantic_fingerprint(&self) -> anyhow::Result<Option<String>> {
+        let UniversalityStorage::OnTheFly(storage) = &self.storage else {
+            return Ok(None);
+        };
+        storage
+            .corpus
+            .ruliad_config()
+            .map(|config| {
+                burn_dragon_universality::ruliad::contract::RuliadSemanticContract::from_config(
+                    config,
+                    storage.config_path.parent(),
+                )?
+                .canonical_hash()
+            })
+            .transpose()
+    }
+
+    /// Seed-stable correctness panel balanced across the lowest generatable
     /// difficulty strata and interleaved across family/task source contracts.
     pub fn sample_ruliad_validation_probe_items_stratified_fixed(
         &self,
@@ -1011,30 +1110,33 @@ fn stratified_ruliad_validation_probe_items(
     if max_items == 0 || difficulty_levels == 0 || storage.corpus.ruliad_config().is_none() {
         return Vec::new();
     }
-    let Some(source_selection) = &storage.source_selection else {
+    if storage.source_selection.is_none() {
+        return Vec::new();
+    }
+    let Some(corpus_config) = storage.corpus.ruliad_config() else {
         return Vec::new();
     };
+    let first_difficulty = corpus_config.source_selection.difficulty_levels.min;
     let mut grouped = BTreeMap::<usize, BTreeMap<(String, String), Vec<String>>>::new();
-    for candidate in source_selection
-        .sampler
-        .lock()
-        .expect("ruliad source sampler lock poisoned")
-        .candidates()
-    {
-        if task_kind.is_some_and(|task_kind| candidate.task_kind != task_kind) {
-            continue;
+    for difficulty_level in first_difficulty..first_difficulty.saturating_add(difficulty_levels) {
+        for candidate in burn_dragon_universality::ruliad_sampler_candidates_for_difficulty(
+            corpus_config,
+            difficulty_level,
+        ) {
+            if task_kind.is_some_and(|task_kind| candidate.task_kind != task_kind) {
+                continue;
+            }
+            grouped
+                .entry(candidate.difficulty_level)
+                .or_default()
+                .entry((candidate.family, candidate.task_kind))
+                .or_default()
+                .push(candidate.oracle_hash);
         }
-        grouped
-            .entry(candidate.difficulty_level)
-            .or_default()
-            .entry((candidate.family.clone(), candidate.task_kind.clone()))
-            .or_default()
-            .push(candidate.oracle_hash.clone());
     }
 
     let strata = grouped
         .into_iter()
-        .take(difficulty_levels)
         .filter_map(|(difficulty_level, groups)| {
             let mut groups = groups.into_values().collect::<Vec<_>>();
             for labels in &mut groups {

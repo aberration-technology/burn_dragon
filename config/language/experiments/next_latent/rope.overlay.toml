@@ -1,0 +1,3 @@
+# Reference BDH positional family, without exponential rho decay.
+[model]
+rotary_embedding = "rope"

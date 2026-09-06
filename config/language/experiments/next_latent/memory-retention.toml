@@ -1,0 +1,16 @@
+extends = ["capacity-base.toml", "conditional-answer.overlay.toml", "alibi-reference.overlay.toml", "memory-long.overlay.toml"]
+
+[dataset]
+config = "config/language/experiments/next_latent/memory-retention.corpus.toml"
+
+[training]
+seed = 29
+batch_size = 8
+max_iters = 16384
+checkpoint_interval_iters = 512
+
+[training.validation.ruliad_panel]
+base_difficulty_levels = 2
+
+[training.events]
+ruliad_correctness_probe_items = 128

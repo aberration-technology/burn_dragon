@@ -270,6 +270,14 @@ impl<B: Backend> DragonModel<B> {
     }
 
     pub(super) fn project_hidden_to_logits(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
+        self.project_hidden_to_logits_with_parameter_gradients(hidden, true)
+    }
+
+    fn project_hidden_to_logits_with_parameter_gradients(
+        &self,
+        hidden: Tensor<B, 3>,
+        parameter_gradients: bool,
+    ) -> Tensor<B, 3> {
         assert!(
             self.language_head.uses_flat_token_logits(),
             "flat token logits are not available for the configured NCA factorized language head; use hidden-state loss helpers instead"
@@ -284,6 +292,11 @@ impl<B: Backend> DragonModel<B> {
                 .as_ref()
                 .expect("flat language-model head weights missing")
                 .val()
+        };
+        let head = if parameter_gradients {
+            head
+        } else {
+            head.detach()
         };
         let logits = hidden.reshape([batch * time, dim]).matmul(head).reshape([
             batch,
@@ -301,6 +314,15 @@ impl<B: Backend> DragonModel<B> {
         hidden: Tensor<B, 3>,
         step: usize,
     ) -> Tensor<B, 3> {
+        self.apply_latent_decoder_step_conditioning_with_parameter_gradients(hidden, step, true)
+    }
+
+    fn apply_latent_decoder_step_conditioning_with_parameter_gradients(
+        &self,
+        hidden: Tensor<B, 3>,
+        step: usize,
+        parameter_gradients: bool,
+    ) -> Tensor<B, 3> {
         if !self.latent_reasoning.step_conditioned_decoder
             || self.latent_reasoning.step_conditioned_decoder_scale <= f32::EPSILON
         {
@@ -315,8 +337,13 @@ impl<B: Backend> DragonModel<B> {
             return hidden;
         }
         let step = step.min(steps - 1);
-        let bias = embedding
-            .val()
+        let weight = embedding.val();
+        let weight = if parameter_gradients {
+            weight
+        } else {
+            weight.detach()
+        };
+        let bias = weight
             .slice([step..step + 1, 0..dim])
             .reshape([1, 1, dim])
             .repeat_dim(0, batch)
@@ -336,6 +363,17 @@ impl<B: Backend> DragonModel<B> {
 
     pub fn logits_from_hidden(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
         self.project_hidden_to_logits_for_latent_step(hidden, self.latent_decoder_step())
+    }
+
+    /// Preserve the hidden-input derivative without training the decoder or its
+    /// step-conditioning parameters through an auxiliary distillation branch.
+    pub fn logits_from_hidden_with_frozen_head(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
+        let hidden = self.apply_latent_decoder_step_conditioning_with_parameter_gradients(
+            hidden,
+            self.latent_decoder_step(),
+            false,
+        );
+        self.project_hidden_to_logits_with_parameter_gradients(hidden, false)
     }
 
     pub fn logits_from_hidden_for_latent_step(

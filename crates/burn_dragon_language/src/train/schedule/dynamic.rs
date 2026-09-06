@@ -324,6 +324,7 @@ where
         let mut accumulation_current = 0usize;
         let mut last_lr = 0.0;
         let mut stop_requested = false;
+        let mut token_exposure = TrainingTokenExposure::default();
 
         while let Some(item) = iterator.next() {
             if let Some(reason) = training_interruption_reason(&event_handles.interrupter) {
@@ -345,6 +346,15 @@ where
             }
 
             model.set_recovery_auxiliary_active(dynamics_control.recovery_auxiliary_active());
+            let [rows, time] = item.inputs.dims();
+            token_exposure.observe(
+                rows.saturating_mul(time),
+                if item.loss_mask.is_none() {
+                    Some(rows.saturating_mul(time))
+                } else {
+                    item.supervised_token_count
+                },
+            );
             let reset_stream_state = item.reset_stream_state;
             let (item, selected_context) = if let Some(routing) = context_routing.as_mut() {
                 let decision = routing.route(&model, &item, absolute_step)?;
@@ -431,7 +441,7 @@ where
             }
 
             if log_train_metrics && let Some(mean_train_loss) = mean_train_loss {
-                let _ = bus.send_metric_sample(TrainingMetricSample {
+                let metric = TrainingMetricSample {
                     run_id: env.run_name.to_string().into(),
                     split: TrainingMetricSplit::Train,
                     epoch,
@@ -440,7 +450,14 @@ where
                     name: train_loss_metric_name(env.training).to_string(),
                     value: mean_train_loss,
                     running_value: mean_train_loss,
-                });
+                };
+                let _ = bus.send_metric_sample(metric.clone());
+                if let Some(name) = train_objective_metric_name(env.training, absolute_step) {
+                    let _ = bus.send_metric_sample(TrainingMetricSample {
+                        name: name.to_string(),
+                        ..metric
+                    });
+                }
                 let _ = bus.send_metric_sample(TrainingMetricSample {
                     run_id: env.run_name.to_string().into(),
                     split: TrainingMetricSplit::Train,
@@ -460,6 +477,18 @@ where
                     &bus,
                 );
                 emit_latent_reasoning_telemetry(env, epoch, iteration, absolute_step, &bus);
+                for (name, value) in token_exposure.metrics() {
+                    let _ = bus.send_metric_sample(TrainingMetricSample {
+                        run_id: env.run_name.to_string().into(),
+                        split: TrainingMetricSplit::Train,
+                        epoch,
+                        step_in_epoch: iteration,
+                        absolute_step,
+                        name: name.to_string(),
+                        value,
+                        running_value: value,
+                    });
+                }
             }
             if emit_step_events {
                 let _ = bus.send_step_finished(StepFinished {
@@ -863,10 +892,7 @@ where
         let loss = mean_scalar_from_loss(loss_tensor);
         count += 1;
         supervised_loss.observe(loss, supervised_tokens);
-        let absolute_step = epoch
-            .saturating_sub(1)
-            .saturating_mul(steps_per_epoch)
-            .saturating_add(count.saturating_sub(1));
+        let absolute_step = training_absolute_step;
         if let Some(degeneracy) = degeneracy {
             emit_output_degeneracy(env, epoch, probe_absolute_step, &degeneracy, bus);
             output_degeneracy = Some(degeneracy);
@@ -925,10 +951,7 @@ where
         bus,
     );
     if env.training.tbptt_persist_across_steps && mean.is_finite() {
-        let absolute_step = epoch
-            .saturating_sub(1)
-            .saturating_mul(steps_per_epoch)
-            .saturating_add(count);
+        let absolute_step = training_absolute_step;
         let _ = bus.send_metric_sample(TrainingMetricSample {
             run_id: env.run_name.to_string().into(),
             split: TrainingMetricSplit::Valid,
@@ -943,11 +966,14 @@ where
     let source_weighted_loss = run_source_weighted_validation(
         env,
         &valid_model,
-        epoch,
         steps_per_epoch,
         batch_size,
-        bus,
         context_routing,
+        TrainingEventContext {
+            epoch,
+            absolute_step: training_absolute_step,
+            bus,
+        },
     )?;
     let correctness_request = RuliadCorrectnessValidation {
         run_name: env.run_name,
@@ -976,6 +1002,9 @@ where
     let ruliad_eval_report = ruliad_validation
         .as_ref()
         .map(|validation| validation.free_run.clone());
+    let ruliad_constrained_policy = ruliad_validation
+        .as_ref()
+        .and_then(|validation| validation.constrained_policy.clone());
     let ruliad_policy_rollout =
         ruliad_validation.and_then(|validation| validation.closed_loop_policy);
     if let Some(report) = ruliad_eval_report.as_ref() {
@@ -999,6 +1028,7 @@ where
         let deployment_capability_gate = ruliad_deployment_capability_gate_status(
             ruliad_eval_report.as_ref(),
             ruliad_policy_rollout.as_ref(),
+            ruliad_constrained_policy.as_ref(),
             output_degeneracy.as_ref(),
             env.training,
         );
@@ -1018,11 +1048,13 @@ where
             Some(run_stream_warm_validation(
                 env,
                 model,
-                epoch,
-                steps_per_epoch,
                 batch_size,
-                bus,
                 context_routing,
+                TrainingEventContext {
+                    epoch,
+                    absolute_step: training_absolute_step,
+                    bus,
+                },
             )?)
         } else {
             None
@@ -1049,10 +1081,7 @@ where
         } else {
             source_weighted_loss / mean
         };
-        let absolute_step = epoch
-            .saturating_sub(1)
-            .saturating_mul(steps_per_epoch)
-            .saturating_add(count);
+        let absolute_step = training_absolute_step;
         for (name, value) in [
             ("Source Weighted Loss Delta", delta),
             ("Source Weighted Loss Ratio", ratio),
@@ -1104,22 +1133,27 @@ where
         output_degeneracy,
         ruliad_eval_report,
         ruliad_policy_rollout,
+        ruliad_constrained_policy,
     })
 }
 
 pub(super) fn run_stream_warm_validation<B>(
     env: &TrainEnvironment<'_, B>,
     model: &LanguageTrainModel<B>,
-    epoch: usize,
-    steps_per_epoch: usize,
     batch_size: usize,
-    bus: &TrainingEventBus,
     context_routing: Option<&crate::train::PredictiveContextRoutingRuntime<B>>,
+    event: TrainingEventContext<'_>,
 ) -> Result<StreamWarmValidationReport>
 where
     B: AutodiffBackend + Clone + 'static,
     B::Device: Clone,
 {
+    // Validation advances its own batch counter, never the training clock.
+    let TrainingEventContext {
+        epoch,
+        absolute_step,
+        bus,
+    } = event;
     let Some(valid_dataset) = env.valid_dataset.as_ref() else {
         return Ok(StreamWarmValidationReport::default());
     };
@@ -1152,16 +1186,19 @@ where
         })
         .unwrap_or_default();
     let iterator = loader.iter();
-    let mut total = 0.0;
     let mut count = 0usize;
-    let mut paired_warm_total = 0.0;
-    let mut paired_cold_total = 0.0;
+    let mut warm = SupervisedValidationLoss::default();
+    let mut paired_warm = SupervisedValidationLoss::default();
+    let mut paired_cold = SupervisedValidationLoss::default();
     let mut paired_count = 0usize;
     let probe = &env.training.sequence_state_probe;
     for item in iterator {
-        let paired_item =
-            (probe.enabled && !item.reset_stream_state && paired_count < probe.paired_batches)
-                .then(|| item.clone());
+        let supervised_tokens = sequence_batch_supervised_tokens(&item);
+        let paired_item = (probe.enabled
+            && supervised_tokens > 0
+            && !item.reset_stream_state
+            && paired_count < probe.paired_batches)
+            .then(|| item.clone());
         let (output, selected_route) = if let Some(router) = context_router.as_ref() {
             let route = router.select_batch(&valid_model, &item)?;
             let route_state = context_states
@@ -1180,20 +1217,19 @@ where
         let loss_value: LossValue<ValidBackend<B>> = output.adapt();
         let loss = mean_scalar_from_loss(loss_value.value());
         count += 1;
-        total += loss;
-        let _ = bus.send_metric_sample(TrainingMetricSample {
-            run_id: env.run_name.to_string().into(),
-            split: TrainingMetricSplit::Valid,
-            epoch,
-            step_in_epoch: count,
-            absolute_step: epoch
-                .saturating_sub(1)
-                .saturating_mul(steps_per_epoch)
-                .saturating_add(count.saturating_sub(1)),
-            name: METRIC_STREAM_WARM_LOSS.to_string(),
-            value: loss,
-            running_value: total / count as f64,
-        });
+        warm.observe(loss, supervised_tokens);
+        if supervised_tokens > 0 {
+            let _ = bus.send_metric_sample(TrainingMetricSample {
+                run_id: env.run_name.to_string().into(),
+                split: TrainingMetricSplit::Valid,
+                epoch,
+                step_in_epoch: count,
+                absolute_step,
+                name: METRIC_STREAM_WARM_LOSS.to_string(),
+                value: loss,
+                running_value: warm.mean().expect("nonempty supervised batch"),
+            });
+        }
         if let Some(cold_item) = paired_item {
             let cold_output = if let Some(route) = selected_route {
                 let mut cold_state = valid_model.model.init_state();
@@ -1208,24 +1244,20 @@ where
             };
             let cold_loss_value: LossValue<ValidBackend<B>> = cold_output.adapt();
             let cold_loss = mean_scalar_from_loss(cold_loss_value.value());
-            paired_warm_total += loss;
-            paired_cold_total += cold_loss;
+            paired_warm.observe(loss, supervised_tokens);
+            paired_cold.observe(cold_loss, supervised_tokens);
             paired_count = paired_count.saturating_add(1);
         }
     }
 
-    let absolute_step = epoch
-        .saturating_sub(1)
-        .saturating_mul(steps_per_epoch)
-        .saturating_add(count);
     let mut report = StreamWarmValidationReport {
-        warm_loss: (count > 0).then_some(total / count as f64),
+        warm_loss: warm.mean(),
         paired_batches: paired_count,
         ..Default::default()
     };
     if paired_count > 0 {
-        let paired_warm_loss = paired_warm_total / paired_count as f64;
-        let paired_cold_loss = paired_cold_total / paired_count as f64;
+        let paired_warm_loss = paired_warm.mean().expect("nonempty paired supervision");
+        let paired_cold_loss = paired_cold.mean().expect("nonempty paired supervision");
         let carry_nll_gain = paired_cold_loss - paired_warm_loss;
         let carry_relative_gain = if paired_cold_loss.abs() <= f64::EPSILON {
             0.0
@@ -1254,6 +1286,29 @@ where
                 running_value: value,
             });
         }
+    }
+    for (name, value) in [
+        ("Stream Validation Contract Version", 2.0),
+        (
+            "Stream Validation Supervision Weight",
+            warm.supervised_tokens as f64,
+        ),
+        ("Stream Validation Empty Batches", warm.empty_batches as f64),
+        (
+            "Stream Paired Supervision Weight",
+            paired_warm.supervised_tokens as f64,
+        ),
+    ] {
+        let _ = bus.send_metric_sample(TrainingMetricSample {
+            run_id: env.run_name.to_string().into(),
+            split: TrainingMetricSplit::Valid,
+            epoch,
+            step_in_epoch: count.saturating_add(1),
+            absolute_step,
+            name: name.to_string(),
+            value,
+            running_value: value,
+        });
     }
     let diagnostics = if !probe.enabled {
         None
@@ -1358,10 +1413,7 @@ where
         let loss = mean_scalar_from_loss(loss_tensor);
         count += 1;
         supervised_loss.observe(loss, supervised_tokens);
-        let absolute_step = epoch
-            .saturating_sub(1)
-            .saturating_mul(steps_per_epoch)
-            .saturating_add(count.saturating_sub(1));
+        let absolute_step = training_absolute_step;
         if let Some(degeneracy) = degeneracy {
             emit_output_degeneracy_sample(
                 env.run_name,
@@ -1426,8 +1478,16 @@ where
         supervised_loss,
         bus,
     );
-    let source_weighted_loss =
-        run_source_weighted_validation_forward_only(env, model, epoch, steps_per_epoch, bus)?;
+    let source_weighted_loss = run_source_weighted_validation_forward_only(
+        env,
+        model,
+        steps_per_epoch,
+        TrainingEventContext {
+            epoch,
+            absolute_step: training_absolute_step,
+            bus,
+        },
+    )?;
     let ruliad_validation = run_ruliad_correctness_validation(RuliadCorrectnessValidation {
         run_name: env.run_name,
         run_dir: env.run_dir,
@@ -1446,6 +1506,9 @@ where
     let ruliad_eval_report = ruliad_validation
         .as_ref()
         .map(|validation| validation.free_run.clone());
+    let ruliad_constrained_policy = ruliad_validation
+        .as_ref()
+        .and_then(|validation| validation.constrained_policy.clone());
     let ruliad_policy_rollout =
         ruliad_validation.and_then(|validation| validation.closed_loop_policy);
     if let Some(report) = ruliad_eval_report.as_ref() {
@@ -1469,6 +1532,7 @@ where
         let deployment_capability_gate = ruliad_deployment_capability_gate_status(
             ruliad_eval_report.as_ref(),
             ruliad_policy_rollout.as_ref(),
+            ruliad_constrained_policy.as_ref(),
             output_degeneracy.as_ref(),
             env.training,
         );
@@ -1492,10 +1556,7 @@ where
         } else {
             source_weighted_loss / mean
         };
-        let absolute_step = epoch
-            .saturating_sub(1)
-            .saturating_mul(steps_per_epoch)
-            .saturating_add(count);
+        let absolute_step = training_absolute_step;
         for (name, value) in [
             ("Source Weighted Loss Delta", delta),
             ("Source Weighted Loss Ratio", ratio),
@@ -1543,6 +1604,7 @@ where
         output_degeneracy,
         ruliad_eval_report,
         ruliad_policy_rollout,
+        ruliad_constrained_policy,
     })
 }
 
@@ -1569,5 +1631,18 @@ mod validation_accounting_tests {
         summary.observe(0.0, 0);
 
         assert_eq!(summary.mean(), None);
+    }
+
+    #[test]
+    fn paired_carry_gain_uses_identical_nonempty_token_weights() {
+        let mut warm = SupervisedValidationLoss::default();
+        let mut cold = SupervisedValidationLoss::default();
+        for (warm_loss, cold_loss, tokens) in [(0.0, 0.0, 0), (2.0, 3.0, 2), (1.0, 1.0, 6)] {
+            warm.observe(warm_loss, tokens);
+            cold.observe(cold_loss, tokens);
+        }
+        assert_eq!(warm.supervised_batches, 2);
+        assert_eq!(warm.supervised_tokens, cold.supervised_tokens);
+        assert_eq!(cold.mean().unwrap() - warm.mean().unwrap(), 0.25);
     }
 }

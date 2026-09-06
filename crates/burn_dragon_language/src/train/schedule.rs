@@ -27,6 +27,9 @@ use std::marker::PhantomData;
 const CHECKPOINT_KEEP_LAST: usize = 2;
 const METRIC_LOSS: &str = "Loss";
 const METRIC_STREAM_WARM_LOSS: &str = "Stream Warm Loss";
+const METRIC_RULIAD_PROOF_POLICY_LOSS: &str = "Ruliad Proof Policy Loss";
+const METRIC_RULIAD_JOINT_POLICY_LOSS: &str = "Ruliad Joint Language Policy Loss";
+const METRIC_RULIAD_PROMPT_VALUE_BINDING_LOSS: &str = "Ruliad Prompt Value Binding Loss";
 const METRIC_RANDOM_COLD_LOSS: &str = "Random Cold Loss";
 const METRIC_STREAM_PAIRED_WARM_LOSS: &str = "Stream Paired Warm Loss";
 const METRIC_STREAM_PAIRED_COLD_LOSS: &str = "Stream Paired Cold Loss";
@@ -98,6 +101,7 @@ struct DynamicValidationReport {
     output_degeneracy: Option<crate::train::steps::OutputDegeneracyStats>,
     ruliad_eval_report: Option<burn_dragon_universality::RuliadEvalReport>,
     ruliad_policy_rollout: Option<RuliadPolicyRolloutProbeResult>,
+    ruliad_constrained_policy: Option<RuliadCorrectnessConstrainedPolicyResult>,
 }
 
 struct DynamicValidation<'a, 'env, B: AutodiffBackend> {
@@ -542,6 +546,7 @@ fn validation_capability_gate_status(
     ruliad_deployment_capability_gate_status(
         validation.ruliad_eval_report.as_ref(),
         validation.ruliad_policy_rollout.as_ref(),
+        validation.ruliad_constrained_policy.as_ref(),
         validation.output_degeneracy.as_ref(),
         training,
     )
@@ -550,6 +555,7 @@ fn validation_capability_gate_status(
 fn ruliad_deployment_capability_gate_status(
     free_run: Option<&burn_dragon_universality::RuliadEvalReport>,
     closed_loop_policy: Option<&RuliadPolicyRolloutProbeResult>,
+    constrained_policy: Option<&RuliadCorrectnessConstrainedPolicyResult>,
     output_degeneracy: Option<&crate::train::steps::OutputDegeneracyStats>,
     training: &crate::config::TrainingHyperparameters,
 ) -> RuliadCapabilityGateStatus {
@@ -579,6 +585,15 @@ fn ruliad_deployment_capability_gate_status(
             ),
             None => reasons.push("closed_loop_policy:missing_probe".to_string()),
         }
+        reasons.extend(
+            ruliad_policy_context_binding_gate_status(
+                constrained_policy,
+                training.ruliad_policy_probe.promotion_gate,
+            )
+            .reasons
+            .into_iter()
+            .map(|reason| format!("context_binding:{reason}")),
+        );
     }
     RuliadCapabilityGateStatus {
         passed: reasons.is_empty(),
@@ -893,8 +908,12 @@ fn update_ruliad_recovery_competence(
     let policy_candidate = || {
         let rollout = validation.ruliad_policy_rollout.as_ref()?;
         let competence = ruliad_policy_competence_key(rollout)?;
-        ruliad_policy_promotion_gate_status(rollout.summary, policy_gate)
-            .passed
+        (ruliad_policy_promotion_gate_status(rollout.summary, policy_gate).passed
+            && ruliad_policy_context_binding_gate_status(
+                validation.ruliad_constrained_policy.as_ref(),
+                policy_gate,
+            )
+            .passed)
             .then_some(competence)
     };
 
@@ -994,6 +1013,11 @@ fn should_promote_checkpoint(
             training.ruliad_policy_probe.promotion_gate,
         )
         .passed
+            || !ruliad_policy_context_binding_gate_status(
+                validation.ruliad_constrained_policy.as_ref(),
+                training.ruliad_policy_probe.promotion_gate,
+            )
+            .passed
         {
             return None;
         }
@@ -1480,8 +1504,11 @@ mod dynamics;
 mod eggroll;
 mod latent_validation;
 mod ruliad_evaluation;
+mod ruliad_policy_controls;
 mod ruliad_rollout;
+mod ruliad_structured_decode;
 mod ruliad_suite;
+mod ruliad_teacher_forced;
 mod ruliad_validation;
 mod telemetry;
 
@@ -1490,7 +1517,10 @@ use dynamic::*;
 use dynamics::*;
 use latent_validation::*;
 use ruliad_evaluation::*;
+use ruliad_policy_controls::*;
 use ruliad_rollout::*;
+use ruliad_structured_decode::*;
+use ruliad_teacher_forced::*;
 use ruliad_validation::*;
 use telemetry::*;
 
@@ -1503,10 +1533,15 @@ pub(crate) use eggroll::{
     autotune_eggroll_population_chunk_size, train_with_eggroll_forward_only, train_with_scheduler,
 };
 pub use ruliad_evaluation::{RuliadModelEvaluation, evaluate_ruliad_model_free_run};
+pub use ruliad_policy_controls::{
+    RuliadPolicyControlEvaluation, RuliadPolicyControlItem, RuliadPolicyControlSummary,
+};
+pub use ruliad_structured_decode::RuliadStructuredPolicyEvaluation;
 pub use ruliad_suite::{
     RuliadConstrainedPolicyEvaluation, RuliadEvaluationSuiteOptions, RuliadEvaluationSuiteReport,
     RuliadPolicyRolloutEvaluation, evaluate_ruliad_model_suite,
 };
+pub use ruliad_teacher_forced::RuliadTeacherForcedEvaluation;
 
 #[cfg(test)]
 mod tests;

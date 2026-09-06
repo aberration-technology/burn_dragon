@@ -1,0 +1,6 @@
+extends = ["structural-eval.corpus.toml"]
+
+# New seed reserved for the completed mastery-first continuation.
+seed = 8817304
+name = "nextlat-mastery-confirmatory-structural"
+validation_samples = 1024

@@ -1,0 +1,59 @@
+# Frozen-weight component ablation; not training or independent learner seeds.
+version = 1
+output = "target/experiments/ruliad-policy-scoring-controls"
+repositories = [".", "../burn_pc", "../burn_ecs", "../burn_eggroll", "../burn_p2p"]
+
+[limits]
+system_fraction = 0.90
+headroom_mib = 4096
+poll_seconds = 0.25
+gpu_sample_seconds = 2.0
+shared_gpu_memory = true
+
+[[cases]]
+id = "adamw-residual-energy"
+gpu = true
+expected_peak_mib = 16384
+timeout_seconds = 300
+argv = ["target/release/examples/evaluate_ruliad_checkpoint","--backend","cuda","--checkpoint","target/experiment-inputs/evaluation-contract/adamw","--epoch","8","--panel-seed","73","--free-run-items","16","--policy-items","256","--difficulty-levels","4","--batch-size","2","--policy-scoring","residual_energy","--no-closed-loop-rollout","--output","{output}/adamw-residual-energy-seed13.json"]
+inputs = ["target/experiment-inputs/evaluation-contract/adamw/checkpoint/model-8.bin","target/experiment-inputs/evaluation-contract/adamw/checkpoint/model-config-8.json","target/experiment-inputs/evaluation-contract/adamw/training_config.json","target/experiment-inputs/evaluation-contract/adamw/config.json","crates/burn_dragon_p2p/deploy/profiles/ruliad-r3.semantic-action.corpus.toml"]
+
+[[cases]]
+id = "adamw-completion-likelihood"
+gpu = true
+expected_peak_mib = 16384
+timeout_seconds = 300
+argv = ["target/release/examples/evaluate_ruliad_checkpoint","--backend","cuda","--checkpoint","target/experiment-inputs/evaluation-contract/adamw","--epoch","8","--panel-seed","73","--free-run-items","16","--policy-items","256","--difficulty-levels","4","--batch-size","2","--policy-scoring","completion_likelihood","--no-closed-loop-rollout","--output","{output}/adamw-completion-likelihood-seed13.json"]
+inputs = ["target/experiment-inputs/evaluation-contract/adamw/checkpoint/model-8.bin","target/experiment-inputs/evaluation-contract/adamw/checkpoint/model-config-8.json","target/experiment-inputs/evaluation-contract/adamw/training_config.json","target/experiment-inputs/evaluation-contract/adamw/config.json","crates/burn_dragon_p2p/deploy/profiles/ruliad-r3.semantic-action.corpus.toml"]
+
+[[cases]]
+id = "adamw-semantic-energy"
+gpu = true
+expected_peak_mib = 16384
+timeout_seconds = 300
+argv = ["target/release/examples/evaluate_ruliad_checkpoint","--backend","cuda","--checkpoint","target/experiment-inputs/evaluation-contract/adamw","--epoch","8","--panel-seed","73","--free-run-items","16","--policy-items","256","--difficulty-levels","4","--batch-size","2","--policy-scoring","semantic_energy","--no-closed-loop-rollout","--output","{output}/adamw-semantic-energy-seed13.json"]
+inputs = ["target/experiment-inputs/evaluation-contract/adamw/checkpoint/model-8.bin","target/experiment-inputs/evaluation-contract/adamw/checkpoint/model-config-8.json","target/experiment-inputs/evaluation-contract/adamw/training_config.json","target/experiment-inputs/evaluation-contract/adamw/config.json","crates/burn_dragon_p2p/deploy/profiles/ruliad-r3.semantic-action.corpus.toml"]
+
+[[cases]]
+id = "pc-residual-energy"
+gpu = true
+expected_peak_mib = 16384
+timeout_seconds = 300
+argv = ["target/release/examples/evaluate_ruliad_checkpoint","--backend","cuda","--checkpoint","target/experiment-inputs/evaluation-contract/pc","--epoch","8","--panel-seed","73","--free-run-items","16","--policy-items","256","--difficulty-levels","4","--batch-size","2","--policy-scoring","residual_energy","--no-closed-loop-rollout","--output","{output}/pc-residual-energy-seed13.json"]
+inputs = ["target/experiment-inputs/evaluation-contract/pc/checkpoint/model-8.bin","target/experiment-inputs/evaluation-contract/pc/checkpoint/model-config-8.json","target/experiment-inputs/evaluation-contract/pc/training_config.json","target/experiment-inputs/evaluation-contract/pc/config.json","crates/burn_dragon_p2p/deploy/profiles/ruliad-r3.semantic-action.corpus.toml"]
+
+[[cases]]
+id = "pc-completion-likelihood"
+gpu = true
+expected_peak_mib = 16384
+timeout_seconds = 300
+argv = ["target/release/examples/evaluate_ruliad_checkpoint","--backend","cuda","--checkpoint","target/experiment-inputs/evaluation-contract/pc","--epoch","8","--panel-seed","73","--free-run-items","16","--policy-items","256","--difficulty-levels","4","--batch-size","2","--policy-scoring","completion_likelihood","--no-closed-loop-rollout","--output","{output}/pc-completion-likelihood-seed13.json"]
+inputs = ["target/experiment-inputs/evaluation-contract/pc/checkpoint/model-8.bin","target/experiment-inputs/evaluation-contract/pc/checkpoint/model-config-8.json","target/experiment-inputs/evaluation-contract/pc/training_config.json","target/experiment-inputs/evaluation-contract/pc/config.json","crates/burn_dragon_p2p/deploy/profiles/ruliad-r3.semantic-action.corpus.toml"]
+
+[[cases]]
+id = "pc-semantic-energy"
+gpu = true
+expected_peak_mib = 16384
+timeout_seconds = 300
+argv = ["target/release/examples/evaluate_ruliad_checkpoint","--backend","cuda","--checkpoint","target/experiment-inputs/evaluation-contract/pc","--epoch","8","--panel-seed","73","--free-run-items","16","--policy-items","256","--difficulty-levels","4","--batch-size","2","--policy-scoring","semantic_energy","--no-closed-loop-rollout","--output","{output}/pc-semantic-energy-seed13.json"]
+inputs = ["target/experiment-inputs/evaluation-contract/pc/checkpoint/model-8.bin","target/experiment-inputs/evaluation-contract/pc/checkpoint/model-config-8.json","target/experiment-inputs/evaluation-contract/pc/training_config.json","target/experiment-inputs/evaluation-contract/pc/config.json","crates/burn_dragon_p2p/deploy/profiles/ruliad-r3.semantic-action.corpus.toml"]

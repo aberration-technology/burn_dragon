@@ -145,6 +145,20 @@ pub fn build_model_config(overrides: &ModelOverrides, training_block_size: usize
             .fused_kernels
             .set_rotary_embedding(rotary_embedding);
     }
+    if let Some(slopes) = &overrides.alibi_slopes {
+        assert!(
+            model_config.fused_kernels.rotary_embedding == burn_dragon_core::RotaryEmbedding::Alibi
+                && model_config.sequence_kernel.memory_system
+                    == burn_dragon_core::SequenceMemorySystem::LinearAttention,
+            "model.alibi_slopes requires ALiBi linear attention"
+        );
+        burn_dragon_core::kernel::linear_attention::validate_alibi_slopes(
+            slopes,
+            model_config.n_head,
+        )
+        .unwrap_or_else(|error| panic!("invalid model config: {error}"));
+        model_config.fused_kernels.set_alibi_slopes(slopes.clone());
+    }
     if let Some(y_neuron_recurrence) = &overrides.y_neuron_recurrence {
         model_config.y_neuron_recurrence = y_neuron_recurrence.clone();
     }
@@ -311,6 +325,44 @@ mod tests {
     use burn_dragon_core::{
         DragonConfig, DragonInitializationConfig, DragonInitializationKind, ResidualConnectorKind,
     };
+
+    #[test]
+    fn alibi_override_roundtrips_and_preserves_unspecified_checkpoint_config() {
+        let defaults = ModelOverrides::default();
+        assert!(
+            serde_json::to_value(&defaults)
+                .unwrap()
+                .get("alibi_slopes")
+                .is_none()
+        );
+        assert!(
+            build_model_config(&defaults, 256)
+                .fused_kernels
+                .alibi_slopes
+                .is_none()
+        );
+        let overrides: ModelOverrides = toml::from_str(
+            "n_head = 4\nrotary_embedding = 'alibi'\nalibi_slopes = [0.25, 0.0625, 0.015625, 0.00390625]"
+        ).unwrap();
+        let config = build_model_config(&overrides, 256);
+        assert_eq!(config.fused_kernels.alibi_slopes, overrides.alibi_slopes);
+        let restored: DragonConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(config, restored);
+    }
+
+    #[test]
+    #[should_panic(expected = "one slope per head")]
+    fn alibi_inference_override_rejects_wrong_head_count() {
+        build_model_config(
+            &ModelOverrides {
+                n_head: Some(4),
+                alibi_slopes: Some(vec![0.25]),
+                ..Default::default()
+            },
+            256,
+        );
+    }
 
     #[test]
     fn backend_name_detection_accepts_wgpu_variants() {

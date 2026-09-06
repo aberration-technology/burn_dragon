@@ -1,0 +1,50 @@
+extends = "local-pc-verifier-1m-semantic-policy.toml"
+
+# Block-coordinate training over one three-step cycle:
+#   0: verifier-native legal-action policy
+#   1: exact policy prompt + supplied schema -> action field value
+#   2: ordinary causal answer rendering
+# Each optimizer step has one primary contract; no empirical objective weight
+# selects among policy learning, conditional value binding, and rendering.
+[training.ruliad_supervision.prompt_value_binding]
+enabled = true
+context = "proof_policy"
+objective = "full_completion"
+every_steps = 3
+phase_steps = 1
+start_after_steps = 0
+max_completion_tokens = 64
+max_rows_per_step = 32
+
+[model.sequence_score_head]
+enabled = true
+projection_dim = 64
+
+[training.ruliad_supervision.proof_policy]
+enabled = true
+require_scheduled_update = true
+mode = "static_then_paired_dagger"
+scoring = "residual_energy"
+decoder_calibration_steps = 0
+prompt_context = "local_action_state"
+target = "expert_set"
+gradient_scope = "policy_path"
+normalization = "candidate_conditional"
+candidate_symmetry = "balanced_rotation"
+presentation_risk = "mean"
+weight = 1.0
+every_steps = 3
+start_after_steps = 0
+dagger_start_after_steps = 192
+stratified_difficulty_levels = 4
+rollout_steps = 4
+max_rows_per_update = 32
+max_presentation_rows_per_update = 32
+counterfactual_targets_per_state = 1
+counterfactual_objective = "factorized_joint"
+candidates = 4
+max_completion_tokens = 128
+
+[training.local_predictive_coding]
+solver = "fixed_prediction"
+terminal_criterion = "ruliad_verifier_set"

@@ -1,0 +1,19 @@
+extends = ["credit-base.toml"]
+
+[dataset]
+config = "config/language/experiments/next_latent/in-distribution.corpus.toml"
+
+[training]
+batch_size = 4
+tbptt_credit_window_chunks = 4
+max_iters = 1024
+checkpoint_interval_iters = 256
+
+# Learning the training task and transferring to novel laws are separate checks.
+[training.validation.ruliad_panel]
+base_difficulty_levels = 1
+
+# Bound evaluation residency independently of the wider training model.
+[training.ruliad_probe_generation]
+max_batch_rows = 2
+max_in_flight_rows = 2

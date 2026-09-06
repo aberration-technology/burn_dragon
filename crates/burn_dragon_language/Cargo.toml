@@ -22,6 +22,7 @@ train = [
   "burn_dragon_train/train",
   "dep:burn-autodiff",
   "dep:burn-ndarray",
+  "dep:burn-store",
   "dep:burn-train",
   "dep:toml",
   "dep:ureq",
@@ -55,6 +56,7 @@ burn-autodiff = { workspace = true, optional = true }
 burn-collective = { workspace = true, optional = true }
 burn-cuda = { workspace = true, optional = true, features = ["std"] }
 burn-ndarray = { workspace = true, optional = true }
+burn-store = { workspace = true, optional = true, features = ["std"] }
 burn-train = { workspace = true, optional = true }
 burn_dragon_checkpoint = { workspace = true, default-features = false, optional = true }
 burn_dragon_core = { workspace = true, default-features = false }

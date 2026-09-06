@@ -2,6 +2,9 @@
 
 use super::*;
 
+mod token_exposure;
+pub(super) use token_exposure::TrainingTokenExposure;
+
 pub(super) fn dataset_eos_id(dataset: Option<&Arc<Dataset>>) -> Option<i64> {
     dataset
         .and_then(|dataset| dataset.tokenizer().eos_id())
@@ -43,6 +46,41 @@ pub(super) fn train_loss_metric_name(training: &TrainingHyperparameters) -> &'st
     }
 }
 
+/// A schedule-aware alias for the scalar actually optimized on this step.
+/// The generic loss metric remains present for existing gates and sinks.
+pub(super) fn train_objective_metric_name(
+    training: &TrainingHyperparameters,
+    absolute_step: usize,
+) -> Option<&'static str> {
+    let policy = training
+        .ruliad_supervision
+        .proof_policy_for_step(absolute_step);
+    let verifier_due = matches!(
+        training.local_predictive_coding.terminal_criterion,
+        crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSet
+            | crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSetJoint
+    ) && policy.enabled
+        && policy.every_steps > 0
+        && absolute_step >= policy.start_after_steps
+        && absolute_step.is_multiple_of(policy.every_steps);
+    if verifier_due {
+        return Some(match training.local_predictive_coding.terminal_criterion {
+            crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSet => {
+                METRIC_RULIAD_PROOF_POLICY_LOSS
+            }
+            crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSetJoint => {
+                METRIC_RULIAD_JOINT_POLICY_LOSS
+            }
+            _ => unreachable!("checked verifier terminal"),
+        });
+    }
+    training
+        .ruliad_supervision
+        .prompt_value_binding
+        .active_at_step(absolute_step)
+        .then_some(METRIC_RULIAD_PROMPT_VALUE_BINDING_LOSS)
+}
+
 pub(super) fn emit_source_selection_telemetry<B>(
     env: &TrainEnvironment<'_, B>,
     absolute_step: usize,
@@ -82,6 +120,7 @@ pub(super) fn emit_source_selection_telemetry_sample(
         crate::train::events::source_selection_sample_from_snapshot(
             run_name.to_string(),
             absolute_step,
+            dataset.source_selection_feedback_updates_enabled(),
             loss,
             &snapshot,
         ),
@@ -107,6 +146,7 @@ pub(super) fn emit_source_selection_capability_feedback_batch(
         crate::train::events::source_selection_sample_from_snapshot(
             run_name.to_string(),
             absolute_step,
+            dataset.source_selection_feedback_updates_enabled(),
             None,
             &snapshot,
         ),

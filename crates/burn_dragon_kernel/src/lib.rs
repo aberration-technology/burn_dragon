@@ -15,6 +15,9 @@ mod recurrent;
 mod relu_lowrank;
 mod sequence;
 
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_fusion_tests;
+
 pub mod api {
     //! Curated public surface for the fused execution layer.
     //!

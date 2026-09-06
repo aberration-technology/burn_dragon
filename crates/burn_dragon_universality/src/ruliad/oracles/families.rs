@@ -388,12 +388,15 @@ pub(super) fn generate_formal_spec(
     };
     let action_presentation_rotation = (task == RuliadTaskKind::SelectProofAction)
         .then(|| rng.next_usize(crate::ruliad::policy::DEFAULT_PROOF_ACTION_CANDIDATES));
+    let action_candidate_count = (task == RuliadTaskKind::SelectProofAction)
+        .then_some(crate::ruliad::policy::DEFAULT_PROOF_ACTION_CANDIDATES);
     Ok(RuliadSampleSpec::FormalProof {
         problem: bundle.problem,
         certificate: bundle.certificate,
         candidate,
         proof_step_index,
         action_presentation_rotation,
+        action_candidate_count,
         action_answer_contract,
         task,
     })

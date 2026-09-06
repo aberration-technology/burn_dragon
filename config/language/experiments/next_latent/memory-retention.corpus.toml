@@ -1,0 +1,15 @@
+extends = ["in-distribution.corpus.toml"]
+
+# A controlled distribution shift, not a production difficulty ceiling.
+[source_selection]
+difficulty_levels = { min = 0, max = 1 }
+
+[source_selection.sampler]
+exploration_floor = 1.0
+
+[source_selection.cold_start]
+enabled = true
+max_difficulty_level = 0
+hold_steps = 8191
+ramp_steps = 1
+release_requires_mastery = false

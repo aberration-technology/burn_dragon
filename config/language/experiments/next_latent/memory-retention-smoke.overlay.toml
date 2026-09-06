@@ -1,0 +1,12 @@
+[dataset]
+config = "config/language/experiments/next_latent/memory-retention-smoke.corpus.toml"
+
+[training]
+max_iters = 64
+checkpoint_interval_iters = 16
+
+[training.validation]
+batches = 4
+
+[training.events]
+ruliad_correctness_probe_items = 4

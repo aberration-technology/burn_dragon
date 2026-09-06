@@ -11,13 +11,14 @@ use burn::tensor::backend::Backend;
 pub use factory::build_dataset;
 pub use huggingface::HuggingFaceDataset;
 pub use scheduler::{
-    RandomDataLoader, RuliadPolicyBatch, RuliadPolicySample, SequenceBatch, SourceSelectedBatch,
-    SourceSelectedStreamBatch, StreamingDataLoader, TokenSequenceDataset, sample_batch_with_shape,
+    RandomDataLoader, RuliadPolicyBatch, RuliadPolicySample, RuliadPolicySamplingMetadata,
+    SequenceBatch, SourceSelectedBatch, SourceSelectedStreamBatch, StreamingDataLoader,
+    TokenSequenceDataset, sample_batch_with_shape,
 };
 pub(crate) use universality::ruliad_capability_feedback_from_report;
 pub use universality::{
-    RuliadSourceSelectionStateSnapshot, RuliadValidationProbeItem, RuliadValidationPromptMode,
-    UniversalityDataset,
+    RuliadSourceSelectionClock, RuliadSourceSelectionRestore, RuliadSourceSelectionStateSnapshot,
+    RuliadValidationProbeItem, RuliadValidationPromptMode, UniversalityDataset,
 };
 pub(crate) use validation_panel::resolve_ruliad_validation_panel;
 
@@ -83,6 +84,13 @@ impl Dataset {
         TokenSequenceDataset::source_selection_snapshot_at_step(self, absolute_step)
     }
 
+    pub fn source_selection_feedback_updates_enabled(&self) -> Option<bool> {
+        match self {
+            Dataset::HuggingFace(_) => None,
+            Dataset::Universality(dataset) => dataset.source_selection_feedback_updates_enabled(),
+        }
+    }
+
     pub fn record_ruliad_capability_feedback(
         &self,
         report: &burn_dragon_universality::RuliadEvalReport,
@@ -119,12 +127,12 @@ impl Dataset {
     pub fn write_source_selection_state(
         &self,
         path: &std::path::Path,
-        absolute_step_offset: usize,
+        completed_run_steps: usize,
     ) -> std::io::Result<Option<RuliadSourceSelectionStateSnapshot>> {
         match self {
             Dataset::HuggingFace(_) => Ok(None),
             Dataset::Universality(dataset) => {
-                dataset.write_source_selection_state(path, absolute_step_offset)
+                dataset.write_source_selection_state(path, completed_run_steps)
             }
         }
     }
@@ -249,6 +257,31 @@ impl Dataset {
         }
     }
 
+    pub fn sample_ruliad_task_probe_items_fixed(
+        &self,
+        panel_seed: u64,
+        max_items: usize,
+        task_kind: &str,
+        difficulty_levels: usize,
+    ) -> Vec<RuliadValidationProbeItem> {
+        match self {
+            Dataset::HuggingFace(_) => Vec::new(),
+            Dataset::Universality(dataset) => dataset.sample_ruliad_task_probe_items_fixed(
+                panel_seed,
+                max_items,
+                task_kind,
+                difficulty_levels,
+            ),
+        }
+    }
+
+    pub fn ruliad_semantic_fingerprint(&self) -> anyhow::Result<Option<String>> {
+        match self {
+            Dataset::HuggingFace(_) => Ok(None),
+            Dataset::Universality(dataset) => dataset.ruliad_semantic_fingerprint(),
+        }
+    }
+
     pub fn decode_ruliad_payload_tokens(
         &self,
         tokens: &[i64],
@@ -274,6 +307,30 @@ impl Dataset {
             Dataset::HuggingFace(_) => None,
             Dataset::Universality(dataset) => dataset.ruliad_document_end_token_id(),
         }
+    }
+
+    pub fn ruliad_supervision_audit(
+        &self,
+    ) -> Option<&burn_dragon_universality::ruliad::RuliadSupervisionAuditReport> {
+        match self {
+            Dataset::HuggingFace(_) => None,
+            Dataset::Universality(dataset) => dataset.ruliad_supervision_audit(),
+        }
+    }
+
+    pub fn ruliad_policy_audit_batch(
+        &self,
+        batch_size: usize,
+        stratified_difficulty_levels: usize,
+    ) -> Option<RuliadPolicyBatch> {
+        TokenSequenceDataset::source_selected_ruliad_policy_batch(
+            self,
+            DatasetSplit::Val,
+            0,
+            0,
+            batch_size,
+            stratified_difficulty_levels,
+        )
     }
 }
 

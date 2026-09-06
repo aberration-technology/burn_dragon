@@ -1,0 +1,5 @@
+# Equal aggregate problem/answer mass, derived from each document's token counts.
+# This task supplies a problem and final action, not an expert reasoning trace.
+[training.ruliad_supervision]
+mode = "trace_and_answer"
+balance_trace_answer_mass = true

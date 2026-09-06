@@ -9,7 +9,7 @@ use burn_dragon_universality::{
     RuliadTokenizationConfig, generate_nca_corpus, ruliad_sampler_candidates,
 };
 use burn_ndarray::NdArray;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use tempfile::tempdir;
 
@@ -823,9 +823,14 @@ fn live_ruliad_mastery_release_is_monotonic_and_checkpointed() {
         .expect("difficulty zero candidate");
     d0.capability_missing_ema = 1.0;
 
-    let restored =
-        LiveSourceSelectionState::from_snapshot(source_selection, corpus, candidates, snapshot)
-            .expect("restored source state");
+    let restored = LiveSourceSelectionState::from_snapshot(
+        source_selection,
+        corpus,
+        candidates,
+        snapshot,
+        RuliadSourceSelectionRestore::StartNewRun,
+    )
+    .expect("restored source state");
     assert!(
         high_difficulty_probability(&restored, 0, 1) > 0.0,
         "forgetting should shift adaptive probability without revoking an already released level"
@@ -870,7 +875,7 @@ fn live_ruliad_source_selection_state_handoff_continues_curriculum() {
         .write_source_selection_state(&state_path, 256)
         .expect("write source-selection state")
         .expect("source-selection snapshot");
-    assert_eq!(snapshot.absolute_step_offset, 256);
+    assert_eq!(snapshot.clock.next_global_step(), 256);
     assert_eq!(snapshot.control.difficulty_pressure, 2.5);
     assert_eq!(snapshot.control.hash_noise_max_probability, 0.25);
     assert!(
@@ -885,7 +890,10 @@ fn live_ruliad_source_selection_state_handoff_continues_curriculum() {
     let restored =
         UniversalityDataset::new_ruliad_on_the_fly(&config_path, 32, 2, &pretokenized_tokenizer())
             .expect("load fresh ruliad dataset")
-            .with_source_selection_state_path(Some(&state_path))
+            .with_source_selection_state_path(
+                Some(&state_path),
+                RuliadSourceSelectionRestore::StartNewRun,
+            )
             .expect("restore source-selection state");
     let restored_state = live_source_selection_state(&restored);
     assert!(
@@ -908,6 +916,225 @@ fn live_ruliad_source_selection_state_handoff_continues_curriculum() {
     );
 }
 
+fn clock_regression_state() -> (
+    LiveSourceSelectionState,
+    burn_dragon_universality::RuliadCorpusConfig,
+) {
+    let mut corpus = live_ruliad_runtime_config();
+    corpus.source_selection.difficulty_levels =
+        burn_dragon_universality::UsizeRangeConfig { min: 0, max: 1 };
+    corpus.source_selection.sampler.exploration_floor = 1.0;
+    corpus.source_selection.cold_start =
+        burn_dragon_universality::RuliadSourceSelectionColdStartConfig {
+            enabled: true,
+            max_difficulty_level: 0,
+            hold_steps: 47,
+            ramp_steps: 1,
+            ..Default::default()
+        };
+    let candidates = ruliad_sampler_candidates(&corpus);
+    let state =
+        LiveSourceSelectionState::new(corpus.source_selection.clone(), corpus.clone(), candidates)
+            .expect("clock regression source state");
+    (state, corpus)
+}
+
+#[test]
+fn source_selection_checkpoint_export_does_not_advance_live_clock() {
+    let (state, _) = clock_regression_state();
+    let weights = state.weighted_bucket_labels(Some(0));
+    for candidate in state.sampler.lock().expect("sampler").candidates() {
+        if candidate.difficulty_level > 0 {
+            assert_eq!(
+                weights
+                    .iter()
+                    .find(|(label, _)| label == &candidate.oracle_hash)
+                    .expect("bucket")
+                    .1,
+                0.0,
+                "hard eligibility masks must not become tiny positive weights"
+            );
+        }
+    }
+    for step in 0..64 {
+        let before = state
+            .choose_bucket_label_for_step(1, step)
+            .expect("source before checkpoint");
+        if (step + 1) % 16 == 0 {
+            let snapshot = state.export_state(step + 1);
+            assert_eq!(snapshot.clock.run_step_origin, 0);
+            assert_eq!(snapshot.clock.completed_run_steps, step + 1);
+            assert_eq!(snapshot, state.export_state(step + 1));
+        }
+        assert_eq!(state.effective_absolute_step(Some(step)), Some(step));
+        assert_eq!(
+            state.choose_bucket_label_for_step(1, step).as_deref(),
+            Some(before.as_str()),
+            "checkpoint frequency must not change source selection"
+        );
+        let harder = high_difficulty_probability(&state, step, 1);
+        if step < 48 {
+            assert!(harder < 1e-6, "early release at step {step}");
+        } else {
+            assert!(harder > 0.0, "missing release at step {step}");
+        }
+    }
+}
+
+#[test]
+fn source_selection_clock_distinguishes_exact_resume_and_new_phase() {
+    let (state, corpus) = clock_regression_state();
+    let restore = |snapshot, mode| {
+        LiveSourceSelectionState::from_snapshot(
+            corpus.source_selection.clone(),
+            corpus.clone(),
+            ruliad_sampler_candidates(&corpus),
+            snapshot,
+            mode,
+        )
+        .expect("restore clock")
+    };
+    let snapshot = state.export_state(16);
+    let resumed = restore(snapshot.clone(), RuliadSourceSelectionRestore::ResumeRun);
+    let phase = restore(snapshot, RuliadSourceSelectionRestore::StartNewRun);
+    for global_step in 16..64 {
+        assert_eq!(
+            resumed.effective_absolute_step(Some(global_step)),
+            Some(global_step)
+        );
+        assert_eq!(
+            phase.effective_absolute_step(Some(global_step - 16)),
+            Some(global_step)
+        );
+        assert_eq!(
+            state.choose_bucket_label_for_step(1, global_step),
+            resumed.choose_bucket_label_for_step(1, global_step),
+            "exact resume changed the sampler trajectory"
+        );
+        assert_eq!(
+            state.choose_bucket_label_for_step(1, global_step),
+            phase.choose_bucket_label_for_step(1, global_step - 16),
+            "new phase must apply its offset exactly once"
+        );
+    }
+    let next = phase.export_state(64);
+    assert_eq!(next.clock.run_step_origin, 16);
+    assert_eq!(next.clock.next_global_step(), 80);
+    let resumed_phase = restore(next.clone(), RuliadSourceSelectionRestore::ResumeRun);
+    let third_phase = restore(next, RuliadSourceSelectionRestore::StartNewRun);
+    assert_eq!(resumed_phase.effective_absolute_step(Some(64)), Some(80));
+    assert_eq!(third_phase.effective_absolute_step(Some(0)), Some(80));
+    assert_eq!(phase.effective_absolute_step(Some(0)), Some(16));
+}
+
+#[test]
+fn source_selection_restore_rejects_mutating_clock_contract() {
+    let (state, corpus) = clock_regression_state();
+    let mut old = state.export_state(16);
+    old.version = 1;
+    assert!(
+        LiveSourceSelectionState::from_snapshot(
+            corpus.source_selection.clone(),
+            corpus.clone(),
+            ruliad_sampler_candidates(&corpus),
+            old,
+            RuliadSourceSelectionRestore::ResumeRun,
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn source_selection_phase_handoff_preserves_document_coordinates() {
+    for consolidation in [false, true] {
+        source_selection_phase_document_handoff(consolidation);
+    }
+}
+
+fn source_selection_phase_document_handoff(consolidation: bool) {
+    let dir = tempdir().expect("tempdir");
+    let config_path = dir.path().join("source.toml");
+    let state_path = dir.path().join("source-state.json");
+    let corpus = live_ruliad_runtime_config();
+    let mut supervision = RuliadSupervisionConfig::default();
+    supervision.consolidation = RuliadConsolidationConfig {
+        enabled: consolidation,
+        initial_unique_steps: 2,
+        hold_steps: 10,
+        novelty_interval_steps: 4,
+        seed: 23,
+    };
+    let request = |absolute_step| RuliadWindowRequest {
+        split: burn_dragon_universality::SampleSplit::Train,
+        epoch_index: 1,
+        absolute_step,
+        batch_size: 2,
+        block_size: 32,
+        prefer_answer_window: false,
+    };
+    fs::write(&config_path, toml::to_string(&corpus).expect("corpus TOML")).expect("write corpus");
+    let dataset =
+        UniversalityDataset::new_ruliad_on_the_fly(&config_path, 32, 2, &pretokenized_tokenizer())
+            .expect("source dataset")
+            .with_ruliad_supervision(supervision);
+    let UniversalityStorage::OnTheFly(original) = &dataset.storage else {
+        panic!("on-the-fly storage required");
+    };
+    for step in 0..16 {
+        original
+            .source_selected_token_windows(request(step))
+            .expect("prefix data");
+    }
+    dataset
+        .write_source_selection_state(&state_path, 16)
+        .expect("source checkpoint");
+    let restored =
+        UniversalityDataset::new_ruliad_on_the_fly(&config_path, 32, 2, &pretokenized_tokenizer())
+            .expect("new dataset")
+            .with_source_selection_state_path(
+                Some(&state_path),
+                RuliadSourceSelectionRestore::StartNewRun,
+            )
+            .expect("new phase")
+            .with_ruliad_supervision(supervision);
+    let (UniversalityStorage::OnTheFly(original), UniversalityStorage::OnTheFly(phase)) =
+        (&dataset.storage, &restored.storage)
+    else {
+        panic!("on-the-fly storage required");
+    };
+    let bucket = live_source_selection_state(&dataset)
+        .choose_bucket_label_for_step(1, 16)
+        .expect("source bucket");
+    for local_step in 0..32 {
+        assert_eq!(
+            original
+                .source_selected_token_windows(request(local_step + 16))
+                .expect("continuous data"),
+            phase
+                .source_selected_token_windows(request(local_step))
+                .expect("phase data"),
+            "document identity changed at local step {local_step}, consolidation={consolidation}"
+        );
+    }
+    assert_eq!(
+        original.build_source_bucket_documents(
+            burn_dragon_universality::SampleSplit::Validation,
+            1,
+            0,
+            &bucket,
+            2,
+        ),
+        phase.build_source_bucket_documents(
+            burn_dragon_universality::SampleSplit::Validation,
+            1,
+            0,
+            &bucket,
+            2,
+        ),
+        "a training phase must not move the validation panel"
+    );
+}
+
 #[test]
 fn source_selection_restore_rehydrates_dynamic_semantic_contract_metadata() {
     let mut config = live_ruliad_runtime_config();
@@ -923,6 +1150,11 @@ fn source_selection_restore_rehydrates_dynamic_semantic_contract_metadata() {
             burn_dragon_universality::RuliadProofActionAnswerContract::SemanticStep,
     };
     let configured_candidates = ruliad_sampler_candidates(&config);
+    let cached_bucket_label = configured_candidates
+        .first()
+        .expect("configured candidate")
+        .oracle_hash
+        .clone();
     let mut dynamic_candidate =
         burn_dragon_universality::ruliad_sampler_candidates_for_difficulty(&config, 3)
             .into_iter()
@@ -933,7 +1165,10 @@ fn source_selection_restore_rehydrates_dynamic_semantic_contract_metadata() {
     dynamic_candidate.capability_feedback_count = 4;
     let snapshot = RuliadSourceSelectionStateSnapshot {
         version: RULIAD_SOURCE_SELECTION_STATE_VERSION,
-        absolute_step_offset: 99,
+        clock: RuliadSourceSelectionClock {
+            run_step_origin: 0,
+            completed_run_steps: 100,
+        },
         frontier_extension_count: 3,
         released_max_difficulty_level: 2,
         control: RuliadSourceSelectionControlSnapshot {
@@ -945,6 +1180,7 @@ fn source_selection_restore_rehydrates_dynamic_semantic_contract_metadata() {
             capability_posteriors: Default::default(),
             verifier_failures: 0,
         },
+        consolidation_bucket_catalog: BTreeMap::from([(7, cached_bucket_label.clone())]),
     };
 
     let restored = LiveSourceSelectionState::from_snapshot(
@@ -952,6 +1188,7 @@ fn source_selection_restore_rehydrates_dynamic_semantic_contract_metadata() {
         config,
         configured_candidates,
         snapshot,
+        RuliadSourceSelectionRestore::ResumeRun,
     )
     .expect("restored source selection");
     let sampler = restored.sampler.lock().expect("sampler");
@@ -964,6 +1201,14 @@ fn source_selection_restore_rehydrates_dynamic_semantic_contract_metadata() {
     assert_eq!(dynamic.answer_contract, "proof_action_step");
     assert_eq!(dynamic.loss_ema, 1.25);
     assert_eq!(dynamic.capability_feedback_count, 4);
+    drop(sampler);
+    assert_eq!(
+        restored
+            .export_state(100)
+            .consolidation_bucket_catalog
+            .get(&7),
+        Some(&cached_bucket_label)
+    );
 }
 
 #[test]
@@ -1038,10 +1283,10 @@ fn answer_target_window_sampler_prefers_nonempty_answer_masks() {
 }
 
 #[test]
-fn live_source_selection_documents_per_step_is_bounded_by_default() {
+fn live_source_selection_documents_per_step_defaults_to_the_full_batch() {
     assert_eq!(
         bounded_live_source_selection_documents_per_step(32, None),
-        DEFAULT_LIVE_SOURCE_SELECTION_DOCUMENTS_PER_STEP
+        32
     );
     assert_eq!(bounded_live_source_selection_documents_per_step(2, None), 2);
     assert_eq!(
@@ -1052,6 +1297,78 @@ fn live_source_selection_documents_per_step_is_bounded_by_default() {
         bounded_live_source_selection_documents_per_step(2, Some(8)),
         2
     );
+}
+
+#[test]
+fn live_training_coordinates_are_unique_within_each_materialized_page() {
+    let coordinates = (0..64)
+        .map(|document_rank| {
+            live_source_selection_sample_coordinate(
+                256,
+                burn_dragon_universality::SampleSplit::Train,
+                7,
+                19,
+                "select_proof_action:difficulty=3",
+                document_rank,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        coordinates.iter().copied().collect::<HashSet<_>>().len(),
+        coordinates.len(),
+        "a live batch must not duplicate generated training coordinates"
+    );
+    assert!(
+        coordinates
+            .iter()
+            .all(|coordinate| coordinate.epoch_index <= u32::MAX as usize),
+        "virtual epochs must use a native/wasm-stable fixed width"
+    );
+
+    let repeated = (0..64)
+        .map(|document_rank| {
+            live_source_selection_sample_coordinate(
+                256,
+                burn_dragon_universality::SampleSplit::Train,
+                7,
+                19,
+                "select_proof_action:difficulty=3",
+                document_rank,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(coordinates, repeated, "coordinates must be reproducible");
+
+    let next_step = (0..64)
+        .map(|document_rank| {
+            live_source_selection_sample_coordinate(
+                256,
+                burn_dragon_universality::SampleSplit::Train,
+                7,
+                20,
+                "select_proof_action:difficulty=3",
+                document_rank,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_ne!(
+        coordinates, next_step,
+        "successive live steps must address fresh generated documents"
+    );
+}
+
+#[test]
+fn live_validation_coordinates_preserve_the_fixed_panel_epoch() {
+    let coordinate = live_source_selection_sample_coordinate(
+        32,
+        burn_dragon_universality::SampleSplit::Validation,
+        11,
+        23,
+        "select_proof_action:difficulty=2",
+        5,
+    );
+    assert_eq!(coordinate.epoch_index, 11);
+    assert!(coordinate.sample_index < 32);
 }
 
 #[test]
@@ -1356,7 +1673,7 @@ fn stratified_fixed_validation_panel_balances_difficulty_and_preserves_coordinat
     let config_path = dir.path().join("ruliad-stratified.toml");
     let mut config = live_ruliad_runtime_config();
     config.source_selection.difficulty_levels =
-        burn_dragon_universality::UsizeRangeConfig { min: 0, max: 5 };
+        burn_dragon_universality::UsizeRangeConfig { min: 0, max: 1 };
     fs::write(&config_path, toml::to_string_pretty(&config).expect("toml")).expect("write config");
     let dataset =
         UniversalityDataset::new_ruliad_on_the_fly(&config_path, 32, 2, &pretokenized_tokenizer())
@@ -1411,6 +1728,51 @@ fn stratified_fixed_validation_panel_balances_difficulty_and_preserves_coordinat
         "panel should span families: {families:?}"
     );
     assert!(tasks.len() >= 2, "panel should span tasks: {tasks:?}");
+}
+
+#[test]
+fn fixed_task_panel_uses_the_requested_seed_and_corpus_identity() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("corpus.toml");
+    let mut config = live_ruliad_runtime_config();
+    config.serialization.document_tokens = 65_537;
+    config.source_selection.formal_task_mix.advance_proof_weight = 0;
+    config
+        .source_selection
+        .formal_task_mix
+        .construct_proof_weight = 0;
+    config.source_selection.formal_task_mix.check_proof_weight = 0;
+    config
+        .source_selection
+        .formal_task_mix
+        .select_proof_action_weight = 1;
+    config.families = vec![burn_dragon_universality::ruliad::RuliadFamilyConfig {
+        kind: burn_dragon_universality::ruliad::RuliadFamilyKind::FormalProof,
+        ..config.families[0].clone()
+    }];
+    fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    let dataset =
+        UniversalityDataset::new_ruliad_on_the_fly(&path, 32, 2, &pretokenized_tokenizer())
+            .unwrap();
+    let sample =
+        |seed| dataset.sample_ruliad_task_probe_items_fixed(seed, 16, "select_proof_action", 4);
+    let first = sample(91);
+    assert_eq!(first.len(), 16);
+    assert_eq!(first, sample(91));
+    assert_ne!(first, sample(92));
+    assert!(
+        first
+            .iter()
+            .all(|probe| probe.item.task_kind == "select_proof_action")
+    );
+    let identity = dataset.ruliad_semantic_fingerprint().unwrap();
+    config.seed += 1;
+    fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    let changed =
+        UniversalityDataset::new_ruliad_on_the_fly(&path, 32, 2, &pretokenized_tokenizer())
+            .unwrap();
+    assert_ne!(identity, changed.ruliad_semantic_fingerprint().unwrap());
+    assert_eq!(identity, dataset.ruliad_semantic_fingerprint().unwrap());
 }
 
 #[test]
@@ -1497,7 +1859,7 @@ fn ruliad_validation_probe_deduplicates_and_stops_at_holdout_capacity() {
 }
 
 #[test]
-fn ruliad_policy_probe_stratifies_materialized_difficulty_buckets() {
+fn ruliad_policy_probe_materializes_requested_difficulty_buckets() {
     let dir = tempdir().expect("tempdir");
     let config_path = dir.path().join("ruliad-action.toml");
     let mut config = fixed_ruliad_runtime_config();
@@ -1505,7 +1867,7 @@ fn ruliad_policy_probe_stratifies_materialized_difficulty_buckets() {
     config.serialization.document_tokens = 8_193;
     config.source_selection.enabled = true;
     config.source_selection.difficulty_levels =
-        burn_dragon_universality::UsizeRangeConfig { min: 0, max: 3 };
+        burn_dragon_universality::UsizeRangeConfig { min: 0, max: 1 };
     config.source_selection.formal_task_mix.advance_proof_weight = 0;
     config
         .source_selection
@@ -1853,6 +2215,7 @@ fn ruliad_cold_start_override_exposes_the_materialized_open_loop_frontier() {
         &pretokenized_tokenizer(),
         RuliadSourceSelectionOverrides {
             cold_start_enabled: Some(false),
+            documents_per_step: None,
         },
     )
     .expect("load aligned ruliad dataset");
@@ -1901,14 +2264,14 @@ fn live_ruliad_source_batches_are_shared_across_tbptt_chunks() {
         3,
         11,
         &bucket,
-        2,
+        8,
     );
     let second = storage.generate_source_bucket_documents(
         burn_dragon_universality::SampleSplit::Train,
         3,
         11,
         &bucket,
-        2,
+        8,
     );
     assert_eq!(first.len(), second.len());
     assert!(
@@ -1918,13 +2281,22 @@ fn live_ruliad_source_batches_are_shared_across_tbptt_chunks() {
             .all(|(left, right)| Arc::ptr_eq(left, right)),
         "the same source decision should reuse its generated documents"
     );
+    assert_eq!(
+        first
+            .iter()
+            .map(|document| document.as_slice())
+            .collect::<HashSet<_>>()
+            .len(),
+        first.len(),
+        "one live source batch should contain distinct generated documents"
+    );
 
     let next = storage.generate_source_bucket_documents(
         burn_dragon_universality::SampleSplit::Train,
         3,
         12,
         &bucket,
-        2,
+        8,
     );
     assert!(
         first
@@ -1932,6 +2304,16 @@ fn live_ruliad_source_batches_are_shared_across_tbptt_chunks() {
             .zip(&next)
             .any(|(left, right)| !Arc::ptr_eq(left, right)),
         "a new source decision must not alias an older batch"
+    );
+    assert_ne!(
+        first
+            .iter()
+            .map(|document| document.as_slice())
+            .collect::<Vec<_>>(),
+        next.iter()
+            .map(|document| document.as_slice())
+            .collect::<Vec<_>>(),
+        "successive source decisions should generate fresh document content"
     );
     let cache = storage.live_batch_cache.inner.lock().expect("live cache");
     assert_eq!(cache.entries.len(), 2);
@@ -2370,6 +2752,14 @@ fn production_verifier_stream_materializes_every_scheduled_policy_panel() {
     );
     for (_, policy) in scheduled {
         assert_eq!(policy.samples.len(), 32);
+        assert_eq!(
+            policy
+                .samples
+                .iter()
+                .filter_map(|sample| sample.item.difficulty_level)
+                .collect::<HashSet<_>>(),
+            HashSet::from([0, 1, 2, 3]),
+        );
         assert!(policy.samples.iter().all(|sample| matches!(
             sample.item.spec,
             Some(burn_dragon_universality::RuliadSampleSpec::FormalProof {
@@ -2378,6 +2768,52 @@ fn production_verifier_stream_materializes_every_scheduled_policy_panel() {
             })
         )));
     }
+}
+
+#[test]
+fn production_verifier_supervision_audit_exposes_stateless_context_gap() {
+    let tokenizer = TokenizerConfig {
+        vocab_path: None,
+        kind: TokenizerKind::Pretokenized(PretokenizedTokenizerConfig {
+            vocab_size: 272,
+            bos_id: None,
+            eos_id: Some(271),
+            pad_id: None,
+            unk_id: None,
+        }),
+    };
+    let corpus_config = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../burn_dragon_p2p/deploy/profiles/ruliad-r3.semantic-action.corpus.toml");
+    let supervision = RuliadSupervisionConfig {
+        mode: RuliadSupervisionMode::AnswerCompletion,
+        ..Default::default()
+    };
+    let audit = |block_size| {
+        UniversalityDataset::new_ruliad_on_the_fly(&corpus_config, block_size, 2, &tokenizer)
+            .expect("load production verifier corpus")
+            .with_ruliad_supervision(supervision)
+            .with_ruliad_supervision_audit(2)
+            .expect("audit production verifier corpus")
+            .ruliad_supervision_audit()
+            .expect("Ruliad audit report")
+            .clone()
+    };
+
+    let short = audit(128);
+    assert!(short.total_query_conditioning_samples > 0);
+    assert_eq!(short.query_visible_within_block_fraction, 0.0);
+    assert!(
+        short
+            .buckets
+            .iter()
+            .any(|bucket| bucket.max_query_to_answer_tokens > 128)
+    );
+
+    let boundary_sensitive = audit(256);
+    assert_eq!(boundary_sensitive.query_visible_within_block_fraction, 0.25);
+
+    let sufficient = audit(4096);
+    assert_eq!(sufficient.query_visible_within_block_fraction, 1.0);
 }
 
 #[test]
@@ -2479,6 +2915,7 @@ fn live_ruliad_answer_completion_streaming_preserves_context_state_and_masks_ans
     let mut answer_mask_rows = 0usize;
     let mut supervised_examples = Vec::new();
     for (_label, batch) in batches {
+        let known_supervised_token_count = batch.supervised_token_count;
         let targets = batch
             .targets
             .to_data()
@@ -2492,6 +2929,11 @@ fn live_ruliad_answer_completion_streaming_preserves_context_state_and_masks_ans
             .convert::<i64>()
             .into_vec::<i64>()
             .expect("loss mask");
+        assert_eq!(
+            known_supervised_token_count,
+            Some(mask.iter().filter(|value| **value != 0).count()),
+            "streaming loader supervision metadata must match its emitted mask"
+        );
         let supervised = masked_ruliad_target_text(wrapped.as_ref(), &targets, &mask);
         if mask.iter().all(|value| *value == 0) {
             saw_context_only_chunk = true;
@@ -2804,6 +3246,92 @@ fn on_the_fly_ruliad_dataset_exposes_structured_document_end_token_id() {
         dataset.ruliad_document_end_token_id(),
         Some(RULIAD_SYMBOLIC_DOCUMENT_END_TOKEN)
     );
+}
+
+#[test]
+fn ruliad_consolidation_replays_primary_windows_and_policy_sidecars_together() {
+    let tokenizer = TokenizerConfig {
+        vocab_path: None,
+        kind: TokenizerKind::Pretokenized(PretokenizedTokenizerConfig {
+            vocab_size: 272,
+            bos_id: None,
+            eos_id: Some(271),
+            pad_id: None,
+            unk_id: None,
+        }),
+    };
+    let mut supervision = crate::config::RuliadSupervisionConfig::default();
+    supervision.consolidation = crate::config::RuliadConsolidationConfig {
+        enabled: true,
+        initial_unique_steps: 2,
+        hold_steps: 10,
+        novelty_interval_steps: 4,
+        seed: 23,
+    };
+    let corpus_config = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../burn_dragon_p2p/deploy/profiles/ruliad-r3.semantic-action.corpus.toml");
+    let dataset = UniversalityDataset::new_ruliad_on_the_fly(&corpus_config, 128, 8, &tokenizer)
+        .expect("load production verifier corpus")
+        .with_ruliad_supervision(supervision);
+    let wrapped = crate::dataset::Dataset::from_universality(dataset);
+    let replay_step = 2;
+    let source_step = supervision
+        .consolidation
+        .coordinate(replay_step)
+        .generation_step;
+    assert!(source_step < supervision.consolidation.initial_unique_steps);
+
+    let original_policy = TokenSequenceDataset::source_selected_ruliad_policy_batch(
+        &wrapped,
+        DatasetSplit::Train,
+        0,
+        source_step,
+        8,
+        2,
+    )
+    .expect("original policy panel");
+    let replayed_policy = TokenSequenceDataset::source_selected_ruliad_policy_batch(
+        &wrapped,
+        DatasetSplit::Train,
+        7,
+        replay_step,
+        8,
+        2,
+    )
+    .expect("replayed policy panel");
+    assert_eq!(original_policy.fingerprint(), replayed_policy.fingerprint());
+    assert_eq!(
+        replayed_policy.sampling_metadata,
+        Some(crate::dataset::RuliadPolicySamplingMetadata {
+            logical_epoch_index: 7,
+            logical_selection_step: replay_step,
+            generation_epoch_index: 0,
+            generation_step: source_step,
+            released_unique_steps: supervision.consolidation.initial_unique_steps,
+            novel: false,
+            consolidation_enabled: true,
+        })
+    );
+
+    let original_windows = TokenSequenceDataset::source_selected_token_windows(
+        &wrapped,
+        DatasetSplit::Train,
+        0,
+        source_step,
+        8,
+        128,
+    )
+    .expect("original primary windows");
+    let replayed_windows = TokenSequenceDataset::source_selected_token_windows(
+        &wrapped,
+        DatasetSplit::Train,
+        7,
+        replay_step,
+        8,
+        128,
+    )
+    .expect("replayed primary windows");
+    assert_eq!(original_windows, replayed_windows);
 }
 
 #[test]

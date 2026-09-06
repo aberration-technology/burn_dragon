@@ -187,6 +187,9 @@ pub(super) fn formal_generation_split(
         (RuliadFormalGeneralizationContract::StructuralHoldoutV1, SampleSplit::Train) => {
             RuliadFormalGenerationSplit::StructuralTrainV1
         }
+        (RuliadFormalGeneralizationContract::StructuralTrainSeedDisjointV1, _) => {
+            RuliadFormalGenerationSplit::StructuralTrainV1
+        }
         (RuliadFormalGeneralizationContract::StructuralHoldoutV1, SampleSplit::Validation) => {
             RuliadFormalGenerationSplit::StructuralValidationV1
         }

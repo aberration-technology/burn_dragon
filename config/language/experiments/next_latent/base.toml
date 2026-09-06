@@ -1,0 +1,124 @@
+[dataset]
+cache_dir = "target/datasets/nextlat-stateful-v2"
+train_split_ratio = 0.9
+type = "universality_ruliad"
+config = "config/language/experiments/next_latent/corpus.toml"
+
+[dataset.tokenizer]
+type = "pretokenized"
+vocab_size = 272
+eos_id = 271
+
+[model]
+n_layer = 4
+n_embd = 96
+n_head = 4
+latent_total = 3072
+tie_input_output_embeddings = false
+dropout = 0.0
+residual_connector = "vanilla"
+rotary_embedding = "alibi"
+sequence_kernel = { memory_system = "linear_attention", executor = "dense_score_short_context" }
+
+[model.language_head]
+type = "standard_token_classification"
+
+# Allocate the same head even in CE controls, preserving initialization identity.
+[model.next_latent_transition]
+enabled = true
+hidden_multiplier = 2
+normalize_input = true
+zero_init_output = false
+
+[training]
+algorithm = "backpropagation"
+block_size = 256
+tbptt_chunk_size = 256
+tbptt_persist_across_steps = true
+sequence_batching = "streaming"
+batch_size = 8
+max_iters = 1024
+checkpoint_interval_iters = 512
+log_frequency = 32
+seed = 13
+launch_mode = "fresh"
+
+[training.validation]
+sampling = "fixed_holdout"
+seed = 3509215397
+
+[training.ruliad_supervision]
+mode = "full_document"
+mask_high_entropy_spans = true
+
+[training.sequence_state_probe]
+enabled = true
+paired_batches = 8
+max_rho_slots = 64
+
+[training.ruliad_probe_generation]
+enabled = true
+max_batch_rows = 16
+minimum_batch_rows = 1
+maximum_prompt_position_span = 128
+device_buffer_tokens = 64
+max_in_flight_rows = 16
+
+[training.latent_reasoning]
+enabled = false
+every_steps = 1
+jepa_future_offsets = []
+target_encoder = "detached_student"
+
+[training.latent_reasoning.next_latent]
+enabled = true
+horizon = 1
+regression_weight = 1.0
+token_kl_weight = 0.0
+smooth_l1_beta = 1.0
+detach_action_embedding = false
+
+[training.latent_reasoning.sigreg]
+enabled = false
+
+[training.latent_reasoning.constraint_balancer]
+enabled = true
+normalized_aux_scale = 1.0
+start_after_steps = 0
+warmup_steps = 0
+
+[training.auto_batch_size]
+enabled = false
+
+[training.continual_backprop]
+enabled = false
+
+[training.neuron_scaling]
+enabled = false
+
+[training.gates]
+enabled = false
+
+[training.dynamics]
+enabled = false
+
+[training.events]
+flush_every_steps = 32
+source_selection_every_steps = 32
+continual_backprop_every_steps = 256
+degeneracy_probe_every_epochs = 1
+degeneracy_probe_tokens = 128
+ruliad_correctness_probe_every_epochs = 1
+ruliad_correctness_probe_items = 32
+ruliad_correctness_probe_tokens = 128
+source_weighted_validation_batches = 0
+
+[optimizer]
+name = "adamw"
+learning_rate = 0.0003
+weight_decay = 0.01
+grad_clip_norm = 1.0
+
+[generation]
+prompt = ""
+output_format = "decoded_text"

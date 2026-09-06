@@ -61,6 +61,18 @@ impl TrainingConfig {
                 "training.sequence_batching=random is incompatible with training.tbptt_persist_across_steps=true"
             ));
         }
+        if matches!(
+            self.dataset.source,
+            crate::config::DatasetSourceConfig::UniversalityRuliad { .. }
+        ) && self.training.sequence_batching == SequenceBatchingMode::Streaming
+            && !self.training.tbptt_persist_across_steps
+            && self.training.ruliad_supervision.uses_answer_target_mask()
+            && !self.training.has_required_self_contained_primary_schedule()
+        {
+            return Err(anyhow!(
+                "answer-masked Ruliad supervision cannot use training.sequence_batching=streaming with training.tbptt_persist_across_steps=false because context-only batches become zero-gradient optimizer updates; use sequence_batching=random, retain stream state, or require self-contained primary objectives covering every step"
+            ));
+        }
         if self.training.sequence_state_probe.enabled {
             if self.training.sequence_state_probe.paired_batches == 0 {
                 return Err(anyhow!(
@@ -75,6 +87,9 @@ impl TrainingConfig {
         }
         if self.training.batch_size == 0 {
             return Err(anyhow!("training.batch_size must be > 0"));
+        }
+        if self.training.validation.batches == Some(0) {
+            return Err(anyhow!("training.validation.batches must be > 0 when set"));
         }
         if self.training.gradient_accumulation_steps == 0 {
             return Err(anyhow!("training.gradient_accumulation_steps must be > 0"));
@@ -360,6 +375,14 @@ impl TrainingConfig {
             }
         }
         if self.training.ruliad_policy_probe.enabled {
+            let proof_policy = self.training.ruliad_supervision.proof_policy;
+            if proof_policy.enabled
+                && self.training.ruliad_policy_probe.prompt_context != proof_policy.prompt_context
+            {
+                return Err(anyhow!(
+                    "training.ruliad_policy_probe.prompt_context must match training.ruliad_supervision.proof_policy.prompt_context when both are enabled"
+                ));
+            }
             if self
                 .training
                 .ruliad_policy_probe
@@ -392,11 +415,6 @@ impl TrainingConfig {
             if self.training.ruliad_policy_probe.items == 0 {
                 return Err(anyhow!(
                     "training.ruliad_policy_probe.items must be > 0 when enabled"
-                ));
-            }
-            if self.training.ruliad_policy_probe.max_steps == 0 {
-                return Err(anyhow!(
-                    "training.ruliad_policy_probe.max_steps must be > 0 when enabled"
                 ));
             }
             if self.training.ruliad_policy_probe.candidates < 2 {
@@ -446,6 +464,15 @@ impl TrainingConfig {
                         "training.ruliad_policy_probe.promotion_gate.minimum_items must be <= training.ruliad_policy_probe.items"
                     ));
                 }
+                if gate.require_context_binding
+                    && (gate.minimum_conditioning_items == 0
+                        || gate.minimum_conditioning_items
+                            > self.training.ruliad_policy_probe.items)
+                {
+                    return Err(anyhow!(
+                        "training.ruliad_policy_probe.promotion_gate.minimum_conditioning_items must be in 1..=training.ruliad_policy_probe.items when context binding is required"
+                    ));
+                }
                 for (name, value) in [
                     ("minimum_solve_rate", gate.minimum_solve_rate),
                     (
@@ -462,6 +489,22 @@ impl TrainingConfig {
                         gate.maximum_repeated_state_rate,
                     ),
                     ("maximum_backtrack_rate", gate.maximum_backtrack_rate),
+                    (
+                        "minimum_context_swap_top1_change_rate",
+                        gate.minimum_context_swap_top1_change_rate,
+                    ),
+                    (
+                        "minimum_context_swap_equivalent_probability_drop",
+                        gate.minimum_context_swap_equivalent_probability_drop,
+                    ),
+                    (
+                        "minimum_counterfactual_target_top1_change_rate",
+                        gate.minimum_counterfactual_target_top1_change_rate,
+                    ),
+                    (
+                        "minimum_counterfactual_target_equivalent_probability_gain",
+                        gate.minimum_counterfactual_target_equivalent_probability_gain,
+                    ),
                 ] {
                     if !value.is_finite() || !(0.0..=1.0).contains(&value) {
                         return Err(anyhow!(
@@ -963,37 +1006,30 @@ impl TrainingConfig {
                 ));
             }
             if latent.next_latent.enabled {
-                if latent.next_latent.every_steps == Some(0) {
-                    return Err(anyhow!(
-                        "training.latent_reasoning.next_latent.every_steps must be > 0 when set"
-                    ));
-                }
-                if latent.next_latent.horizon == 0 {
-                    return Err(anyhow!(
-                        "training.latent_reasoning.next_latent.horizon must be > 0 when enabled"
-                    ));
-                }
-                if !latent.next_latent.regression_weight.is_finite()
-                    || latent.next_latent.regression_weight < 0.0
-                {
-                    return Err(anyhow!(
-                        "training.latent_reasoning.next_latent.regression_weight must be finite and >= 0"
-                    ));
-                }
-                if !latent.next_latent.token_kl_weight.is_finite()
-                    || latent.next_latent.token_kl_weight < 0.0
-                {
-                    return Err(anyhow!(
-                        "training.latent_reasoning.next_latent.token_kl_weight must be finite and >= 0"
-                    ));
-                }
-                if !latent.next_latent.smooth_l1_beta.is_finite()
-                    || latent.next_latent.smooth_l1_beta <= 0.0
-                {
-                    return Err(anyhow!(
-                        "training.latent_reasoning.next_latent.smooth_l1_beta must be finite and > 0"
-                    ));
-                }
+                latent.next_latent.validate()?;
+                anyhow::ensure!(
+                    matches!(
+                        latent.target_encoder,
+                        crate::config::LatentReasoningTargetEncoder::DetachedStudent
+                    ),
+                    "training.latent_reasoning.next_latent requires target_encoder=detached_student; EMA targets do not yet preserve the stream history"
+                );
+                anyhow::ensure!(
+                    !self.training.input_corruption.enabled,
+                    "training.latent_reasoning.next_latent requires input_corruption.enabled=false for its same-pass target contract"
+                );
+                anyhow::ensure!(
+                    !self.parallel.pipeline.enabled,
+                    "training.latent_reasoning.next_latent requires single-process hidden/state ownership; pipeline mode is unsupported"
+                );
+                anyhow::ensure!(
+                    self.parallel.mode == ParallelismKind::Single,
+                    "training.latent_reasoning.next_latent requires parallel.mode=single until masked loss reductions are validated across peers"
+                );
+                anyhow::ensure!(
+                    !self.training.auto_batch_size.enabled,
+                    "training.latent_reasoning.next_latent requires a bounded fixed batch; startup auto-batch probes do not include latent auxiliary memory"
+                );
             }
             if latent.step_contract.enabled {
                 if latent.step_contract.every_steps == Some(0) {

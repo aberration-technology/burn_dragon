@@ -11,6 +11,29 @@ fn uses_shared_ruliad_verifier_terminal(
         && policy.gradient_scope == crate::config::RuliadProofPolicyGradientScope::FullModel
 }
 
+impl<B: BackendTrait> LanguageTrainModel<B> {
+    fn report_ruliad_verifier_terminal_skip(
+        &self,
+        policy_batch: Option<&crate::dataset::RuliadPolicyBatch>,
+        policy: crate::config::RuliadProofPolicyTrainingConfig,
+        step_index: usize,
+        reason: &'static str,
+    ) {
+        self.write_ruliad_proof_policy_dagger_telemetry(RuliadProofPolicyDaggerTelemetry::skipped(
+            policy_batch,
+            policy,
+            step_index,
+            reason,
+        ));
+        self.local_predictive_coding_profile
+            .record_structured_terminal_skip();
+        assert!(
+            !policy.require_scheduled_update,
+            "required Ruliad proof-policy update failed at step {step_index}: {reason}"
+        );
+    }
+}
+
 impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
     type Input = SequenceBatch<B>;
     type Output = LanguageModelTrainItem<B>;
@@ -43,10 +66,53 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
         let clean_inputs = batch.inputs;
         let targets = batch.targets;
         let loss_mask = batch.loss_mask;
+        let known_supervised_token_count = batch.supervised_token_count;
         let summary_event_mask = batch.summary_event_mask;
         let reset_stream_state = batch.reset_stream_state;
-        let [batch_size, block_size] = clean_inputs.shape().dims::<2>();
+        let [_, block_size] = clean_inputs.shape().dims::<2>();
+        let verifier_terminal_due = local_predictive_coding::verifier_terminal_due(
+            self.local_predictive_coding.terminal_criterion,
+            self.ruliad_supervision.proof_policy,
+            schedule_step_index,
+        );
         if matches!(self.training_algorithm, TrainingAlgorithm::Backpropagation)
+            && verifier_terminal_due
+            && local_predictive_coding::verifier_terminal_preserves_primary(
+                self.local_predictive_coding.terminal_criterion,
+            )
+        {
+            if let Some(output) = self.joint_backprop_verifier_terminal_step(
+                ruliad_policy_batch.as_deref(),
+                clean_inputs.clone(),
+                targets.clone(),
+                loss_mask.clone(),
+                known_supervised_token_count,
+                summary_event_mask.clone(),
+                reset_stream_state,
+                block_size,
+                schedule_step_index,
+                prof_enabled,
+            ) {
+                return output;
+            }
+            let terminal_policy = self
+                .ruliad_supervision
+                .proof_policy_for_step(schedule_step_index);
+            self.report_ruliad_verifier_terminal_skip(
+                ruliad_policy_batch.as_deref(),
+                terminal_policy,
+                schedule_step_index,
+                if ruliad_policy_batch.is_some() {
+                    "unencodable_or_empty_verifier_panel"
+                } else {
+                    "missing_policy_batch"
+                },
+            );
+        }
+        if matches!(self.training_algorithm, TrainingAlgorithm::Backpropagation)
+            && !local_predictive_coding::verifier_terminal_preserves_primary(
+                self.local_predictive_coding.terminal_criterion,
+            )
             && local_predictive_coding::verifier_terminal_due(
                 self.local_predictive_coding.terminal_criterion,
                 self.ruliad_supervision.proof_policy,
@@ -109,8 +175,16 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                         item: LanguageModelTrainItem::new(objective.loss),
                     };
                 }
-                self.local_predictive_coding_profile
-                    .record_structured_terminal_skip();
+                self.report_ruliad_verifier_terminal_skip(
+                    ruliad_policy_batch.as_deref(),
+                    terminal_policy,
+                    schedule_step_index,
+                    if ruliad_policy_batch.is_some() {
+                        "unencodable_or_empty_verifier_panel"
+                    } else {
+                        "missing_policy_batch"
+                    },
+                );
             }
             if shared_prefix_terminal {
                 let started = Instant::now();
@@ -141,11 +215,12 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                 if let Some(prepared) = prepared {
                     self.write_ruliad_proof_policy_dagger_telemetry(
                         RuliadProofPolicyDaggerTelemetry::from_verifier_panel(
-                            prepared.stats,
+                            &prepared.stats,
                             terminal_policy,
                             schedule_step_index,
                             prepared.decision_rows,
-                        ),
+                        )
+                        .with_policy_sampling(ruliad_policy_batch.as_deref()),
                     );
                     let prepared =
                         local_predictive_coding::lift_ruliad_verifier_terminal::<B>(prepared);
@@ -199,15 +274,18 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                         item: LanguageModelTrainItem::new(loss),
                     };
                 }
-                self.local_predictive_coding_profile
-                    .record_structured_terminal_skip();
+                self.report_ruliad_verifier_terminal_skip(
+                    ruliad_policy_batch.as_deref(),
+                    terminal_policy,
+                    schedule_step_index,
+                    if ruliad_policy_batch.is_some() {
+                        "unencodable_or_empty_verifier_panel"
+                    } else {
+                        "missing_policy_batch"
+                    },
+                );
             }
         }
-        let verifier_terminal_due = local_predictive_coding::verifier_terminal_due(
-            self.local_predictive_coding.terminal_criterion,
-            self.ruliad_supervision.proof_policy,
-            schedule_step_index,
-        );
         if self
             .ruliad_supervision
             .prompt_value_binding
@@ -226,6 +304,31 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
             if let Some(output) = self.ruliad_prompt_value_binding_step(input) {
                 return output;
             }
+        }
+        // A context-only streaming chunk still carries an independently scheduled
+        // verifier terminal. Do not let the zero-token fast path silently drop
+        // that objective (and bypass its required-delivery assertion).
+        let predictive_coding_verifier_due =
+            matches!(self.training_algorithm, TrainingAlgorithm::PredictiveCoding)
+                && verifier_terminal_due;
+        if self.objective.is_next_token()
+            && known_supervised_token_count == Some(0)
+            && !predictive_coding_verifier_due
+        {
+            let device = clean_inputs.device();
+            let stream_advance_started = prof_enabled.then(Instant::now);
+            self.advance_stream_state_without_update(
+                clean_inputs,
+                summary_event_mask,
+                reset_stream_state,
+            );
+            if let Some(started) = stream_advance_started {
+                crate::train::profile::record_stream_advance(started.elapsed().as_nanos());
+            }
+            return TrainOutput {
+                grads: GradientsParams::new(),
+                item: LanguageModelTrainItem::new(Tensor::zeros([1], &device)),
+            };
         }
         if matches!(self.training_algorithm, TrainingAlgorithm::PredictiveCoding) {
             if local_predictive_coding::verifier_terminal_due(
@@ -261,12 +364,13 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                 if let Some(prepared) = prepared {
                     self.write_ruliad_proof_policy_dagger_telemetry(
                         RuliadProofPolicyDaggerTelemetry::from_verifier_panel(
-                            prepared.stats,
+                            &prepared.stats,
                             self.ruliad_supervision
                                 .proof_policy_for_step(schedule_step_index),
                             schedule_step_index,
                             prepared.decision_rows,
-                        ),
+                        )
+                        .with_policy_sampling(ruliad_policy_batch.as_deref()),
                     );
                     let semantic_rows = prepared.decision_rows;
                     let [structured_batch_size, structured_sequence_len] =
@@ -278,6 +382,55 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                         &self.local_predictive_coding_profile,
                     );
                     debug_assert_eq!(step.report.global_backward_calls, 0);
+                    let preserves_primary =
+                        local_predictive_coding::verifier_terminal_preserves_primary(
+                            self.local_predictive_coding.terminal_criterion,
+                        );
+                    if preserves_primary {
+                        let primary = if self
+                            .local_predictive_coding
+                            .temporal_credit
+                            .carries_temporal_credit()
+                            && known_supervised_token_count != Some(0)
+                        {
+                            let chunk_size = self
+                                .effective_tbptt_chunk_size(block_size)
+                                .expect("validated exact temporal credit requires a TBPTT chunk");
+                            self.primary_exact_window_predictive_coding_step(
+                                clean_inputs,
+                                targets,
+                                loss_mask,
+                                reset_stream_state,
+                                chunk_size,
+                            )
+                        } else {
+                            self.primary_local_predictive_coding_step(
+                                clean_inputs,
+                                targets,
+                                loss_mask,
+                                known_supervised_token_count,
+                                summary_event_mask,
+                                reset_stream_state,
+                                block_size,
+                            )
+                        };
+                        let mut accumulator = GradientsAccumulator::new();
+                        accumulator.accumulate(self, primary.grads);
+                        accumulator.accumulate(self, step.grads);
+                        if prof_enabled {
+                            crate::train::profile::record_local_learning_step(
+                                step.report.elapsed_ns,
+                            );
+                            crate::train::profile::record_structured_terminal(
+                                semantic_rows,
+                                structured_batch_size.saturating_mul(structured_sequence_len),
+                            );
+                        }
+                        return TrainOutput {
+                            grads: self.apply_gradient_scale_schedule(accumulator.grads()),
+                            item: LanguageModelTrainItem::new(primary.loss + step.loss),
+                        };
+                    }
                     if prof_enabled {
                         crate::train::profile::record_local_learning_step(step.report.elapsed_ns);
                         crate::train::profile::record_structured_terminal(
@@ -304,106 +457,50 @@ impl<B: AutodiffBackend> TrainStep for LanguageTrainModel<B> {
                         item: LanguageModelTrainItem::new(step.loss),
                     };
                 }
-                self.local_predictive_coding_profile
-                    .record_structured_terminal_skip();
+                self.report_ruliad_verifier_terminal_skip(
+                    ruliad_policy_batch.as_deref(),
+                    self.ruliad_supervision
+                        .proof_policy_for_step(schedule_step_index),
+                    schedule_step_index,
+                    if ruliad_policy_batch.is_some() {
+                        "unencodable_or_empty_verifier_panel"
+                    } else {
+                        "missing_policy_batch"
+                    },
+                );
             }
             let chunk_size = self.effective_tbptt_chunk_size(block_size);
             if self
                 .local_predictive_coding
                 .temporal_credit
                 .carries_temporal_credit()
+                && known_supervised_token_count != Some(0)
                 && let Some(chunk_size) = chunk_size
             {
-                return self.exact_window_predictive_coding_step(
+                let primary = self.primary_exact_window_predictive_coding_step(
                     clean_inputs,
                     targets,
                     loss_mask,
                     reset_stream_state,
                     chunk_size,
                 );
-            }
-            if chunk_size.is_none() && !self.tbptt_persist_across_steps {
-                let step = local_predictive_coding::local_predictive_coding_train_step(
-                    &self.model,
-                    clean_inputs,
-                    targets,
-                    loss_mask,
-                    &self.local_predictive_coding,
-                    &self.local_predictive_coding_profile,
-                );
-                debug_assert_eq!(step.report.global_backward_calls, 0);
-                if prof_enabled {
-                    crate::train::profile::record_local_learning_step(step.report.elapsed_ns);
-                }
                 return TrainOutput {
-                    grads: self.apply_gradient_scale_schedule(step.grads),
-                    item: LanguageModelTrainItem::new(step.loss),
+                    grads: self.apply_gradient_scale_schedule(primary.grads),
+                    item: LanguageModelTrainItem::new(primary.loss),
                 };
             }
-
-            let mut state = self.load_step_state(reset_stream_state, block_size);
-            let mut accumulator = GradientsAccumulator::new();
-            let mut total_loss: Option<Tensor<B, 1>> = None;
-            let mut total_supervised_tokens: Option<Tensor<B, 1>> = None;
-            let mut total_elapsed_ns = 0u128;
-            let chunk_size = chunk_size.unwrap_or(block_size);
-            for start in (0..block_size).step_by(chunk_size) {
-                let end = (start + chunk_size).min(block_size);
-                let chunk_inputs = Self::slice_tokens(clean_inputs.clone(), batch_size, start, end);
-                let chunk_targets = Self::slice_tokens(targets.clone(), batch_size, start, end);
-                let chunk_loss_mask = loss_mask
-                    .clone()
-                    .map(|mask| Self::slice_tokens(mask, batch_size, start, end));
-                let mut step =
-                    local_predictive_coding::local_predictive_coding_train_step_with_state(
-                        &self.model,
-                        chunk_inputs,
-                        chunk_targets,
-                        chunk_loss_mask,
-                        state,
-                        &self.local_predictive_coding,
-                        &self.local_predictive_coding_profile,
-                    );
-                debug_assert_eq!(step.report.global_backward_calls, 0);
-                state = step.terminal_state;
-                let supervised_tokens = step.supervised_tokens;
-                rescale_gradients_by_device_scalar::<B, _>(
-                    self,
-                    &mut step.grads,
-                    supervised_tokens.clone().inner(),
-                    false,
-                );
-                accumulator.accumulate(self, step.grads);
-                let weighted_loss = step.loss * supervised_tokens.clone();
-                total_loss = Some(match total_loss {
-                    Some(accumulated) => accumulated + weighted_loss,
-                    None => weighted_loss,
-                });
-                total_supervised_tokens = Some(match total_supervised_tokens {
-                    Some(accumulated) => accumulated + supervised_tokens,
-                    None => supervised_tokens,
-                });
-                total_elapsed_ns = total_elapsed_ns.saturating_add(step.report.elapsed_ns);
-            }
-            self.store_step_state(state);
-            if prof_enabled {
-                crate::train::profile::record_local_learning_step(total_elapsed_ns);
-            }
-            let supervised_tokens = total_supervised_tokens
-                .expect("local PC TBPTT requires at least one chunk")
-                .clamp_min(1.0);
-            let mut grads = accumulator.grads();
-            rescale_gradients_by_device_scalar::<B, _>(
-                self,
-                &mut grads,
-                supervised_tokens.clone().inner(),
-                true,
+            let primary = self.primary_local_predictive_coding_step(
+                clean_inputs,
+                targets,
+                loss_mask,
+                known_supervised_token_count,
+                summary_event_mask,
+                reset_stream_state,
+                block_size,
             );
-            let loss =
-                total_loss.expect("local PC TBPTT requires at least one chunk") / supervised_tokens;
             return TrainOutput {
-                grads: self.apply_gradient_scale_schedule(grads),
-                item: LanguageModelTrainItem::new(loss),
+                grads: self.apply_gradient_scale_schedule(primary.grads),
+                item: LanguageModelTrainItem::new(primary.loss),
             };
         }
         if !self.objective.is_next_token() {

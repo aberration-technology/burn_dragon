@@ -1,0 +1,23 @@
+version = 1
+output = "target/experiments/nextlat-difficulty-inspection"
+repositories = ["."]
+
+[limits]
+system_fraction = 0.90
+headroom_mib = 4096
+poll_seconds = 0.25
+shared_gpu_memory = true
+
+[[cases]]
+id = "training"
+expected_peak_mib = 1024
+timeout_seconds = 60
+argv = ["target/release/bd-ruliad", "inspect-samples", "--config", "config/language/experiments/next_latent/corpus.toml", "--split", "train", "--levels", "0,1,2,3", "--samples-per-bucket", "8", "--out", "{output}/samples.json"]
+inputs = ["config/language/experiments/next_latent/corpus.toml"]
+
+[[cases]]
+id = "structural-validation"
+expected_peak_mib = 1024
+timeout_seconds = 60
+argv = ["target/release/bd-ruliad", "inspect-samples", "--config", "config/language/experiments/next_latent/structural-eval.corpus.toml", "--split", "validation", "--levels", "0,1,2,3", "--samples-per-bucket", "8", "--out", "{output}/samples.json"]
+inputs = ["config/language/experiments/next_latent/corpus.toml", "config/language/experiments/next_latent/structural-eval.corpus.toml"]

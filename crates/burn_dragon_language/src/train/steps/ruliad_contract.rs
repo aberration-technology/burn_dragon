@@ -1290,7 +1290,7 @@ impl<B: BackendTrait> LanguageTrainModel<B> {
         }
     }
 
-    pub(super) fn ruliad_policy_row_from_completion(
+    pub(crate) fn ruliad_policy_row_from_completion(
         prompt: &[i64],
         completion: &[i64],
     ) -> Option<(Vec<i64>, Vec<i64>, Vec<f32>)> {

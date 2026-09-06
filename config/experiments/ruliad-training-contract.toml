@@ -1,0 +1,42 @@
+version = 1
+output = "target/experiments/ruliad-training-contract-v5"
+repositories = [".", "../burn_pc", "../burn_ecs", "../burn_eggroll", "../burn_p2p"]
+
+[limits]
+system_fraction = 0.90
+headroom_mib = 4096
+poll_seconds = 0.25
+gpu_sample_seconds = 2.0
+shared_gpu_memory = true
+
+[[cases]]
+id = "adamw-seed13"
+gpu = true
+expected_peak_mib = 65536
+timeout_seconds = 600
+argv = ["target/release/examples/train_language", "--backend", "cuda", "--config", "config/language/experiments/predictive_coding/evaluation-contract-pilot-adamw.toml"]
+inputs = ["config/language/experiments/predictive_coding/evaluation-contract-pilot-adamw.toml", "config/language/experiments/predictive_coding/evaluation-contract-pilot.toml", "crates/burn_dragon_p2p/deploy/profiles/ruliad-r3.semantic-action.corpus.toml"]
+
+[[cases]]
+id = "pc-seed13"
+gpu = true
+expected_peak_mib = 65536
+timeout_seconds = 600
+argv = ["target/release/examples/train_language", "--backend", "cuda", "--config", "config/language/experiments/predictive_coding/evaluation-contract-pilot.toml"]
+inputs = ["config/language/experiments/predictive_coding/evaluation-contract-pilot.toml", "crates/burn_dragon_p2p/deploy/profiles/ruliad-r3.semantic-action.corpus.toml"]
+
+[[cases]]
+id = "adamw-no-stream-seed13"
+gpu = true
+expected_peak_mib = 65536
+timeout_seconds = 600
+argv = ["target/release/examples/train_language", "--backend", "cuda", "--config", "config/language/experiments/predictive_coding/evaluation-contract-pilot-adamw.toml", "--config", "config/language/experiments/predictive_coding/evaluation-contract-no-stream.overlay.toml"]
+inputs = ["config/language/experiments/predictive_coding/evaluation-contract-pilot-adamw.toml", "config/language/experiments/predictive_coding/evaluation-contract-pilot.toml", "config/language/experiments/predictive_coding/evaluation-contract-no-stream.overlay.toml", "crates/burn_dragon_p2p/deploy/profiles/ruliad-r3.semantic-action.corpus.toml"]
+
+[[cases]]
+id = "pc-no-stream-seed13"
+gpu = true
+expected_peak_mib = 65536
+timeout_seconds = 600
+argv = ["target/release/examples/train_language", "--backend", "cuda", "--config", "config/language/experiments/predictive_coding/evaluation-contract-pilot.toml", "--config", "config/language/experiments/predictive_coding/evaluation-contract-no-stream.overlay.toml"]
+inputs = ["config/language/experiments/predictive_coding/evaluation-contract-pilot.toml", "config/language/experiments/predictive_coding/evaluation-contract-no-stream.overlay.toml", "crates/burn_dragon_p2p/deploy/profiles/ruliad-r3.semantic-action.corpus.toml"]

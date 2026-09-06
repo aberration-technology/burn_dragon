@@ -101,8 +101,8 @@ pub(crate) use burn_dragon_train::train::metrics::{
 pub(crate) use burn_dragon_train::train::pipeline::{
     PipelinePlan, PipelineRankWorkload, ResolvedLrScheduler, ResolvedOptimizer, ScheduleSource,
     TrainSchedule, adamw_config_from_optimizer, build_pipeline_plan, build_pipeline_rank_workload,
-    create_run_dir, resolve_optimizer, resolve_valid_steps_per_epoch,
-    simulate_pipeline_communication, split_microbatch_ranges, write_latest_run,
+    create_run_dir, resolve_optimizer, simulate_pipeline_communication, split_microbatch_ranges,
+    write_latest_run,
 };
 #[cfg(feature = "ddp")]
 pub(crate) use burn_dragon_train::train::runtime::resolve_collective_config;

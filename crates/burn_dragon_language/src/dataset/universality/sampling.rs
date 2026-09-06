@@ -33,12 +33,19 @@ pub(super) fn live_source_batch_cache_bytes() -> usize {
         .unwrap_or(DEFAULT_LIVE_SOURCE_BATCH_CACHE_BYTES)
 }
 
-pub(super) fn live_source_selection_documents_per_step(batch_size: usize) -> usize {
-    let configured = std::env::var("DragonModel_RULIAD_SOURCE_SELECTION_DOCUMENTS_PER_STEP")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0);
-    bounded_live_source_selection_documents_per_step(batch_size, configured)
+pub(super) fn live_source_selection_documents_per_step(
+    batch_size: usize,
+    configured: Option<usize>,
+) -> usize {
+    let environment_override =
+        std::env::var("DragonModel_RULIAD_SOURCE_SELECTION_DOCUMENTS_PER_STEP")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0);
+    bounded_live_source_selection_documents_per_step(
+        batch_size,
+        environment_override.or(configured),
+    )
 }
 
 pub(super) fn bounded_live_source_selection_documents_per_step(
@@ -46,7 +53,7 @@ pub(super) fn bounded_live_source_selection_documents_per_step(
     configured: Option<usize>,
 ) -> usize {
     configured
-        .unwrap_or(DEFAULT_LIVE_SOURCE_SELECTION_DOCUMENTS_PER_STEP)
+        .unwrap_or(batch_size.max(1))
         .min(batch_size.max(1))
         .max(1)
 }
@@ -63,12 +70,22 @@ pub(super) fn live_source_selection_eos_window_probability() -> f64 {
 pub(super) fn source_selection_step_seed(
     epoch_index: usize,
     absolute_step: usize,
-    salt: usize,
+    salt: u64,
 ) -> u64 {
-    0x8B8B_4D1A_51E5_E1ECu64
-        ^ (epoch_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ (absolute_step as u64).rotate_left(17)
-        ^ (salt as u64).rotate_left(31)
+    mix_source_seed(
+        0x8B8B_4D1A_51E5_E1ECu64
+            ^ mix_source_seed(epoch_index as u64)
+            ^ mix_source_seed((absolute_step as u64) ^ 0x9E37_79B9_7F4A_7C15)
+            ^ mix_source_seed(salt ^ 0xD1B5_4A32_D192_ED03),
+    )
+}
+
+fn mix_source_seed(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
 }
 
 pub(super) fn source_label_seed(label: &str) -> u64 {
@@ -98,12 +115,80 @@ pub(super) fn live_source_selection_sample_index(
     let seed = source_selection_step_seed(
         epoch_index,
         absolute_step,
-        source_label_seed(bucket_label) as usize
-            ^ document_rank.rotate_left(7)
-            ^ split_salt.rotate_left(17),
+        source_label_seed(bucket_label)
+            ^ (document_rank as u64).rotate_left(7)
+            ^ (split_salt as u64).rotate_left(17),
     );
     let mut rng = StdRng::seed_from_u64(seed);
     rng.gen_range(0..sample_count)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct LiveSourceSampleCoordinate {
+    pub epoch_index: usize,
+    pub sample_index: usize,
+}
+
+/// Address an effectively unbounded online training stream without changing
+/// the finite sample count used by offline materialization and validation.
+/// Rows within a page form a deterministic permutation, so a large batch does
+/// not sample the same generated document more than once merely because the
+/// configured materialization panel is small.
+pub(super) fn live_source_selection_sample_coordinate(
+    sample_count: usize,
+    split: burn_dragon_universality::SampleSplit,
+    epoch_index: usize,
+    absolute_step: usize,
+    bucket_label: &str,
+    document_rank: usize,
+) -> LiveSourceSampleCoordinate {
+    let sample_count = sample_count.max(1);
+    if split == burn_dragon_universality::SampleSplit::Validation {
+        return LiveSourceSampleCoordinate {
+            epoch_index,
+            sample_index: live_source_selection_sample_index(
+                sample_count,
+                split,
+                epoch_index,
+                absolute_step,
+                bucket_label,
+                document_rank,
+            ),
+        };
+    }
+
+    let page = document_rank / sample_count;
+    let slot = document_rank % sample_count;
+    let seed = source_selection_step_seed(
+        epoch_index,
+        absolute_step,
+        source_label_seed(bucket_label) ^ (page as u64).rotate_left(29),
+    );
+    let count = sample_count as u64;
+    let offset = (seed % count) as usize;
+    let mut stride = ((seed.rotate_right(23) % count) as usize).max(1);
+    while greatest_common_divisor(stride, sample_count) != 1 {
+        stride = (stride + 1) % sample_count;
+        if stride == 0 {
+            stride = 1;
+        }
+    }
+    let sample_index = offset.wrapping_add(slot.wrapping_mul(stride)) % sample_count;
+    LiveSourceSampleCoordinate {
+        // Keep native and wasm peers aligned by deriving the virtual epoch
+        // from an explicitly fixed-width value.
+        epoch_index: ((seed >> 32) as u32) as usize,
+        sample_index,
+    }
+}
+
+fn greatest_common_divisor(mut left: usize, mut right: usize) -> usize {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
 }
 
 pub(super) fn fixed_validation_probe_sample_index(
@@ -161,7 +246,7 @@ pub(super) fn source_selected_windows_from_documents(
             let mut rng = StdRng::seed_from_u64(source_selection_step_seed(
                 epoch_index,
                 absolute_step,
-                source_label_seed(bucket_label) as usize ^ batch_index.rotate_left(11),
+                source_label_seed(bucket_label) ^ (batch_index as u64).rotate_left(11),
             ));
             if prefer_answer_window {
                 for attempt in 0..document_count {
@@ -235,7 +320,8 @@ pub(super) fn source_selected_stream_windows_from_documents(
                 let mut rng = StdRng::seed_from_u64(source_selection_step_seed(
                     epoch_index,
                     absolute_step,
-                    batch_index.rotate_left(13) ^ chunk_index_in_document.rotate_left(23),
+                    (batch_index as u64).rotate_left(13)
+                        ^ (chunk_index_in_document as u64).rotate_left(23),
                 ));
                 for attempt in 0..documents.len() {
                     let document = documents

@@ -1,0 +1,42 @@
+version = 1
+output = "target/experiments/nextlat-credit-screen"
+repositories = [".", "../burn_pc", "../burn_ecs", "../burn_eggroll", "../burn_p2p"]
+
+[limits]
+system_fraction = 0.90
+headroom_mib = 4096
+poll_seconds = 0.25
+gpu_sample_seconds = 2.0
+shared_gpu_memory = true
+
+[[cases]]
+id = "joint-credit1"
+gpu = true
+expected_peak_mib = 49152
+timeout_seconds = 1200
+argv = ["target/release/examples/train_language", "--backend", "cuda", "--config", "config/language/experiments/next_latent/credit-base.toml"]
+inputs = ["config/language/experiments/next_latent/base.toml", "config/language/experiments/next_latent/corpus.toml", "config/language/experiments/next_latent/credit-base.toml"]
+
+[[cases]]
+id = "joint-credit4"
+gpu = true
+expected_peak_mib = 49152
+timeout_seconds = 1200
+argv = ["target/release/examples/train_language", "--backend", "cuda", "--config", "config/language/experiments/next_latent/credit-base.toml", "--config", "config/language/experiments/next_latent/credit4.overlay.toml"]
+inputs = ["config/language/experiments/next_latent/base.toml", "config/language/experiments/next_latent/corpus.toml", "config/language/experiments/next_latent/credit-base.toml", "config/language/experiments/next_latent/credit4.overlay.toml"]
+
+[[cases]]
+id = "balanced-credit4"
+gpu = true
+expected_peak_mib = 49152
+timeout_seconds = 1200
+argv = ["target/release/examples/train_language", "--backend", "cuda", "--config", "config/language/experiments/next_latent/credit-base.toml", "--config", "config/language/experiments/next_latent/credit4.overlay.toml", "--config", "config/language/experiments/next_latent/answer-balanced.overlay.toml"]
+inputs = ["config/language/experiments/next_latent/base.toml", "config/language/experiments/next_latent/corpus.toml", "config/language/experiments/next_latent/credit-base.toml", "config/language/experiments/next_latent/credit4.overlay.toml", "config/language/experiments/next_latent/answer-balanced.overlay.toml"]
+
+[[cases]]
+id = "balanced-credit4-nextlat2"
+gpu = true
+expected_peak_mib = 49152
+timeout_seconds = 1200
+argv = ["target/release/examples/train_language", "--backend", "cuda", "--config", "config/language/experiments/next_latent/credit-base.toml", "--config", "config/language/experiments/next_latent/credit4.overlay.toml", "--config", "config/language/experiments/next_latent/answer-balanced.overlay.toml", "--config", "config/language/experiments/next_latent/h2.overlay.toml"]
+inputs = ["config/language/experiments/next_latent/base.toml", "config/language/experiments/next_latent/corpus.toml", "config/language/experiments/next_latent/credit-base.toml", "config/language/experiments/next_latent/credit4.overlay.toml", "config/language/experiments/next_latent/answer-balanced.overlay.toml", "config/language/experiments/next_latent/h2.overlay.toml"]

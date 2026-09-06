@@ -44,10 +44,12 @@ pub mod api {
         #[cfg(feature = "train")]
         pub use crate::config::{
             DatasetConfig, DatasetSourceConfig, HuggingFaceDatasetConfig, HuggingFaceRecordFormat,
-            LocalPredictiveCodingConfig, LocalPredictiveCodingSolver, PcGradientNormScope,
+            LocalPredictiveCodingConfig, LocalPredictiveCodingSolver,
+            LocalPredictiveCodingTerminalCriterion, PcGradientNormScope,
             PredictiveCodingBackwardMode, PredictiveCodingConfig, PredictiveCodingFactorReduction,
             PredictiveCodingMode, PredictiveCodingParameterUpdate, PredictiveCodingStateScope,
-            RepromptTruncation, RuliadProbeGenerationConfig, RuliadValidationPanelConfig,
+            RepromptTruncation, RuliadProbeGenerationConfig, RuliadProofPolicyCandidateSymmetry,
+            RuliadProofPolicyNormalization, RuliadProofPolicyScoring, RuliadValidationPanelConfig,
             RuliadValidationPanelMode, SdftObjectiveConfig, SdftSdpoObjectiveConfig,
             SdpoObjectiveConfig, SelfDistillationKlKind, TeacherRegularization, TrainingAlgorithm,
             TrainingConfig, TrainingHyperparameters, TrainingObjectiveConfig,
@@ -100,7 +102,9 @@ pub mod api {
         pub use crate::train::ruliad_policy::{
             EncodedRuliadProofActionPresentation, EncodedRuliadProofActionRequest,
             RuliadProofActionDecision, SemanticActionOrbitSummary,
-            select_ruliad_proof_actions_batch, select_ruliad_proof_actions_batch_with_scoring,
+            encode_ruliad_proof_action_request, select_ruliad_proof_actions_batch,
+            select_ruliad_proof_actions_batch_with_contract,
+            select_ruliad_proof_actions_batch_with_scoring,
         };
     }
 }
@@ -130,11 +134,12 @@ pub use config::{
     PredictiveCodingConfig, PredictiveCodingFactorReduction, PredictiveCodingMode,
     PredictiveCodingParameterUpdate, PredictiveCodingStateScope, RepromptTruncation,
     RuliadAnswerDenoisingConfig, RuliadAnswerRankingConfig, RuliadProbeGenerationConfig,
-    RuliadSupervisionConfig, RuliadSupervisionMode, RuliadValidationPanelConfig,
-    RuliadValidationPanelMode, SdftObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind,
-    TeacherRegularization, TrainingAlgorithm, TrainingConfig, TrainingHyperparameters,
-    TrainingObjectiveConfig, TrainingObjectiveKind, TrainingValidationConfig,
-    TrainingValidationExecution, TrainingValidationObjective, load_training_config,
+    RuliadPromptValueBindingContext, RuliadPromptValueBindingObjective, RuliadSupervisionConfig,
+    RuliadSupervisionMode, RuliadValidationPanelConfig, RuliadValidationPanelMode,
+    SdftObjectiveConfig, SdpoObjectiveConfig, SelfDistillationKlKind, TeacherRegularization,
+    TrainingAlgorithm, TrainingConfig, TrainingHyperparameters, TrainingObjectiveConfig,
+    TrainingObjectiveKind, TrainingValidationConfig, TrainingValidationExecution,
+    TrainingValidationObjective, load_training_config,
 };
 pub use generation::{
     ContextStrategy, GenerationProfileSnapshot, GenerationSettings,

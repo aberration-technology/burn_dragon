@@ -1,5 +1,6 @@
 [workspace]
 resolver = "3"
+exclude = ["vendor/burn-cubecl-fusion"]
 members = [
   "xtask",
   "crates/burn_dragon_time",
@@ -13,6 +14,10 @@ members = [
   "crates/burn_dragon_train",
   "crates/burn_dragon_universality",
 ]
+
+[patch.crates-io]
+# Burn 0.21 mixed byte-mask/matmul vectorization backport; see vendor/PATCHES.md.
+burn-cubecl-fusion = { path = "vendor/burn-cubecl-fusion" }
 
 [workspace.package]
 version = "0.21.8"

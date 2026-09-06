@@ -1,0 +1,4 @@
+extends = ["corpus.toml"]
+
+# A larger evaluation index space permits unused confirmatory panels.
+validation_samples = 256

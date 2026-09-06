@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -55,6 +56,14 @@ SUMMARY_COLUMNS = [
     "source_selection_feedback_updates_enabled",
     "ruliad_source_selection_cold_start_enabled",
     "proof_policy_mode",
+    "proof_policy_target",
+    "proof_policy_prompt_context",
+    "policy_probe_prompt_context",
+    "policy_probe_scoring",
+    "pc_inference_steps",
+    "pc_step_size",
+    "pc_prediction_precision",
+    "pc_next_token_solver",
     "wall_s",
     "tok_s",
     "model_tok_s",
@@ -87,6 +96,42 @@ SUMMARY_COLUMNS = [
     "stream_carry_relative_gain",
     "lr_last",
     "pc_ms_mean",
+    "proof_policy_event_count",
+    "proof_policy_counterfactual_objective_histogram",
+    "proof_policy_expected_event_count",
+    "proof_policy_delivery_fraction",
+    "proof_policy_delivery_complete",
+    "proof_policy_skipped_event_count",
+    "proof_policy_consolidation_novel_event_count",
+    "proof_policy_consolidation_replay_event_count",
+    "proof_policy_consolidation_released_unique_steps",
+    "proof_policy_consolidation_max_logical_selection_step",
+    "proof_policy_consolidation_metadata_missing_count",
+    "proof_policy_consolidation_metadata_invalid_count",
+    "proof_policy_consolidation_coordinate_content_conflict_count",
+    "proof_policy_consolidation_integrity_pass",
+    "proof_policy_batch_stream_sha256",
+    "proof_policy_objective_panel_stream_sha256",
+    "proof_policy_objective_panel_unique_count",
+    "proof_policy_objective_panel_missing_count",
+    "proof_policy_prompt_retention_fraction",
+    "proof_policy_truncated_presentations",
+    "proof_policy_difficulty_sample_groups",
+    "proof_policy_difficulty_visited_states",
+    "proof_policy_difficulty_expert_rows",
+    "proof_policy_expert_selected_index_histogram",
+    "proof_policy_expert_equivalent_index_histogram",
+    "proof_policy_model_selected_index_histogram",
+    "proof_policy_dynamic_event_count",
+    "proof_policy_model_scoring_batches",
+    "proof_policy_model_visited_expert_rows",
+    "proof_policy_dagger_expert_rows",
+    "proof_policy_static_expert_rows",
+    "proof_policy_model_valid_actions",
+    "proof_policy_model_invalid_actions",
+    "proof_policy_model_expert_equivalent_actions",
+    "proof_policy_model_off_expert_actions",
+    "proof_policy_model_scoring_ms",
     "pc_corrected_fraction",
     "source_loss",
     "source_loss_cadence_mean",
@@ -99,8 +144,29 @@ SUMMARY_COLUMNS = [
     "ruliad_verifier_accuracy",
     "ruliad_verifier_accuracy_best",
     "ruliad_verifier_accuracy_final_minus_best",
+    "ruliad_schema_valid_wrong_rate",
+    "ruliad_malformed_rate",
+    "ruliad_completion_health_rate",
+    "ruliad_policy_context_verifier_accuracy",
+    "ruliad_policy_context_schema_valid_wrong_rate",
+    "ruliad_policy_context_malformed_rate",
+    "ruliad_policy_context_completion_health_rate",
+    "ruliad_policy_context_teacher_forced_nll",
+    "ruliad_policy_context_teacher_forced_token_accuracy",
+    "ruliad_policy_context_teacher_forced_first_token_accuracy",
+    "ruliad_policy_context_teacher_forced_sequence_accuracy",
+    "ruliad_policy_context_swap_teacher_forced_nll",
+    "ruliad_policy_context_binding_nll_gain",
+    "ruliad_structured_policy_verifier_accuracy",
+    "ruliad_structured_policy_partial_credit_rate",
+    "ruliad_structured_policy_mean_partial_progress",
+    "ruliad_structured_policy_schema_valid_wrong_rate",
+    "ruliad_structured_policy_malformed_rate",
+    "ruliad_structured_policy_completion_health_rate",
+    "ruliad_structured_policy_consistency_gap",
     "ruliad_constrained_equivalent_top1",
     "ruliad_constrained_free_accuracy_gap",
+    "ruliad_policy_context_decode_gap",
     "ruliad_constrained_equivalent_nll",
     "ruliad_constrained_valid_invalid_margin",
     "ruliad_context_swap_top1_change_rate",
@@ -140,6 +206,16 @@ SUMMARY_COLUMNS = [
     "capability_allowed_max_difficulty",
     "output_entropy_bits",
     "output_distinct_2_fraction",
+    "prompt_value_binding_event_count",
+    "prompt_value_binding_active_steps",
+    "prompt_value_binding_skipped_steps",
+    "prompt_value_binding_algorithm_last",
+    "prompt_value_binding_objective_last",
+    "prompt_value_binding_sample_groups_total",
+    "prompt_value_binding_rows_total",
+    "prompt_value_binding_active_tokens_total",
+    "prompt_value_binding_padded_tokens_total",
+    "prompt_value_binding_global_backward_calls_total",
 ]
 
 # Keep aggregation, paired comparisons, and CSV serialization on one schema.
@@ -183,8 +259,29 @@ ANALYSIS_METRICS = [
     "ruliad_verifier_accuracy",
     "ruliad_verifier_accuracy_best",
     "ruliad_verifier_accuracy_final_minus_best",
+    "ruliad_schema_valid_wrong_rate",
+    "ruliad_malformed_rate",
+    "ruliad_completion_health_rate",
+    "ruliad_policy_context_verifier_accuracy",
+    "ruliad_policy_context_schema_valid_wrong_rate",
+    "ruliad_policy_context_malformed_rate",
+    "ruliad_policy_context_completion_health_rate",
+    "ruliad_policy_context_teacher_forced_nll",
+    "ruliad_policy_context_teacher_forced_token_accuracy",
+    "ruliad_policy_context_teacher_forced_first_token_accuracy",
+    "ruliad_policy_context_teacher_forced_sequence_accuracy",
+    "ruliad_policy_context_swap_teacher_forced_nll",
+    "ruliad_policy_context_binding_nll_gain",
+    "ruliad_structured_policy_verifier_accuracy",
+    "ruliad_structured_policy_partial_credit_rate",
+    "ruliad_structured_policy_mean_partial_progress",
+    "ruliad_structured_policy_schema_valid_wrong_rate",
+    "ruliad_structured_policy_malformed_rate",
+    "ruliad_structured_policy_completion_health_rate",
+    "ruliad_structured_policy_consistency_gap",
     "ruliad_constrained_equivalent_top1",
     "ruliad_constrained_free_accuracy_gap",
+    "ruliad_policy_context_decode_gap",
     "ruliad_constrained_equivalent_nll",
     "ruliad_constrained_valid_invalid_margin",
     "ruliad_context_swap_top1_change_rate",
@@ -225,6 +322,41 @@ ANALYSIS_METRICS = [
     "output_entropy_bits",
     "output_distinct_2_fraction",
     "pc_ms_mean",
+    "proof_policy_event_count",
+    "proof_policy_expected_event_count",
+    "proof_policy_delivery_fraction",
+    "proof_policy_delivery_complete",
+    "proof_policy_skipped_event_count",
+    "proof_policy_consolidation_novel_event_count",
+    "proof_policy_consolidation_replay_event_count",
+    "proof_policy_consolidation_released_unique_steps",
+    "proof_policy_consolidation_max_logical_selection_step",
+    "proof_policy_consolidation_metadata_missing_count",
+    "proof_policy_consolidation_metadata_invalid_count",
+    "proof_policy_consolidation_coordinate_content_conflict_count",
+    "proof_policy_consolidation_integrity_pass",
+    "proof_policy_batch_stream_sha256",
+    "proof_policy_objective_panel_stream_sha256",
+    "proof_policy_objective_panel_unique_count",
+    "proof_policy_objective_panel_missing_count",
+    "proof_policy_prompt_retention_fraction",
+    "proof_policy_truncated_presentations",
+    "proof_policy_difficulty_sample_groups",
+    "proof_policy_difficulty_visited_states",
+    "proof_policy_difficulty_expert_rows",
+    "proof_policy_expert_selected_index_histogram",
+    "proof_policy_expert_equivalent_index_histogram",
+    "proof_policy_model_selected_index_histogram",
+    "proof_policy_dynamic_event_count",
+    "proof_policy_model_scoring_batches",
+    "proof_policy_model_visited_expert_rows",
+    "proof_policy_dagger_expert_rows",
+    "proof_policy_static_expert_rows",
+    "proof_policy_model_valid_actions",
+    "proof_policy_model_invalid_actions",
+    "proof_policy_model_expert_equivalent_actions",
+    "proof_policy_model_off_expert_actions",
+    "proof_policy_model_scoring_ms",
 ]
 
 EVENT_SUMMARY_COLUMNS = [
@@ -246,6 +378,49 @@ EVENT_SUMMARY_COLUMNS = [
     "source_selection_feedback_updates_enabled",
     "ruliad_source_selection_cold_start_enabled",
     "proof_policy_mode",
+    "proof_policy_target",
+    "proof_policy_prompt_context",
+    "policy_probe_prompt_context",
+    "pc_inference_steps",
+    "pc_step_size",
+    "pc_prediction_precision",
+    "pc_next_token_solver",
+    "proof_policy_event_count",
+    "proof_policy_counterfactual_objective_histogram",
+    "proof_policy_expected_event_count",
+    "proof_policy_delivery_fraction",
+    "proof_policy_delivery_complete",
+    "proof_policy_skipped_event_count",
+    "proof_policy_consolidation_novel_event_count",
+    "proof_policy_consolidation_replay_event_count",
+    "proof_policy_consolidation_released_unique_steps",
+    "proof_policy_consolidation_max_logical_selection_step",
+    "proof_policy_consolidation_metadata_missing_count",
+    "proof_policy_consolidation_metadata_invalid_count",
+    "proof_policy_consolidation_coordinate_content_conflict_count",
+    "proof_policy_consolidation_integrity_pass",
+    "proof_policy_batch_stream_sha256",
+    "proof_policy_objective_panel_stream_sha256",
+    "proof_policy_objective_panel_unique_count",
+    "proof_policy_objective_panel_missing_count",
+    "proof_policy_prompt_retention_fraction",
+    "proof_policy_truncated_presentations",
+    "proof_policy_difficulty_sample_groups",
+    "proof_policy_difficulty_visited_states",
+    "proof_policy_difficulty_expert_rows",
+    "proof_policy_expert_selected_index_histogram",
+    "proof_policy_expert_equivalent_index_histogram",
+    "proof_policy_model_selected_index_histogram",
+    "proof_policy_dynamic_event_count",
+    "proof_policy_model_scoring_batches",
+    "proof_policy_model_visited_expert_rows",
+    "proof_policy_dagger_expert_rows",
+    "proof_policy_static_expert_rows",
+    "proof_policy_model_valid_actions",
+    "proof_policy_model_invalid_actions",
+    "proof_policy_model_expert_equivalent_actions",
+    "proof_policy_model_off_expert_actions",
+    "proof_policy_model_scoring_ms",
     "training_wall_seconds",
     "train_tokens",
     "source_batches",
@@ -304,6 +479,22 @@ EVENT_SUMMARY_COLUMNS = [
     "ruliad_verifier_accuracy_last",
     "ruliad_verifier_accuracy_best",
     "ruliad_verifier_accuracy_final_minus_best",
+    "ruliad_policy_context_verifier_accuracy_last",
+    "ruliad_policy_context_schema_valid_wrong_rate_last",
+    "ruliad_policy_context_malformed_rate_last",
+    "ruliad_policy_context_completion_health_rate_last",
+    "ruliad_policy_context_teacher_forced_nll_last",
+    "ruliad_policy_context_teacher_forced_token_accuracy_last",
+    "ruliad_policy_context_teacher_forced_first_token_accuracy_last",
+    "ruliad_policy_context_teacher_forced_sequence_accuracy_last",
+    "ruliad_policy_context_swap_teacher_forced_nll_last",
+    "ruliad_policy_context_binding_nll_gain_last",
+    "ruliad_structured_policy_verifier_accuracy_last",
+    "ruliad_structured_policy_partial_credit_rate_last",
+    "ruliad_structured_policy_mean_partial_progress_last",
+    "ruliad_structured_policy_schema_valid_wrong_rate_last",
+    "ruliad_structured_policy_malformed_rate_last",
+    "ruliad_structured_policy_completion_health_rate_last",
     "ruliad_constrained_items_last",
     "ruliad_constrained_equivalent_top1_last",
     "ruliad_constrained_preferred_top1_last",
@@ -401,6 +592,7 @@ EVENT_SUMMARY_COLUMNS = [
     "prompt_value_binding_active_steps",
     "prompt_value_binding_skipped_steps",
     "prompt_value_binding_algorithm_last",
+    "prompt_value_binding_objective_last",
     "prompt_value_binding_sample_groups_total",
     "prompt_value_binding_rows_total",
     "prompt_value_binding_active_tokens_total",
@@ -503,12 +695,22 @@ MANIFEST_COLUMNS = [
     "tbptt_credit_window_chunks",
     "model_sequence_executor",
     "verifier_every_steps",
+    "proof_policy_start_after_steps",
     "proof_policy_scoring",
+    "proof_policy_decoder_calibration_steps",
+    "proof_policy_prompt_context",
+    "proof_policy_target",
     "proof_policy_mode",
     "proof_policy_gradient_scope",
+    "pc_inference_steps",
+    "pc_step_size",
+    "pc_prediction_precision",
+    "pc_next_token_solver",
     "proof_policy_normalization",
     "proof_policy_candidate_symmetry",
     "proof_policy_presentation_risk",
+    "policy_probe_scoring",
+    "policy_probe_prompt_context",
     "policy_probe_normalization",
     "policy_probe_candidate_symmetry",
     "proof_policy_counterfactual_targets",
@@ -520,6 +722,11 @@ MANIFEST_COLUMNS = [
     "sequence_state_probe_paired_batches",
     "source_selection_feedback_updates_enabled",
     "ruliad_source_selection_cold_start_enabled",
+    "ruliad_consolidation_enabled",
+    "ruliad_consolidation_initial_unique_steps",
+    "ruliad_consolidation_hold_steps",
+    "ruliad_consolidation_novelty_interval_steps",
+    "ruliad_consolidation_seed",
     "validation_objective",
     "validation_sampling",
     "ruliad_panel_base_difficulty_levels",
@@ -533,6 +740,19 @@ MANIFEST_COLUMNS = [
     "run_dir",
     "log_path",
     "gpu_path",
+    "checkpoint_eval_enabled",
+    "checkpoint_eval_path",
+    "checkpoint_eval_log_path",
+    "checkpoint_eval_status",
+    "checkpoint_eval_elapsed_seconds",
+    "checkpoint_eval_peak_used_mb",
+    "checkpoint_eval_min_available_mb",
+    "checkpoint_eval_free_run_items",
+    "checkpoint_eval_policy_items",
+    "checkpoint_eval_difficulty_levels",
+    "checkpoint_eval_batch_size",
+    "checkpoint_eval_policy_scoring",
+    "checkpoint_eval_policy_max_steps",
     "status",
     "elapsed_seconds",
     "peak_used_mb",
@@ -542,7 +762,10 @@ MANIFEST_COLUMNS = [
     "git_dirty",
     "clean_git_required",
     "train_binary_sha256",
+    "checkpoint_eval_binary_sha256",
     "runner_sha256",
+    "initial_model_tensor_fingerprint_schema",
+    "initial_model_sha256",
 ]
 
 
@@ -624,6 +847,14 @@ EXPERIMENT_CONTEXT_FIELDS = (
     "source_selection_feedback_updates_enabled",
     "ruliad_source_selection_cold_start_enabled",
     "proof_policy_mode",
+    "proof_policy_target",
+    "proof_policy_prompt_context",
+    "policy_probe_prompt_context",
+    "policy_probe_scoring",
+    "pc_inference_steps",
+    "pc_step_size",
+    "pc_prediction_precision",
+    "pc_next_token_solver",
 )
 
 
@@ -648,6 +879,14 @@ def experiment_context_sort_key(context: tuple[Any, ...]) -> tuple[Any, ...]:
         source_feedback,
         cold_start_enabled,
         policy_mode,
+        policy_target,
+        proof_policy_prompt_context,
+        policy_probe_prompt_context,
+        policy_probe_scoring,
+        pc_inference_steps,
+        pc_step_size,
+        pc_prediction_precision,
+        pc_next_token_solver,
     ) = context
     return (
         str(matrix or ""),
@@ -661,6 +900,14 @@ def experiment_context_sort_key(context: tuple[Any, ...]) -> tuple[Any, ...]:
         str(source_feedback or ""),
         str(cold_start_enabled or ""),
         str(policy_mode or ""),
+        str(policy_target or ""),
+        str(proof_policy_prompt_context or ""),
+        str(policy_probe_prompt_context or ""),
+        str(policy_probe_scoring or ""),
+        as_int(pc_inference_steps) or -1,
+        as_float(pc_step_size) or -1.0,
+        as_float(pc_prediction_precision) or -1.0,
+        str(pc_next_token_solver or ""),
     )
 
 
@@ -801,6 +1048,7 @@ def discover_inputs(paths: Iterable[str]) -> tuple[list[Path], list[Path], list[
                 "source_selection.jsonl",
                 "capacity_scaling.jsonl",
                 "ruliad_prompt_value_binding.jsonl",
+                "ruliad_proof_policy_dagger.jsonl",
             }:
                 event_jsonls.append(candidate)
             elif name.endswith(".json") and candidate.parent.name == "manifests":
@@ -853,6 +1101,20 @@ def normalize_summary_row(row: dict[str, str]) -> dict[str, Any]:
     normalized["proof_policy_mode"] = row.get("proof_policy_mode", "") or infer_proof_policy_mode(
         normalized["arm"]
     )
+    normalized["proof_policy_target"] = row.get("proof_policy_target", "")
+    normalized["proof_policy_prompt_context"] = row.get(
+        "proof_policy_prompt_context", ""
+    )
+    normalized["policy_probe_prompt_context"] = row.get(
+        "policy_probe_prompt_context", ""
+    )
+    normalized["policy_probe_scoring"] = row.get("policy_probe_scoring", "")
+    normalized["pc_inference_steps"] = as_int(row.get("pc_inference_steps"))
+    normalized["pc_step_size"] = as_float(row.get("pc_step_size"))
+    normalized["pc_prediction_precision"] = as_float(
+        row.get("pc_prediction_precision")
+    )
+    normalized["pc_next_token_solver"] = row.get("pc_next_token_solver", "")
     aliases = {
         "wall_s": ["wall_s", "wall"],
         "tok_s": ["tok_s"],
@@ -1020,6 +1282,33 @@ def update_metric(summary: dict[str, Any], event: dict[str, Any]) -> None:
         epoch = as_int(event.get("epoch"))
         if epoch is not None:
             summary["_ruliad_verifier_by_epoch"][epoch] = value
+    elif split == "valid" and name == "Ruliad Policy Context Teacher Forced NLL":
+        summary["ruliad_policy_context_teacher_forced_nll_last"] = value
+    elif (
+        split == "valid"
+        and name == "Ruliad Policy Context Teacher Forced Token Accuracy"
+    ):
+        summary["ruliad_policy_context_teacher_forced_token_accuracy_last"] = value
+    elif (
+        split == "valid"
+        and name == "Ruliad Policy Context Teacher Forced First Token Accuracy"
+    ):
+        summary["ruliad_policy_context_teacher_forced_first_token_accuracy_last"] = value
+    elif (
+        split == "valid"
+        and name == "Ruliad Policy Context Teacher Forced Sequence Accuracy"
+    ):
+        summary["ruliad_policy_context_teacher_forced_sequence_accuracy_last"] = value
+    elif (
+        split == "valid"
+        and name == "Ruliad Policy Context Teacher Forced Context-Swap NLL"
+    ):
+        summary["ruliad_policy_context_swap_teacher_forced_nll_last"] = value
+    elif (
+        split == "valid"
+        and name == "Ruliad Policy Context Teacher Forced Context-Binding NLL Gain"
+    ):
+        summary["ruliad_policy_context_binding_nll_gain_last"] = value
     elif split == "valid" and name == "Ruliad Policy Rollout Items":
         summary["ruliad_policy_rollout_items_last"] = value
     elif split == "valid" and name == "Ruliad Policy Rollout Solve Rate":
@@ -1209,12 +1498,56 @@ def default_event_summary(run: str, run_dir: Path) -> dict[str, Any]:
     summary["prompt_value_binding_event_count"] = 0
     summary["prompt_value_binding_active_steps"] = 0
     summary["prompt_value_binding_skipped_steps"] = 0
+    summary["prompt_value_binding_objective_last"] = ""
     summary["prompt_value_binding_sample_groups_total"] = 0
     summary["prompt_value_binding_rows_total"] = 0
     summary["prompt_value_binding_active_tokens_total"] = 0
     summary["prompt_value_binding_padded_tokens_total"] = 0
     summary["prompt_value_binding_global_backward_calls_total"] = 0
+    summary["proof_policy_event_count"] = 0
+    summary["_proof_policy_counterfactual_objective_histogram"] = {}
+    summary["proof_policy_expected_event_count"] = ""
+    summary["proof_policy_delivery_fraction"] = ""
+    summary["proof_policy_delivery_complete"] = ""
+    summary["proof_policy_prompt_context"] = ""
+    summary["proof_policy_skipped_event_count"] = 0
+    summary["proof_policy_consolidation_novel_event_count"] = 0
+    summary["proof_policy_consolidation_replay_event_count"] = 0
+    summary["proof_policy_consolidation_released_unique_steps"] = 0
+    summary["proof_policy_consolidation_max_logical_selection_step"] = 0
+    summary["proof_policy_consolidation_metadata_missing_count"] = 0
+    summary["proof_policy_consolidation_metadata_invalid_count"] = 0
+    summary["proof_policy_consolidation_coordinate_content_conflict_count"] = 0
+    summary["proof_policy_consolidation_integrity_pass"] = ""
+    summary["_proof_policy_consolidation_coordinate_fingerprints"] = {}
+    summary["_proof_policy_consolidation_fingerprint_coordinates"] = {}
+    summary["proof_policy_original_prompt_tokens"] = 0
+    summary["proof_policy_retained_prompt_tokens"] = 0
+    summary["proof_policy_truncated_presentations"] = 0
+    for key in (
+        "difficulty_sample_groups",
+        "difficulty_visited_states",
+        "difficulty_expert_rows",
+        "expert_selected_index_histogram",
+        "expert_equivalent_index_histogram",
+        "model_selected_index_histogram",
+    ):
+        summary[f"_proof_policy_{key}"] = {}
+    summary["proof_policy_dynamic_event_count"] = 0
+    summary["proof_policy_model_scoring_batches"] = 0
+    summary["proof_policy_model_visited_expert_rows"] = 0
+    summary["proof_policy_dagger_expert_rows"] = 0
+    summary["proof_policy_static_expert_rows"] = 0
+    summary["proof_policy_model_valid_actions"] = 0
+    summary["proof_policy_model_invalid_actions"] = 0
+    summary["proof_policy_model_expert_equivalent_actions"] = 0
+    summary["proof_policy_model_off_expert_actions"] = 0
+    summary["proof_policy_model_scoring_ms"] = 0.0
     summary["_pc_ms_values"] = []
+    summary["_proof_policy_fingerprints"] = []
+    summary["_proof_policy_objective_fingerprints"] = []
+    summary["proof_policy_objective_panel_missing_count"] = 0
+    summary["_proof_policy_event_steps"] = []
     summary["_source_loss_by_step"] = {}
     summary["_source_loss_unkeyed"] = []
     summary["_validation_loss_by_epoch"] = {}
@@ -1298,6 +1631,7 @@ def collect_event_summaries(
             if path.name == "ruliad_prompt_value_binding.jsonl":
                 summary["prompt_value_binding_event_count"] += 1
                 summary["prompt_value_binding_algorithm_last"] = event.get("algorithm", "")
+                summary["prompt_value_binding_objective_last"] = event.get("objective", "")
                 if event.get("skip_reason"):
                     summary["prompt_value_binding_skipped_steps"] += 1
                 else:
@@ -1315,6 +1649,167 @@ def collect_event_summaries(
                 summary["prompt_value_binding_global_backward_calls_total"] += as_int(
                     event.get("global_backward_calls")
                 ) or 0
+            elif path.name == "ruliad_proof_policy_dagger.jsonl":
+                summary["proof_policy_event_count"] += 1
+                objective = str(event.get("counterfactual_objective") or "")
+                if objective:
+                    objective_histogram = summary[
+                        "_proof_policy_counterfactual_objective_histogram"
+                    ]
+                    objective_histogram[objective] = (
+                        objective_histogram.get(objective, 0) + 1
+                    )
+                step_index = as_int(event.get("step_index"))
+                if step_index is not None:
+                    summary["_proof_policy_event_steps"].append(step_index)
+                summary["proof_policy_prompt_context"] = event.get(
+                    "prompt_context", ""
+                )
+                if event.get("skip_reason"):
+                    summary["proof_policy_skipped_event_count"] += 1
+                fingerprint = as_int(event.get("policy_batch_fingerprint"))
+                if event.get("consolidation_enabled"):
+                    if event.get("consolidation_novel"):
+                        summary["proof_policy_consolidation_novel_event_count"] += 1
+                    else:
+                        summary["proof_policy_consolidation_replay_event_count"] += 1
+                    summary["proof_policy_consolidation_released_unique_steps"] = max(
+                        summary["proof_policy_consolidation_released_unique_steps"],
+                        as_int(event.get("consolidation_released_unique_steps")) or 0,
+                    )
+                    logical_epoch = as_int(
+                        event.get("consolidation_logical_epoch_index")
+                    )
+                    logical_step = as_int(
+                        event.get("consolidation_logical_selection_step")
+                    )
+                    generation_epoch = as_int(
+                        event.get("consolidation_generation_epoch_index")
+                    )
+                    generation_step = as_int(
+                        event.get("consolidation_generation_step")
+                    )
+                    released = as_int(
+                        event.get("consolidation_released_unique_steps")
+                    )
+                    required = (
+                        logical_epoch,
+                        logical_step,
+                        generation_epoch,
+                        generation_step,
+                        released,
+                        fingerprint,
+                    )
+                    if any(value is None for value in required):
+                        summary[
+                            "proof_policy_consolidation_metadata_missing_count"
+                        ] += 1
+                    else:
+                        summary[
+                            "proof_policy_consolidation_max_logical_selection_step"
+                        ] = max(
+                            summary[
+                                "proof_policy_consolidation_max_logical_selection_step"
+                            ],
+                            logical_step,
+                        )
+                        coordinate_valid = (
+                            generation_epoch == 0
+                            and generation_step <= logical_step
+                            and released > generation_step
+                            and (
+                                not event.get("consolidation_novel")
+                                or generation_step + 1 == released
+                            )
+                        )
+                        if not coordinate_valid:
+                            summary[
+                                "proof_policy_consolidation_metadata_invalid_count"
+                            ] += 1
+                        coordinate = f"{generation_epoch}:{generation_step}"
+                        coordinate_fingerprints = summary[
+                            "_proof_policy_consolidation_coordinate_fingerprints"
+                        ]
+                        fingerprint_coordinates = summary[
+                            "_proof_policy_consolidation_fingerprint_coordinates"
+                        ]
+                        previous_fingerprint = coordinate_fingerprints.get(coordinate)
+                        previous_coordinate = fingerprint_coordinates.get(str(fingerprint))
+                        if (
+                            previous_fingerprint is not None
+                            and previous_fingerprint != fingerprint
+                        ) or (
+                            previous_coordinate is not None
+                            and previous_coordinate != coordinate
+                        ):
+                            summary[
+                                "proof_policy_consolidation_coordinate_content_conflict_count"
+                            ] += 1
+                        coordinate_fingerprints[coordinate] = fingerprint
+                        fingerprint_coordinates[str(fingerprint)] = coordinate
+                if fingerprint is not None:
+                    summary["_proof_policy_fingerprints"].append(
+                        [as_int(event.get("step_index")), fingerprint]
+                    )
+                objective_fingerprint = as_int(
+                    event.get("objective_panel_fingerprint")
+                )
+                if objective_fingerprint is not None and objective_fingerprint != 0:
+                    summary["_proof_policy_objective_fingerprints"].append(
+                        [as_int(event.get("step_index")), objective_fingerprint]
+                    )
+                elif not event.get("skip_reason"):
+                    summary["proof_policy_objective_panel_missing_count"] += 1
+                summary["proof_policy_original_prompt_tokens"] += as_int(
+                    event.get("original_prompt_tokens")
+                ) or 0
+                summary["proof_policy_retained_prompt_tokens"] += as_int(
+                    event.get("retained_prompt_tokens")
+                ) or 0
+                summary["proof_policy_truncated_presentations"] += as_int(
+                    event.get("truncated_presentations")
+                ) or 0
+                for map_key in (
+                    "difficulty_sample_groups",
+                    "difficulty_visited_states",
+                    "difficulty_expert_rows",
+                    "expert_selected_index_histogram",
+                    "expert_equivalent_index_histogram",
+                    "model_selected_index_histogram",
+                ):
+                    destination = summary[f"_proof_policy_{map_key}"]
+                    values = event.get(map_key) or {}
+                    if isinstance(values, dict):
+                        for bucket, count in values.items():
+                            destination[str(bucket)] = destination.get(str(bucket), 0) + (
+                                as_int(count) or 0
+                            )
+                if event.get("mode") != "static_expert":
+                    summary["proof_policy_dynamic_event_count"] += 1
+                summary["proof_policy_target"] = event.get("target", "")
+                for summary_key, event_key in (
+                    ("proof_policy_model_scoring_batches", "model_scoring_batches"),
+                    (
+                        "proof_policy_model_visited_expert_rows",
+                        "model_visited_expert_rows",
+                    ),
+                    ("proof_policy_dagger_expert_rows", "dagger_expert_rows"),
+                    ("proof_policy_static_expert_rows", "static_expert_rows"),
+                    ("proof_policy_model_valid_actions", "model_valid_actions"),
+                    ("proof_policy_model_invalid_actions", "model_invalid_actions"),
+                    (
+                        "proof_policy_model_expert_equivalent_actions",
+                        "model_expert_equivalent_actions",
+                    ),
+                    (
+                        "proof_policy_model_off_expert_actions",
+                        "model_off_expert_actions",
+                    ),
+                ):
+                    summary[summary_key] += as_int(event.get(event_key)) or 0
+                summary["proof_policy_model_scoring_ms"] += as_float(
+                    event.get("model_scoring_ms")
+                ) or 0.0
             elif path.name == "source_selection.jsonl" or event_type == "source_selection":
                 update_source(summary, event)
                 if any(
@@ -1341,6 +1836,59 @@ def collect_event_summaries(
                 if validation_loss is not None and epoch is not None:
                     summary["_validation_loss_by_epoch"][epoch] = validation_loss
             elif event_type == "capability_probe":
+                if (
+                    event.get("split") == "valid"
+                    and event.get("probe_name") == "ruliad_correctness"
+                ):
+                    summary["ruliad_schema_valid_wrong_rate_last"] = as_float(
+                        event.get("schema_valid_wrong_rate")
+                    )
+                    summary["ruliad_malformed_rate_last"] = as_float(
+                        event.get("malformed_rate")
+                    )
+                    summary["ruliad_completion_health_rate_last"] = as_float(
+                        event.get("completion_health_rate")
+                    )
+                elif (
+                    event.get("split") == "valid"
+                    and event.get("probe_name")
+                    == "ruliad_correctness_policy_context"
+                ):
+                    summary["ruliad_policy_context_verifier_accuracy_last"] = (
+                        as_float(event.get("verifier_rate"))
+                    )
+                    summary[
+                        "ruliad_policy_context_schema_valid_wrong_rate_last"
+                    ] = as_float(event.get("schema_valid_wrong_rate"))
+                    summary["ruliad_policy_context_malformed_rate_last"] = as_float(
+                        event.get("malformed_rate")
+                    )
+                    summary[
+                        "ruliad_policy_context_completion_health_rate_last"
+                    ] = as_float(event.get("completion_health_rate"))
+                elif (
+                    event.get("split") == "valid"
+                    and event.get("probe_name")
+                    == "ruliad_correctness_structured_policy"
+                ):
+                    summary["ruliad_structured_policy_verifier_accuracy_last"] = (
+                        as_float(event.get("verifier_rate"))
+                    )
+                    summary[
+                        "ruliad_structured_policy_partial_credit_rate_last"
+                    ] = as_float(event.get("partial_credit_rate"))
+                    summary[
+                        "ruliad_structured_policy_mean_partial_progress_last"
+                    ] = as_float(event.get("mean_partial_progress"))
+                    summary[
+                        "ruliad_structured_policy_schema_valid_wrong_rate_last"
+                    ] = as_float(event.get("schema_valid_wrong_rate"))
+                    summary["ruliad_structured_policy_malformed_rate_last"] = (
+                        as_float(event.get("malformed_rate"))
+                    )
+                    summary[
+                        "ruliad_structured_policy_completion_health_rate_last"
+                    ] = as_float(event.get("completion_health_rate"))
                 for group in event.get("group_buckets") or []:
                     raw_label = str(group.get("label") or "")
                     kind, separator, label = raw_label.partition(":")
@@ -1539,6 +2087,63 @@ def collect_event_summaries(
     for summary in summaries.values():
         pc_values = summary.pop("_pc_ms_values", [])
         summary["pc_ms_mean"] = stats(pc_values).mean if pc_values else ""
+        policy_fingerprints = summary.pop("_proof_policy_fingerprints", [])
+        summary["proof_policy_batch_stream_sha256"] = (
+            hashlib.sha256(
+                json.dumps(policy_fingerprints, separators=(",", ":")).encode()
+            ).hexdigest()
+            if policy_fingerprints
+            else ""
+        )
+        objective_fingerprints = summary.pop(
+            "_proof_policy_objective_fingerprints", []
+        )
+        summary["proof_policy_objective_panel_stream_sha256"] = (
+            hashlib.sha256(
+                json.dumps(objective_fingerprints, separators=(",", ":")).encode()
+            ).hexdigest()
+            if objective_fingerprints
+            else ""
+        )
+        summary["proof_policy_objective_panel_unique_count"] = len(
+            {fingerprint for _, fingerprint in objective_fingerprints}
+        )
+        summary["proof_policy_counterfactual_objective_histogram"] = json.dumps(
+            summary.pop("_proof_policy_counterfactual_objective_histogram", {}),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        summary.pop("_proof_policy_consolidation_coordinate_fingerprints", None)
+        summary.pop("_proof_policy_consolidation_fingerprint_coordinates", None)
+        consolidation_event_count = (
+            summary["proof_policy_consolidation_novel_event_count"]
+            + summary["proof_policy_consolidation_replay_event_count"]
+        )
+        if consolidation_event_count:
+            summary["proof_policy_consolidation_integrity_pass"] = (
+                summary["proof_policy_consolidation_metadata_missing_count"] == 0
+                and summary["proof_policy_consolidation_metadata_invalid_count"] == 0
+                and summary[
+                    "proof_policy_consolidation_coordinate_content_conflict_count"
+                ]
+                == 0
+            )
+        summary["proof_policy_prompt_retention_fraction"] = (
+            summary["proof_policy_retained_prompt_tokens"]
+            / max(summary["proof_policy_original_prompt_tokens"], 1)
+        )
+        for map_key in (
+            "difficulty_sample_groups",
+            "difficulty_visited_states",
+            "difficulty_expert_rows",
+            "expert_selected_index_histogram",
+            "expert_equivalent_index_histogram",
+            "model_selected_index_histogram",
+        ):
+            values = summary.pop(f"_proof_policy_{map_key}", {})
+            summary[f"proof_policy_{map_key}"] = json.dumps(
+                values, sort_keys=True, separators=(",", ":")
+            )
         source_loss_values = list(summary.pop("_source_loss_by_step", {}).values())
         source_loss_values.extend(summary.pop("_source_loss_unkeyed", []))
         summary["source_loss_cadence_mean"] = (
@@ -1608,8 +2213,21 @@ def collect_event_summaries(
                 "source_selection_feedback_updates_enabled",
                 "ruliad_source_selection_cold_start_enabled",
                 "proof_policy_mode",
+                "proof_policy_target",
+                "proof_policy_prompt_context",
+                "verifier_every_steps",
+                "proof_policy_start_after_steps",
+                "policy_probe_prompt_context",
+                "policy_probe_scoring",
+                "pc_inference_steps",
+                "pc_step_size",
+                "pc_prediction_precision",
+                "pc_next_token_solver",
             ):
-                summary[key] = manifest.get(key, "")
+                value = manifest.get(key, "")
+                if key == "proof_policy_target" and not value:
+                    continue
+                summary[key] = value
             if not summary.get("proof_policy_mode"):
                 summary["proof_policy_mode"] = infer_proof_policy_mode(
                     str(summary.get("arm") or "")
@@ -1621,6 +2239,21 @@ def collect_event_summaries(
             extended_horizon = latest_experiment_planned_max_iters(Path(summary["run_dir"]))
             if extended_horizon is not None:
                 summary["iters"] = extended_horizon
+            cadence = as_int(summary.get("verifier_every_steps"))
+            horizon = as_int(summary.get("iters"))
+            start = as_int(summary.get("proof_policy_start_after_steps")) or 0
+            if cadence is not None and cadence > 0 and horizon is not None:
+                expected_steps = [
+                    step
+                    for step in range(horizon)
+                    if step >= start and step % cadence == 0
+                ]
+                actual_steps = summary.pop("_proof_policy_event_steps", [])
+                summary["proof_policy_expected_event_count"] = len(expected_steps)
+                summary["proof_policy_delivery_fraction"] = len(actual_steps) / max(
+                    len(expected_steps), 1
+                )
+                summary["proof_policy_delivery_complete"] = actual_steps == expected_steps
             profile = read_stage_profile(manifest.get("log_path"))
             if "total_ns" in profile:
                 summary["training_wall_seconds"] = profile["total_ns"] / 1_000_000_000.0
@@ -1699,6 +2332,20 @@ def normalize_event_summaries(rows: Iterable[dict[str, Any]]) -> list[dict[str, 
                 ),
                 "proof_policy_mode": event.get("proof_policy_mode", "")
                 or infer_proof_policy_mode(str(event.get("arm") or "")),
+                "proof_policy_target": event.get("proof_policy_target", ""),
+                "proof_policy_prompt_context": event.get(
+                    "proof_policy_prompt_context", ""
+                ),
+                "policy_probe_prompt_context": event.get(
+                    "policy_probe_prompt_context", ""
+                ),
+                "policy_probe_scoring": event.get("policy_probe_scoring", ""),
+                "pc_inference_steps": as_int(event.get("pc_inference_steps")),
+                "pc_step_size": as_float(event.get("pc_step_size")),
+                "pc_prediction_precision": as_float(
+                    event.get("pc_prediction_precision")
+                ),
+                "pc_next_token_solver": event.get("pc_next_token_solver", ""),
                 "wall_s": as_float(event.get("training_wall_seconds"))
                 or as_float(event.get("elapsed_seconds")),
                 "tok_s": as_float(event.get("wall_tokens_per_second")),
@@ -1758,6 +2405,116 @@ def normalize_event_summaries(rows: Iterable[dict[str, Any]]) -> list[dict[str, 
                     event.get("stream_carry_relative_gain_last")
                 ),
                 "pc_ms_mean": as_float(event.get("pc_ms_mean")),
+                "proof_policy_event_count": as_float(
+                    event.get("proof_policy_event_count")
+                ),
+                "proof_policy_counterfactual_objective_histogram": event.get(
+                    "proof_policy_counterfactual_objective_histogram", ""
+                ),
+                "proof_policy_expected_event_count": as_float(
+                    event.get("proof_policy_expected_event_count")
+                ),
+                "proof_policy_delivery_fraction": as_float(
+                    event.get("proof_policy_delivery_fraction")
+                ),
+                "proof_policy_delivery_complete": event.get(
+                    "proof_policy_delivery_complete", ""
+                ),
+                "proof_policy_skipped_event_count": as_float(
+                    event.get("proof_policy_skipped_event_count")
+                ),
+                "proof_policy_consolidation_novel_event_count": as_float(
+                    event.get("proof_policy_consolidation_novel_event_count")
+                ),
+                "proof_policy_consolidation_replay_event_count": as_float(
+                    event.get("proof_policy_consolidation_replay_event_count")
+                ),
+                "proof_policy_consolidation_released_unique_steps": as_float(
+                    event.get("proof_policy_consolidation_released_unique_steps")
+                ),
+                "proof_policy_consolidation_max_logical_selection_step": as_float(
+                    event.get("proof_policy_consolidation_max_logical_selection_step")
+                ),
+                "proof_policy_consolidation_metadata_missing_count": as_float(
+                    event.get("proof_policy_consolidation_metadata_missing_count")
+                ),
+                "proof_policy_consolidation_metadata_invalid_count": as_float(
+                    event.get("proof_policy_consolidation_metadata_invalid_count")
+                ),
+                "proof_policy_consolidation_coordinate_content_conflict_count": as_float(
+                    event.get(
+                        "proof_policy_consolidation_coordinate_content_conflict_count"
+                    )
+                ),
+                "proof_policy_consolidation_integrity_pass": event.get(
+                    "proof_policy_consolidation_integrity_pass", ""
+                ),
+                "proof_policy_batch_stream_sha256": event.get(
+                    "proof_policy_batch_stream_sha256", ""
+                ),
+                "proof_policy_objective_panel_stream_sha256": event.get(
+                    "proof_policy_objective_panel_stream_sha256", ""
+                ),
+                "proof_policy_objective_panel_unique_count": as_float(
+                    event.get("proof_policy_objective_panel_unique_count")
+                ),
+                "proof_policy_objective_panel_missing_count": as_float(
+                    event.get("proof_policy_objective_panel_missing_count")
+                ),
+                "proof_policy_prompt_retention_fraction": as_float(
+                    event.get("proof_policy_prompt_retention_fraction")
+                ),
+                "proof_policy_truncated_presentations": as_float(
+                    event.get("proof_policy_truncated_presentations")
+                ),
+                "proof_policy_difficulty_sample_groups": event.get(
+                    "proof_policy_difficulty_sample_groups", ""
+                ),
+                "proof_policy_difficulty_visited_states": event.get(
+                    "proof_policy_difficulty_visited_states", ""
+                ),
+                "proof_policy_difficulty_expert_rows": event.get(
+                    "proof_policy_difficulty_expert_rows", ""
+                ),
+                "proof_policy_expert_selected_index_histogram": event.get(
+                    "proof_policy_expert_selected_index_histogram", ""
+                ),
+                "proof_policy_expert_equivalent_index_histogram": event.get(
+                    "proof_policy_expert_equivalent_index_histogram", ""
+                ),
+                "proof_policy_model_selected_index_histogram": event.get(
+                    "proof_policy_model_selected_index_histogram", ""
+                ),
+                "proof_policy_dynamic_event_count": as_float(
+                    event.get("proof_policy_dynamic_event_count")
+                ),
+                "proof_policy_model_scoring_batches": as_float(
+                    event.get("proof_policy_model_scoring_batches")
+                ),
+                "proof_policy_model_visited_expert_rows": as_float(
+                    event.get("proof_policy_model_visited_expert_rows")
+                ),
+                "proof_policy_dagger_expert_rows": as_float(
+                    event.get("proof_policy_dagger_expert_rows")
+                ),
+                "proof_policy_static_expert_rows": as_float(
+                    event.get("proof_policy_static_expert_rows")
+                ),
+                "proof_policy_model_valid_actions": as_float(
+                    event.get("proof_policy_model_valid_actions")
+                ),
+                "proof_policy_model_invalid_actions": as_float(
+                    event.get("proof_policy_model_invalid_actions")
+                ),
+                "proof_policy_model_expert_equivalent_actions": as_float(
+                    event.get("proof_policy_model_expert_equivalent_actions")
+                ),
+                "proof_policy_model_off_expert_actions": as_float(
+                    event.get("proof_policy_model_off_expert_actions")
+                ),
+                "proof_policy_model_scoring_ms": as_float(
+                    event.get("proof_policy_model_scoring_ms")
+                ),
                 "source_loss": as_float(event.get("source_loss_last")),
                 "source_loss_cadence_mean": as_float(
                     event.get("source_loss_cadence_mean")
@@ -1788,6 +2545,75 @@ def normalize_event_summaries(rows: Iterable[dict[str, Any]]) -> list[dict[str, 
                 ),
                 "ruliad_verifier_accuracy_final_minus_best": as_float(
                     event.get("ruliad_verifier_accuracy_final_minus_best")
+                ),
+                "ruliad_schema_valid_wrong_rate": as_float(
+                    event.get("ruliad_schema_valid_wrong_rate_last")
+                ),
+                "ruliad_malformed_rate": as_float(
+                    event.get("ruliad_malformed_rate_last")
+                ),
+                "ruliad_completion_health_rate": as_float(
+                    event.get("ruliad_completion_health_rate_last")
+                ),
+                "ruliad_policy_context_verifier_accuracy": as_float(
+                    event.get("ruliad_policy_context_verifier_accuracy_last")
+                ),
+                "ruliad_policy_context_schema_valid_wrong_rate": as_float(
+                    event.get("ruliad_policy_context_schema_valid_wrong_rate_last")
+                ),
+                "ruliad_policy_context_malformed_rate": as_float(
+                    event.get("ruliad_policy_context_malformed_rate_last")
+                ),
+                "ruliad_policy_context_completion_health_rate": as_float(
+                    event.get("ruliad_policy_context_completion_health_rate_last")
+                ),
+                "ruliad_policy_context_teacher_forced_nll": as_float(
+                    event.get("ruliad_policy_context_teacher_forced_nll_last")
+                ),
+                "ruliad_policy_context_teacher_forced_token_accuracy": as_float(
+                    event.get(
+                        "ruliad_policy_context_teacher_forced_token_accuracy_last"
+                    )
+                ),
+                "ruliad_policy_context_teacher_forced_first_token_accuracy": as_float(
+                    event.get(
+                        "ruliad_policy_context_teacher_forced_first_token_accuracy_last"
+                    )
+                ),
+                "ruliad_policy_context_teacher_forced_sequence_accuracy": as_float(
+                    event.get(
+                        "ruliad_policy_context_teacher_forced_sequence_accuracy_last"
+                    )
+                ),
+                "ruliad_policy_context_swap_teacher_forced_nll": as_float(
+                    event.get(
+                        "ruliad_policy_context_swap_teacher_forced_nll_last"
+                    )
+                ),
+                "ruliad_policy_context_binding_nll_gain": as_float(
+                    event.get("ruliad_policy_context_binding_nll_gain_last")
+                ),
+                "ruliad_structured_policy_verifier_accuracy": as_float(
+                    event.get("ruliad_structured_policy_verifier_accuracy_last")
+                ),
+                "ruliad_structured_policy_partial_credit_rate": as_float(
+                    event.get("ruliad_structured_policy_partial_credit_rate_last")
+                ),
+                "ruliad_structured_policy_mean_partial_progress": as_float(
+                    event.get("ruliad_structured_policy_mean_partial_progress_last")
+                ),
+                "ruliad_structured_policy_schema_valid_wrong_rate": as_float(
+                    event.get(
+                        "ruliad_structured_policy_schema_valid_wrong_rate_last"
+                    )
+                ),
+                "ruliad_structured_policy_malformed_rate": as_float(
+                    event.get("ruliad_structured_policy_malformed_rate_last")
+                ),
+                "ruliad_structured_policy_completion_health_rate": as_float(
+                    event.get(
+                        "ruliad_structured_policy_completion_health_rate_last"
+                    )
                 ),
                 "ruliad_constrained_equivalent_top1": as_float(
                     event.get("ruliad_constrained_equivalent_top1_last")
@@ -1909,6 +2735,36 @@ def normalize_event_summaries(rows: Iterable[dict[str, Any]]) -> list[dict[str, 
                 "output_distinct_2_fraction": as_float(
                     event.get("output_distinct_2_fraction_last")
                 ),
+                "prompt_value_binding_event_count": as_float(
+                    event.get("prompt_value_binding_event_count")
+                ),
+                "prompt_value_binding_active_steps": as_float(
+                    event.get("prompt_value_binding_active_steps")
+                ),
+                "prompt_value_binding_skipped_steps": as_float(
+                    event.get("prompt_value_binding_skipped_steps")
+                ),
+                "prompt_value_binding_algorithm_last": event.get(
+                    "prompt_value_binding_algorithm_last", ""
+                ),
+                "prompt_value_binding_objective_last": event.get(
+                    "prompt_value_binding_objective_last", ""
+                ),
+                "prompt_value_binding_sample_groups_total": as_float(
+                    event.get("prompt_value_binding_sample_groups_total")
+                ),
+                "prompt_value_binding_rows_total": as_float(
+                    event.get("prompt_value_binding_rows_total")
+                ),
+                "prompt_value_binding_active_tokens_total": as_float(
+                    event.get("prompt_value_binding_active_tokens_total")
+                ),
+                "prompt_value_binding_padded_tokens_total": as_float(
+                    event.get("prompt_value_binding_padded_tokens_total")
+                ),
+                "prompt_value_binding_global_backward_calls_total": as_float(
+                    event.get("prompt_value_binding_global_backward_calls_total")
+                ),
             }
         )
         for prefix in LOSS_SERIES_PREFIXES:
@@ -1919,6 +2775,16 @@ def normalize_event_summaries(rows: Iterable[dict[str, Any]]) -> list[dict[str, 
         free = as_float(row.get("ruliad_verifier_accuracy"))
         if constrained is not None and free is not None:
             row["ruliad_constrained_free_accuracy_gap"] = constrained - free
+        policy_context_free = as_float(
+            row.get("ruliad_policy_context_verifier_accuracy")
+        )
+        if constrained is not None and policy_context_free is not None:
+            row["ruliad_policy_context_decode_gap"] = (
+                constrained - policy_context_free
+            )
+        structured = as_float(row.get("ruliad_structured_policy_verifier_accuracy"))
+        if constrained is not None and structured is not None:
+            row["ruliad_structured_policy_consistency_gap"] = constrained - structured
         normalized_rows.append(row)
     return normalized_rows
 
@@ -1963,6 +2829,29 @@ def read_manifests(paths: Iterable[Path]) -> list[dict[str, Any]]:
         if not isinstance(data, dict) or "trial_key" not in data:
             continue
         row = {key: data.get(key, "") for key in MANIFEST_COLUMNS}
+        run_dir = Path(str(row.get("run_dir") or ""))
+        experiment_manifest_path = run_dir / "experiment_manifest.json"
+        if experiment_manifest_path.is_file():
+            try:
+                experiment_manifest = json.loads(experiment_manifest_path.read_text())
+                launch = next(
+                    (
+                        candidate
+                        for candidate in experiment_manifest.get("launches", [])
+                        if candidate.get("initial_model_sha256")
+                    ),
+                    {},
+                )
+                row["initial_model_tensor_fingerprint_schema"] = launch.get(
+                    "initial_model_tensor_fingerprint_schema", ""
+                )
+                row["initial_model_sha256"] = launch.get("initial_model_sha256", "")
+            except (OSError, json.JSONDecodeError, AttributeError) as error:
+                print(
+                    f"warning: cannot read initial model identity from "
+                    f"{experiment_manifest_path}: {error}",
+                    file=sys.stderr,
+                )
         row["matrix"] = canonical_matrix(
             str(row.get("matrix") or ""),
             row.get("source_selection_feedback_updates_enabled"),
@@ -2197,14 +3086,12 @@ def write_markdown(
     lines.append("## Run Summary")
     lines.append("")
     lines.append(
-        "| Matrix | Backend | Profile | Iters | Wall budget | Completed updates | Batch | Ckpt | Policy probe | Feedback | Cold start | Policy mode | Arm | Runs | Seeds | Cold valid | Cold supervised tokens | Stream warm | Validation objective | Best objective | Final-best | Regression | Val slope | Source cadence | Free verifier acc | Action top-1 | Decode gap | Action NLL | Context swap | Counterfactual gain | Policy solve | Goal completion | Valid action | Partial progress | Wall tok/s | Model tok/s | Duty | PC ms |"
+        "| Matrix | Backend | Profile | Iters | Wall budget | Completed updates | Batch | Ckpt | Policy probe | Probe scoring | Feedback | Cold start | Policy mode | Policy target | Arm | Runs | Seeds | Cold valid | Cold supervised tokens | Stream warm | Validation objective | Best objective | Final-best | Regression | Val slope | Source cadence | Document verifier | Document schema wrong | Document malformed | Document health | Policy-context verifier | Policy-context schema wrong | Policy-context malformed | Policy-context health | Action top-1 | Structured verifier | Structured consistency gap | Matched decode gap | Document decode gap | Action NLL | Context swap | Counterfactual gain | Policy solve | Goal completion | Valid action | Partial progress | Wall tok/s | Model tok/s | Duty | PC ms |"
     )
-    lines.append(
-        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
-    )
+    lines.append("|" + " --- |" * 50)
     for row in summary_rows:
         lines.append(
-            "| {matrix} | {backend} | {profile} | {iters} | {wall_clock_seconds} | {completed_updates} | {batch_size} | {checkpoint_interval} | {policy_probe_cadence} | {source_feedback} | {cold_start} | {policy_mode} | {arm} | {runs} | {seeds} | {valid} | {cold_tokens} | {warm} | {objective} | {best_objective} | {final_minus_best} | {regression} | {slope} | {source} | {verifier} | {action_top1} | {decode_gap} | {action_nll} | {context_swap} | {counterfactual_gain} | {policy_solve} | {goal_completion} | {valid_action} | {partial} | {tok} | {model_tok} | {duty} | {pc} |".format(
+            "| {matrix} | {backend} | {profile} | {iters} | {wall_clock_seconds} | {completed_updates} | {batch_size} | {checkpoint_interval} | {policy_probe_cadence} | {policy_probe_scoring} | {source_feedback} | {cold_start} | {policy_mode} | {policy_target} | {arm} | {runs} | {seeds} | {valid} | {cold_tokens} | {warm} | {objective} | {best_objective} | {final_minus_best} | {regression} | {slope} | {source} | {verifier} | {schema_wrong} | {malformed} | {completion_health} | {policy_context_verifier} | {policy_context_schema_wrong} | {policy_context_malformed} | {policy_context_health} | {action_top1} | {structured_verifier} | {structured_consistency_gap} | {policy_context_decode_gap} | {document_decode_gap} | {action_nll} | {context_swap} | {counterfactual_gain} | {policy_solve} | {goal_completion} | {valid_action} | {partial} | {tok} | {model_tok} | {duty} | {pc} |".format(
                 matrix=row.get("matrix", ""),
                 backend=row.get("backend", ""),
                 profile=Path(str(row.get("profile") or "")).name,
@@ -2218,6 +3105,7 @@ def write_markdown(
                 policy_probe_cadence=row.get(
                     "ruliad_policy_probe_every_epochs", ""
                 ),
+                policy_probe_scoring=row.get("policy_probe_scoring", ""),
                 source_feedback=row.get(
                     "source_selection_feedback_updates_enabled", ""
                 ),
@@ -2225,6 +3113,7 @@ def write_markdown(
                     "ruliad_source_selection_cold_start_enabled", ""
                 ),
                 policy_mode=row.get("proof_policy_mode", ""),
+                policy_target=row.get("proof_policy_target", ""),
                 arm=row.get("arm", ""),
                 runs=row.get("runs", ""),
                 seeds=row.get("seeds", ""),
@@ -2242,8 +3131,34 @@ def write_markdown(
                 slope=fmt_mean_ci(row, "validation_loss_slope_per_checkpoint"),
                 source=fmt_mean_ci(row, "source_loss_cadence_mean"),
                 verifier=fmt_mean_ci(row, "ruliad_verifier_accuracy"),
+                schema_wrong=fmt_mean_ci(row, "ruliad_schema_valid_wrong_rate"),
+                malformed=fmt_mean_ci(row, "ruliad_malformed_rate"),
+                completion_health=fmt_mean_ci(
+                    row, "ruliad_completion_health_rate"
+                ),
+                policy_context_verifier=fmt_mean_ci(
+                    row, "ruliad_policy_context_verifier_accuracy"
+                ),
+                policy_context_schema_wrong=fmt_mean_ci(
+                    row, "ruliad_policy_context_schema_valid_wrong_rate"
+                ),
+                policy_context_malformed=fmt_mean_ci(
+                    row, "ruliad_policy_context_malformed_rate"
+                ),
+                policy_context_health=fmt_mean_ci(
+                    row, "ruliad_policy_context_completion_health_rate"
+                ),
                 action_top1=fmt_mean_ci(row, "ruliad_constrained_equivalent_top1"),
-                decode_gap=fmt_mean_ci(
+                structured_verifier=fmt_mean_ci(
+                    row, "ruliad_structured_policy_verifier_accuracy"
+                ),
+                structured_consistency_gap=fmt_mean_ci(
+                    row, "ruliad_structured_policy_consistency_gap"
+                ),
+                policy_context_decode_gap=fmt_mean_ci(
+                    row, "ruliad_policy_context_decode_gap"
+                ),
+                document_decode_gap=fmt_mean_ci(
                     row, "ruliad_constrained_free_accuracy_gap"
                 ),
                 action_nll=fmt_mean_ci(row, "ruliad_constrained_equivalent_nll"),
@@ -2271,12 +3186,12 @@ def write_markdown(
     lines.append("## Paired Deltas")
     lines.append("")
     lines.append(
-        "| Matrix | Backend | Profile | Iters | Batch | Ckpt | Policy probe | Feedback | Cold start | Policy mode | Comparison | Metric | Pairs | Delta |"
+        "| Matrix | Backend | Profile | Iters | Batch | Ckpt | Policy probe | Probe scoring | Feedback | Cold start | Policy mode | Policy target | Comparison | Metric | Pairs | Delta |"
     )
-    lines.append("| --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- | --- | ---: | ---: |")
+    lines.append("| --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- | --- | --- | --- | ---: | ---: |")
     for row in paired_rows:
         lines.append(
-            "| {matrix} | {backend} | {profile} | {iters} | {batch_size} | {checkpoint_interval} | {policy_probe_cadence} | {source_feedback} | {cold_start} | {policy_mode} | {comparison} | {metric} | {pairs} | {delta} |".format(
+            "| {matrix} | {backend} | {profile} | {iters} | {batch_size} | {checkpoint_interval} | {policy_probe_cadence} | {policy_probe_scoring} | {source_feedback} | {cold_start} | {policy_mode} | {policy_target} | {comparison} | {metric} | {pairs} | {delta} |".format(
                 matrix=row.get("matrix", ""),
                 backend=row.get("backend", ""),
                 profile=Path(str(row.get("profile") or "")).name,
@@ -2286,6 +3201,7 @@ def write_markdown(
                 policy_probe_cadence=row.get(
                     "ruliad_policy_probe_every_epochs", ""
                 ),
+                policy_probe_scoring=row.get("policy_probe_scoring", ""),
                 source_feedback=row.get(
                     "source_selection_feedback_updates_enabled", ""
                 ),
@@ -2293,6 +3209,7 @@ def write_markdown(
                     "ruliad_source_selection_cold_start_enabled", ""
                 ),
                 policy_mode=row.get("proof_policy_mode", ""),
+                policy_target=row.get("proof_policy_target", ""),
                 comparison=row.get("comparison", ""),
                 metric=row.get("metric", ""),
                 pairs=row.get("pairs", ""),
@@ -2831,6 +3748,82 @@ def self_test() -> None:
             + "\n"
             + json.dumps(
                 {
+                    "type": "capability_probe",
+                    "run_id": "run-a",
+                    "epoch": 3,
+                    "absolute_step": 12,
+                    "split": "valid",
+                    "probe_name": "ruliad_correctness_policy_context",
+                    "verifier_rate": 0.625,
+                    "schema_valid_wrong_rate": 0.25,
+                    "malformed_rate": 0.125,
+                    "completion_health_rate": 0.875,
+                    "group_buckets": [],
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "metric",
+                    "run_id": "run-a",
+                    "split": "valid",
+                    "name": "Ruliad Policy Context Teacher Forced NLL",
+                    "value": 0.375,
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "metric",
+                    "run_id": "run-a",
+                    "split": "valid",
+                    "name": "Ruliad Policy Context Teacher Forced Token Accuracy",
+                    "value": 0.8125,
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "metric",
+                    "run_id": "run-a",
+                    "split": "valid",
+                    "name": "Ruliad Policy Context Teacher Forced First Token Accuracy",
+                    "value": 0.875,
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "metric",
+                    "run_id": "run-a",
+                    "split": "valid",
+                    "name": "Ruliad Policy Context Teacher Forced Sequence Accuracy",
+                    "value": 0.5,
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "metric",
+                    "run_id": "run-a",
+                    "split": "valid",
+                    "name": "Ruliad Policy Context Teacher Forced Context-Swap NLL",
+                    "value": 0.75,
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "metric",
+                    "run_id": "run-a",
+                    "split": "valid",
+                    "name": "Ruliad Policy Context Teacher Forced Context-Binding NLL Gain",
+                    "value": 0.375,
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
                     "type": "source_selection",
                     "run_id": "run-a",
                     "absolute_step": 4,
@@ -2909,9 +3902,11 @@ def self_test() -> None:
         (events / "ruliad_prompt_value_binding.jsonl").write_text(
             json.dumps(
                 {
-                    "version": 1,
+                    "version": 2,
                     "step_index": 1,
                     "algorithm": "predictive_coding",
+                    "prompt_context": "proof_policy",
+                    "objective": "full_completion",
                     "skip_reason": None,
                     "sample_groups": 3,
                     "rows": 8,
@@ -2923,15 +3918,79 @@ def self_test() -> None:
             + "\n"
             + json.dumps(
                 {
-                    "version": 1,
+                    "version": 2,
                     "step_index": 3,
                     "algorithm": "predictive_coding",
+                    "prompt_context": "proof_policy",
+                    "objective": "full_completion",
                     "skip_reason": "missing_or_empty_policy_batch",
                     "sample_groups": 0,
                     "rows": 0,
                     "active_tokens": 0,
                     "padded_tokens": 0,
                     "global_backward_calls": 0,
+                }
+            )
+            + "\n"
+        )
+        (events / "ruliad_proof_policy_dagger.jsonl").write_text(
+            json.dumps(
+                {
+                    "version": 27,
+                    "step_index": 0,
+                    "policy_batch_fingerprint": 101,
+                    "consolidation_enabled": True,
+                    "consolidation_logical_epoch_index": 0,
+                    "consolidation_logical_selection_step": 0,
+                    "consolidation_generation_epoch_index": 0,
+                    "consolidation_generation_step": 0,
+                    "consolidation_released_unique_steps": 1,
+                    "consolidation_novel": True,
+                    "prompt_context": "local_action_state",
+                    "original_prompt_tokens": 12,
+                    "retained_prompt_tokens": 12,
+                    "truncated_presentations": 0,
+                    "target": "verified_progress_distribution",
+                    "mode": "static_expert",
+                    "model_scoring_batches": 0,
+                    "model_visited_expert_rows": 0,
+                    "dagger_expert_rows": 0,
+                    "static_expert_rows": 4,
+                    "model_valid_actions": 0,
+                    "model_invalid_actions": 0,
+                    "model_expert_equivalent_actions": 0,
+                    "model_off_expert_actions": 0,
+                    "model_scoring_ms": 0.0,
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "version": 27,
+                    "step_index": 2,
+                    "policy_batch_fingerprint": 101,
+                    "consolidation_enabled": True,
+                    "consolidation_logical_epoch_index": 1,
+                    "consolidation_logical_selection_step": 2,
+                    "consolidation_generation_epoch_index": 0,
+                    "consolidation_generation_step": 0,
+                    "consolidation_released_unique_steps": 1,
+                    "consolidation_novel": False,
+                    "prompt_context": "local_action_state",
+                    "original_prompt_tokens": 16,
+                    "retained_prompt_tokens": 16,
+                    "truncated_presentations": 0,
+                    "target": "verified_progress_distribution",
+                    "mode": "paired_dagger",
+                    "model_scoring_batches": 3,
+                    "model_visited_expert_rows": 7,
+                    "dagger_expert_rows": 7,
+                    "static_expert_rows": 2,
+                    "model_valid_actions": 3,
+                    "model_invalid_actions": 1,
+                    "model_expert_equivalent_actions": 2,
+                    "model_off_expert_actions": 1,
+                    "model_scoring_ms": 1.25,
                 }
             )
             + "\n"
@@ -2952,6 +4011,18 @@ def self_test() -> None:
             "2026/01/01 00:00:00,0,80,50\n"
             "2026/01/01 00:00:01,0,100,60\n"
         )
+        (root / "run-a" / "experiment_manifest.json").write_text(
+            json.dumps(
+                {
+                    "launches": [
+                        {
+                            "initial_model_tensor_fingerprint_schema": "test-model-v1",
+                            "initial_model_sha256": "a" * 64,
+                        }
+                    ]
+                }
+            )
+        )
         (manifests / "run-a.json").write_text(
             json.dumps(
                 {
@@ -2965,6 +4036,13 @@ def self_test() -> None:
                     "wall_clock_seconds": 60,
                     "ruliad_policy_probe_every_epochs": 1,
                     "ruliad_source_selection_cold_start_enabled": False,
+                    "verifier_every_steps": 2,
+                    "proof_policy_start_after_steps": 0,
+                    "proof_policy_prompt_context": "local_action_state",
+                    "pc_inference_steps": 3,
+                    "pc_step_size": 0.03,
+                    "pc_prediction_precision": 30.0,
+                    "pc_next_token_solver": "fixed_prediction",
                     "validation_objective": "source_weighted",
                     "validation_sampling": "fixed_holdout",
                     "backend": "cpu",
@@ -2995,6 +4073,10 @@ def self_test() -> None:
         assert event_rows[0]["trial_key"] == "pc-smoke-run-a"
         assert event_rows[0]["arm"] == "adamwpc"
         assert event_rows[0]["ruliad_source_selection_cold_start_enabled"] == "False"
+        assert event_rows[0]["pc_inference_steps"] == "3"
+        assert event_rows[0]["pc_step_size"] == "0.03"
+        assert event_rows[0]["pc_prediction_precision"] == "30.0"
+        assert event_rows[0]["pc_next_token_solver"] == "fixed_prediction"
         assert event_rows[0]["wall_tokens_per_second"] == "512.0"
         assert event_rows[0]["model_tokens_per_second"] == "640.0"
         assert event_rows[0]["model_duty_fraction"] == "0.8"
@@ -3002,11 +4084,42 @@ def self_test() -> None:
         assert event_rows[0]["prompt_value_binding_active_steps"] == "1"
         assert event_rows[0]["prompt_value_binding_skipped_steps"] == "1"
         assert event_rows[0]["prompt_value_binding_algorithm_last"] == "predictive_coding"
+        assert event_rows[0]["prompt_value_binding_objective_last"] == "full_completion"
         assert event_rows[0]["prompt_value_binding_sample_groups_total"] == "3"
         assert event_rows[0]["prompt_value_binding_rows_total"] == "8"
         assert event_rows[0]["prompt_value_binding_active_tokens_total"] == "16"
         assert event_rows[0]["prompt_value_binding_padded_tokens_total"] == "4"
         assert event_rows[0]["prompt_value_binding_global_backward_calls_total"] == "0"
+        assert event_rows[0]["proof_policy_target"] == "verified_progress_distribution"
+        assert event_rows[0]["proof_policy_event_count"] == "2"
+        assert event_rows[0]["proof_policy_expected_event_count"] == "2"
+        assert event_rows[0]["proof_policy_delivery_fraction"] == "1.0"
+        assert event_rows[0]["proof_policy_delivery_complete"] == "True"
+        assert event_rows[0]["proof_policy_consolidation_novel_event_count"] == "1"
+        assert event_rows[0]["proof_policy_consolidation_replay_event_count"] == "1"
+        assert (
+            event_rows[0]["proof_policy_consolidation_max_logical_selection_step"]
+            == "2"
+        )
+        assert event_rows[0]["proof_policy_consolidation_metadata_missing_count"] == "0"
+        assert event_rows[0]["proof_policy_consolidation_metadata_invalid_count"] == "0"
+        assert (
+            event_rows[0][
+                "proof_policy_consolidation_coordinate_content_conflict_count"
+            ]
+            == "0"
+        )
+        assert event_rows[0]["proof_policy_consolidation_integrity_pass"] == "True"
+        assert event_rows[0]["proof_policy_dynamic_event_count"] == "1"
+        assert event_rows[0]["proof_policy_model_scoring_batches"] == "3"
+        assert event_rows[0]["proof_policy_model_visited_expert_rows"] == "7"
+        assert event_rows[0]["proof_policy_dagger_expert_rows"] == "7"
+        assert event_rows[0]["proof_policy_static_expert_rows"] == "6"
+        assert event_rows[0]["proof_policy_model_valid_actions"] == "3"
+        assert event_rows[0]["proof_policy_model_invalid_actions"] == "1"
+        assert event_rows[0]["proof_policy_model_expert_equivalent_actions"] == "2"
+        assert event_rows[0]["proof_policy_model_off_expert_actions"] == "1"
+        assert event_rows[0]["proof_policy_model_scoring_ms"] == "1.25"
         assert event_rows[0]["valid_loss_mean"] == "0.45"
         assert event_rows[0]["stream_warm_loss_mean"] == "0.55"
         assert event_rows[0]["validation_objective_loss_last"] == "0.6"
@@ -3031,6 +4144,24 @@ def self_test() -> None:
             0.025,
         )
         assert event_rows[0]["ruliad_context_swap_top1_change_rate_last"] == "0.375"
+        assert event_rows[0]["ruliad_policy_context_teacher_forced_nll_last"] == "0.375"
+        assert (
+            event_rows[0]["ruliad_policy_context_teacher_forced_token_accuracy_last"]
+            == "0.8125"
+        )
+        assert (
+            event_rows[0]["ruliad_policy_context_teacher_forced_first_token_accuracy_last"]
+            == "0.875"
+        )
+        assert (
+            event_rows[0]["ruliad_policy_context_teacher_forced_sequence_accuracy_last"]
+            == "0.5"
+        )
+        assert (
+            event_rows[0]["ruliad_policy_context_swap_teacher_forced_nll_last"]
+            == "0.75"
+        )
+        assert event_rows[0]["ruliad_policy_context_binding_nll_gain_last"] == "0.375"
         assert (
             event_rows[0][
                 "ruliad_counterfactual_target_equivalent_probability_gain_last"
@@ -3098,9 +4229,26 @@ def self_test() -> None:
         assert event_normalized["checkpoint_interval_iters"] == "2"
         assert event_normalized["ruliad_policy_probe_every_epochs"] == "1"
         assert event_normalized["ruliad_source_selection_cold_start_enabled"] == "False"
+        assert event_normalized["pc_inference_steps"] == "3"
+        assert event_normalized["pc_step_size"] == "0.03"
+        assert event_normalized["pc_prediction_precision"] == "30.0"
+        assert event_normalized["pc_next_token_solver"] == "fixed_prediction"
+        manifests_normalized = list(
+            csv.DictReader((out / "manifest_summary.csv").open())
+        )
+        assert (
+            manifests_normalized[0]["initial_model_tensor_fingerprint_schema"]
+            == "test-model-v1"
+        )
+        assert manifests_normalized[0]["initial_model_sha256"] == "a" * 64
         assert event_normalized["tok_s"] == "512.0"
         assert event_normalized["model_tok_s"] == "640.0"
         assert event_normalized["model_duty_fraction"] == "0.8"
+        assert event_normalized["proof_policy_target"] == "verified_progress_distribution"
+        assert event_normalized["proof_policy_event_count"] == "2.0"
+        assert event_normalized["proof_policy_dynamic_event_count"] == "1.0"
+        assert event_normalized["proof_policy_model_scoring_batches"] == "3.0"
+        assert event_normalized["proof_policy_model_visited_expert_rows"] == "7.0"
         assert event_normalized["validation_objective"] == "source_weighted"
         assert event_normalized["validation_sampling"] == "fixed_holdout"
         assert event_normalized["fixed_holdout_loss_first_checkpoint"] == "0.45"
@@ -3109,6 +4257,31 @@ def self_test() -> None:
         assert event_normalized["ruliad_verifier_accuracy"] == "0.25"
         assert event_normalized["ruliad_constrained_equivalent_top1"] == "0.75"
         assert event_normalized["ruliad_constrained_free_accuracy_gap"] == "0.5"
+        assert event_normalized["ruliad_policy_context_verifier_accuracy"] == "0.625"
+        assert event_normalized["ruliad_policy_context_schema_valid_wrong_rate"] == "0.25"
+        assert event_normalized["ruliad_policy_context_malformed_rate"] == "0.125"
+        assert event_normalized["ruliad_policy_context_completion_health_rate"] == "0.875"
+        assert event_normalized["ruliad_policy_context_teacher_forced_nll"] == "0.375"
+        assert (
+            event_normalized["ruliad_policy_context_teacher_forced_token_accuracy"]
+            == "0.8125"
+        )
+        assert (
+            event_normalized["ruliad_policy_context_teacher_forced_first_token_accuracy"]
+            == "0.875"
+        )
+        assert (
+            event_normalized["ruliad_policy_context_teacher_forced_sequence_accuracy"]
+            == "0.5"
+        )
+        assert (
+            event_normalized["ruliad_policy_context_swap_teacher_forced_nll"]
+            == "0.75"
+        )
+        assert event_normalized["ruliad_policy_context_binding_nll_gain"] == "0.375"
+        assert event_normalized["prompt_value_binding_event_count"] == "2.0"
+        assert event_normalized["prompt_value_binding_objective_last"] == "full_completion"
+        assert event_normalized["ruliad_policy_context_decode_gap"] == "0.125"
         assert event_normalized["ruliad_partial_progress"] == "0.5"
         assert event_normalized["ruliad_deployment_capability_gate_passed"] == "1.0"
         assert event_normalized["checkpoint_promoted_count"] == "1.0"

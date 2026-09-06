@@ -118,14 +118,18 @@ pub fn dragon_predictive_coding_checkpoint_manifest(
         crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSet => {
             "ruliad_verifier_set"
         }
+        crate::config::LocalPredictiveCodingTerminalCriterion::RuliadVerifierSetJoint => {
+            "ruliad_verifier_set_joint"
+        }
     };
     let temporal_credit_mode = match config.temporal_credit.mode {
         burn_pc::PcTemporalCreditMode::Detached => "detached",
         burn_pc::PcTemporalCreditMode::ExactWindow => "exact_window",
     };
     let program_digest = format!(
-        "dragon-pc-program-v9;solver={};terminal={terminal_criterion};schedule={learning_schedule};parameterization={parameterization};shared_reuse={shared_reuse_reduction};factor_reduction={factor_reduction};temporal_credit={temporal_credit_mode};temporal_window_chunks={};inference_steps={};step_size={:08x};latent_decay={:08x};max_grad_norm={max_grad_norm};gradient_norm_scope={gradient_norm_scope};eps={:08x};alm_steps={};alm_primal_step={:08x};alm_dual_step={:08x};alm_penalty={:08x};alm_max_grad_norm={alm_max_grad_norm};alm_gradient_norm_scope={alm_gradient_norm_scope};alm_eps={:08x};prediction_precision={:08x};incremental_parameter_step_scale={:016x};dkp_preliminary_step={:08x};dkp_feedback_step={:08x};dkp_forward_decay={:08x};dkp_feedback_decay={:08x};dkp_signal_scale={:08x};dkp_feedback_initialization={feedback_initialization};adjoint_enabled={};adjoint_warmup={};adjoint_every={};adjoint_predictor={adjoint_predictor};adjoint_conditioning={adjoint_conditioning};adjoint_conditioning_clip={:08x};adjoint_lr={:08x};adjoint_decay={:08x};adjoint_max_update={adjoint_max_update};adjoint_eps={:08x};consensus_damping={:08x};consensus_min_curvature={:08x};consensus_max_norm={consensus_max_norm};consensus_eps={:08x}",
+        "dragon-pc-program-v11;solver={};next_token_solver={};terminal={terminal_criterion};schedule={learning_schedule};parameterization={parameterization};shared_reuse={shared_reuse_reduction};factor_reduction={factor_reduction};temporal_credit={temporal_credit_mode};temporal_window_chunks={};inference_steps={};step_size={:08x};latent_decay={:08x};max_grad_norm={max_grad_norm};gradient_norm_scope={gradient_norm_scope};eps={:08x};alm_steps={};alm_primal_step={:08x};alm_dual_step={:08x};alm_penalty={:08x};alm_max_grad_norm={alm_max_grad_norm};alm_gradient_norm_scope={alm_gradient_norm_scope};alm_eps={:08x};prediction_precision={:08x};incremental_parameter_step_scale={:016x};dkp_preliminary_step={:08x};dkp_feedback_step={:08x};dkp_forward_decay={:08x};dkp_feedback_decay={:08x};dkp_signal_scale={:08x};dkp_feedback_initialization={feedback_initialization};adjoint_enabled={};adjoint_warmup={};adjoint_every={};adjoint_predictor={adjoint_predictor};adjoint_conditioning={adjoint_conditioning};adjoint_conditioning_clip={:08x};adjoint_lr={:08x};adjoint_decay={:08x};adjoint_max_update={adjoint_max_update};adjoint_eps={:08x};consensus_damping={:08x};consensus_min_curvature={:08x};consensus_max_norm={consensus_max_norm};consensus_eps={:08x}",
         config.solver.as_str(),
+        config.next_token_solver().as_str(),
         config.temporal_credit.window_chunks,
         config.inference.steps,
         config.inference.step_size.to_bits(),
@@ -162,4 +166,35 @@ pub fn dragon_predictive_coding_checkpoint_manifest(
         learning_schedule: config.learning_schedule,
         execution_contract: config.execution_contract(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{LocalPredictiveCodingObjectiveRoutingConfig, LocalPredictiveCodingSolver};
+
+    #[test]
+    fn objective_solver_route_is_bound_to_checkpoint_program_identity() {
+        let base = LocalPredictiveCodingConfig {
+            solver: LocalPredictiveCodingSolver::ErrorEquilibrium,
+            ..LocalPredictiveCodingConfig::default()
+        };
+        let routed = LocalPredictiveCodingConfig {
+            objective_routing: LocalPredictiveCodingObjectiveRoutingConfig {
+                next_token_solver: Some(LocalPredictiveCodingSolver::FixedPrediction),
+            },
+            ..base.clone()
+        };
+
+        let base = dragon_predictive_coding_checkpoint_manifest(4, &base)
+            .expect("base checkpoint manifest");
+        let routed = dragon_predictive_coding_checkpoint_manifest(4, &routed)
+            .expect("routed checkpoint manifest");
+        assert_ne!(base.program_digest, routed.program_digest);
+        assert!(
+            routed
+                .program_digest
+                .contains("next_token_solver=fixed_prediction")
+        );
+    }
 }

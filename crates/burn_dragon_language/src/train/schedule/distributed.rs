@@ -633,6 +633,30 @@ pub(super) fn broadcast_sequence_batch_rooted<B: AutodiffBackend>(
         device,
         Some(batch.as_ref().is_some_and(|batch| batch.reset_stream_state)),
     )?;
+    let has_supervised_token_count = broadcast_bool_rooted::<B::InnerBackend>(
+        peer_id,
+        global_rank,
+        root_rank,
+        device,
+        Some(
+            batch
+                .as_ref()
+                .is_some_and(|batch| batch.supervised_token_count.is_some()),
+        ),
+    )?;
+    let supervised_token_count = if has_supervised_token_count {
+        Some(broadcast_usize_rooted::<B::InnerBackend>(
+            peer_id,
+            global_rank,
+            root_rank,
+            device,
+            batch
+                .as_ref()
+                .and_then(|batch| batch.supervised_token_count),
+        )?)
+    } else {
+        None
+    };
     let has_absolute_step = broadcast_bool_rooted::<B::InnerBackend>(
         peer_id,
         global_rank,
@@ -660,6 +684,7 @@ pub(super) fn broadcast_sequence_batch_rooted<B: AutodiffBackend>(
         inputs,
         targets,
         loss_mask,
+        supervised_token_count,
         summary_event_mask,
         ruliad_policy_batch: None,
         absolute_step,

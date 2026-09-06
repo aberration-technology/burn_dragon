@@ -1034,7 +1034,7 @@ pub(super) fn save_source_selection_state_checkpoint(
     dataset
         .write_source_selection_state(
             &source_selection_state_checkpoint_path(run_dir, epoch),
-            absolute_step,
+            absolute_step.saturating_add(1),
         )
         .with_context(|| {
             format!(

@@ -72,6 +72,7 @@ pub(super) fn formal_proof_document(spec: &RuliadSampleSpec, oracle_hash: &str) 
         candidate,
         proof_step_index,
         action_presentation_rotation,
+        action_candidate_count,
         action_answer_contract,
         task,
     } = spec
@@ -96,6 +97,7 @@ pub(super) fn formal_proof_document(spec: &RuliadSampleSpec, oracle_hash: &str) 
             proof_step_index
                 .ok_or_else(|| anyhow!("proof-action document requires proof_step_index"))?,
             *action_presentation_rotation,
+            *action_candidate_count,
             *action_answer_contract,
         )?,
         RuliadTaskKind::CheckProof => {
@@ -213,13 +215,16 @@ pub(super) fn formal_select_action_query(
     certificate: &RuliadProofCertificate,
     step_index: usize,
     presentation_rotation: Option<usize>,
+    candidate_count: Option<usize>,
     answer_contract: RuliadProofActionAnswerContract,
 ) -> Result<(String, String)> {
     let actions = crate::ruliad::policy::oracle_proof_action_set(
         problem,
         certificate,
         step_index,
-        crate::ruliad::policy::DEFAULT_PROOF_ACTION_CANDIDATES,
+        candidate_count
+            .unwrap_or(crate::ruliad::policy::DEFAULT_PROOF_ACTION_CANDIDATES)
+            .max(2),
     )?;
     let actions = actions
         .rotate_left(presentation_rotation.unwrap_or_default() % actions.candidates.len().max(1))?;
@@ -305,6 +310,23 @@ pub fn ruliad_proof_action_prompt(
         problem.domain.label(),
         encode_problem(problem)?,
         ruliad_proof_action_query(problem, actions)?,
+    ))
+}
+
+/// Minimal verifier-sufficient interface for proof-action policy learning.
+///
+/// The action menu already contains the local rewrite patterns, current and
+/// target focus, goal id, and difference path needed to choose a transition.
+/// Omitting the serialized global problem and random content hash prevents a
+/// fixed context window from silently retaining an arbitrary suffix of those
+/// fields and removes a high-entropy memorization channel from the policy.
+pub fn ruliad_proof_action_local_prompt(
+    problem: &RuliadProofProblem,
+    actions: &crate::ruliad::policy::RuliadProofActionSet,
+) -> Result<String> {
+    Ok(format!(
+        "{}\n!:",
+        ruliad_proof_action_query(problem, actions)?
     ))
 }
 
@@ -790,6 +812,7 @@ pub(super) fn compact_answer(spec: &RuliadSampleSpec) -> String {
             candidate,
             proof_step_index,
             action_presentation_rotation,
+            action_candidate_count,
             action_answer_contract,
             task,
         } => match task {
@@ -805,7 +828,9 @@ pub(super) fn compact_answer(spec: &RuliadSampleSpec) -> String {
                         problem,
                         certificate,
                         index,
-                        crate::ruliad::policy::DEFAULT_PROOF_ACTION_CANDIDATES,
+                        action_candidate_count
+                            .unwrap_or(crate::ruliad::policy::DEFAULT_PROOF_ACTION_CANDIDATES)
+                            .max(2),
                     )
                     .ok()
                 })

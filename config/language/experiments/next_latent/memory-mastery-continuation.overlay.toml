@@ -1,0 +1,8 @@
+[training]
+launch_mode = "resume_exact_run"
+resume_run_dir = "target/experiments/nextlat-memory-mastery-work/terrific-friend"
+resume_checkpoint_epoch = 32
+max_iters = 24576
+
+[training.resume_horizon_extension]
+enabled = true
